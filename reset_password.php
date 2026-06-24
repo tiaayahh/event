@@ -4,8 +4,7 @@ require_once 'includes/csrf.php';
 
 $error = '';
 $success = '';
-$email = '';
-$resetLink = '';
+$token = isset($_GET['token']) ? trim($_GET['token']) : '';
 
 function ensurePasswordResetTable(PDO $pdo): void
 {
@@ -23,50 +22,73 @@ function ensurePasswordResetTable(PDO $pdo): void
     );
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+function findActiveReset(PDO $pdo, string $token): ?array
+{
+    if ($token === '') {
+        return null;
+    }
+
+    $stmt = $pdo->query(
+        "SELECT reset_id, user_id, token_hash
+         FROM password_resets
+         WHERE used_at IS NULL
+           AND expires_at > NOW()"
+    );
+
+    while ($row = $stmt->fetch()) {
+        if (password_verify($token, $row['token_hash'])) {
+            return $row;
+        }
+    }
+
+    return null;
+}
+
+try {
+    ensurePasswordResetTable($pdo);
+} catch (Throwable $e) {
+    $error = 'Password reset service is not available right now.';
+}
+
+$resetRequest = null;
+if ($error === '') {
+    $resetRequest = findActiveReset($pdo, $token);
+    if (!$resetRequest) {
+        $error = 'This reset link is invalid or has expired.';
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
     csrf_require_valid_post_token();
 
-    $email = isset($_POST['email']) ? trim($_POST['email']) : '';
+    $newPassword = $_POST['new_password'] ?? '';
+    $confirmPassword = $_POST['confirm_password'] ?? '';
 
-    if ($email === '') {
-        $error = 'Please enter your account email.';
-    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        $error = 'Enter a valid email address.';
+    if ($newPassword === '' || $confirmPassword === '') {
+        $error = 'Please fill in all fields.';
+    } elseif (strlen($newPassword) < 6) {
+        $error = 'Password must be at least 6 characters.';
+    } elseif ($newPassword !== $confirmPassword) {
+        $error = 'Passwords do not match.';
     } else {
         try {
-            ensurePasswordResetTable($pdo);
+            $passwordHash = password_hash($newPassword, PASSWORD_BCRYPT);
 
-            $stmt = $pdo->prepare('SELECT user_id FROM users WHERE email = ? LIMIT 1');
-            $stmt->execute([$email]);
-            $user = $stmt->fetch();
+            $pdo->beginTransaction();
 
-            $success = 'If an account with that email exists, a reset link has been generated.';
+            $updateUser = $pdo->prepare('UPDATE users SET password_hash = ? WHERE user_id = ?');
+            $updateUser->execute([$passwordHash, $resetRequest['user_id']]);
 
-            if ($user) {
-                $token = bin2hex(random_bytes(32));
-                $tokenHash = password_hash($token, PASSWORD_BCRYPT);
-                $expiresAt = (new DateTime('+30 minutes'))->format('Y-m-d H:i:s');
+            $markUsed = $pdo->prepare('UPDATE password_resets SET used_at = NOW() WHERE reset_id = ?');
+            $markUsed->execute([$resetRequest['reset_id']]);
 
-                $pdo->beginTransaction();
-
-                $clearTokens = $pdo->prepare('DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL');
-                $clearTokens->execute([$user['user_id']]);
-
-                $insertToken = $pdo->prepare('INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES (?, ?, ?)');
-                $insertToken->execute([$user['user_id'], $tokenHash, $expiresAt]);
-
-                $pdo->commit();
-
-                $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-                $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
-                $basePath = rtrim(dirname($_SERVER['PHP_SELF']), '/\\');
-                $resetLink = $scheme . '://' . $host . ($basePath ? $basePath : '') . '/reset_password.php?token=' . urlencode($token);
-            }
+            $pdo->commit();
+            $success = 'Password updated successfully. You can now login.';
         } catch (Throwable $e) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
             }
-            $error = 'Unable to process reset request. Please try again.';
+            $error = 'Unable to update password. Please try again.';
         }
     }
 }
@@ -77,7 +99,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="assets/style.css">
-    <title>Planora - Forgot Password</title>
+    <title>Planora - Reset Password</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
@@ -212,26 +234,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <div class="message success"><?php echo htmlspecialchars($success); ?></div>
             <?php endif; ?>
 
-            <form method="POST" action="<?php echo htmlspecialchars($_SERVER['PHP_SELF']); ?>">
-                <?php echo csrf_input(); ?>
-                <div class="form-group">
-                    <label for="email">Account Email</label>
-                    <input type="email" id="email" name="email" value="<?php echo htmlspecialchars($email); ?>" required>
-                </div>
-
-                <button type="submit" class="btn-reset">Send Reset Link</button>
-
-                <?php if ($resetLink !== ''): ?>
-                    <div class="message success" style="word-break: break-all;">
-                        Development reset link:<br>
-                        <a href="<?php echo htmlspecialchars($resetLink); ?>"><?php echo htmlspecialchars($resetLink); ?></a>
+            <?php if ($success === '' && $error === ''): ?>
+                <form method="POST" action="<?php echo htmlspecialchars($_SERVER['PHP_SELF'] . '?token=' . urlencode($token)); ?>">
+                    <?php echo csrf_input(); ?>
+                    <div class="form-group">
+                        <label for="new_password">New Password</label>
+                        <input type="password" id="new_password" name="new_password" required>
                     </div>
-                <?php endif; ?>
 
-                <div class="footer-text">
-                    Remembered it?<a href="login.php">Back to Login</a>
-                </div>
-            </form>
+                    <div class="form-group">
+                        <label for="confirm_password">Confirm Password</label>
+                        <input type="password" id="confirm_password" name="confirm_password" required>
+                    </div>
+
+                    <button type="submit" class="btn-reset">Update Password</button>
+                </form>
+            <?php endif; ?>
+
+            <div class="footer-text">
+                Remembered it?<a href="login.php">Back to Login</a>
+            </div>
         </div>
     </div>
 </body>
