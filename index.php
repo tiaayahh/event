@@ -248,38 +248,66 @@ if ($role === 'planner') {
         }
 
         .feature-card {
-            background: var(--white);
-            border: 1px solid var(--card-border);
+            --card-image: none;
+            background:
+                linear-gradient(180deg, rgba(17, 22, 39, 0.22) 0%, rgba(17, 22, 39, 0.72) 100%),
+                var(--card-image) center/cover no-repeat;
+            border: 1px solid rgba(255, 255, 255, 0.22);
             border-radius: 16px;
             padding: 28px 24px;
             text-align: center;
             transition: all 0.25s ease;
             box-shadow: var(--shadow-sm);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .feature-card::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at top right, rgba(184, 168, 255, 0.35), transparent 55%);
+            pointer-events: none;
+        }
+
+        .feature-card > * {
+            position: relative;
+            z-index: 1;
         }
 
         .feature-card:hover {
             transform: translateY(-6px);
             box-shadow: var(--shadow-md);
-            border-color: var(--primary-light);
+            border-color: rgba(255, 255, 255, 0.42);
         }
+
+        .feature-card:nth-child(1) { --card-image: url('https://images.unsplash.com/photo-1511578314322-379afb476865?auto=format&fit=crop&w=1200&q=80'); }
+        .feature-card:nth-child(2) { --card-image: url('https://images.unsplash.com/photo-1552664730-d307ca884978?auto=format&fit=crop&w=1200&q=80'); }
+        .feature-card:nth-child(3) { --card-image: url('https://images.unsplash.com/photo-1517457373958-b7bdd4587205?auto=format&fit=crop&w=1200&q=80'); }
+        .feature-card:nth-child(4) { --card-image: url('https://images.unsplash.com/photo-1529156069898-49953e39b3ac?auto=format&fit=crop&w=1200&q=80'); }
+        .feature-card:nth-child(5) { --card-image: url('https://images.unsplash.com/photo-1551288049-bebda4e38f71?auto=format&fit=crop&w=1200&q=80'); }
 
         .feature-card .icon {
             font-size: 40px;
             margin-bottom: 16px;
             display: block;
+            color: #FFFFFF;
+            text-shadow: 0 3px 12px rgba(0, 0, 0, 0.35);
         }
 
         .feature-card h3 {
             margin-bottom: 10px;
             font-size: 18px;
             font-weight: 600;
-            color: var(--text);
+            color: #FFFFFF;
+            text-shadow: 0 2px 10px rgba(0, 0, 0, 0.32);
         }
 
         .feature-card p {
-            color: var(--text-soft);
+            color: rgba(255, 255, 255, 0.92);
             font-size: 14px;
             line-height: 1.6;
+            text-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
         }
 
         
