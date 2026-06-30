@@ -28,8 +28,11 @@ BEGIN
         ('transactions'),
         ('attendances'),
         ('messages'),
+        ('vendor_notification_state'),
         ('service_ratings'),
-        ('password_resets');
+        ('password_resets'),
+        ('audit_logs'),
+        ('login_attempts');
 
     CREATE TEMPORARY TABLE expected_columns (
         table_name VARCHAR(64) NOT NULL,
@@ -95,6 +98,10 @@ BEGIN
         ('messages', 'is_read'),
         ('messages', 'created_at'),
 
+        ('vendor_notification_state', 'vendor_id'),
+        ('vendor_notification_state', 'last_seen_pending_bookings_at'),
+        ('vendor_notification_state', 'updated_at'),
+
         ('service_ratings', 'rating_id'),
         ('service_ratings', 'attendee_id'),
         ('service_ratings', 'service_id'),
@@ -109,7 +116,22 @@ BEGIN
         ('password_resets', 'token_hash'),
         ('password_resets', 'expires_at'),
         ('password_resets', 'used_at'),
-        ('password_resets', 'created_at');
+        ('password_resets', 'created_at'),
+
+        ('audit_logs', 'log_id'),
+        ('audit_logs', 'user_id'),
+        ('audit_logs', 'role'),
+        ('audit_logs', 'action'),
+        ('audit_logs', 'target_type'),
+        ('audit_logs', 'target_id'),
+        ('audit_logs', 'metadata_json'),
+        ('audit_logs', 'ip_address'),
+        ('audit_logs', 'user_agent'),
+        ('audit_logs', 'created_at'),
+
+        ('login_attempts', 'attempt_id'),
+        ('login_attempts', 'email'),
+        ('login_attempts', 'attempted_at');
 
     CREATE TEMPORARY TABLE missing_tables AS
     SELECT et.table_name

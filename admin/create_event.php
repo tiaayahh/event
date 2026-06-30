@@ -26,10 +26,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_event'])) {
         try {
             $stmt = $pdo->prepare('INSERT INTO events (planner_id, title, event_date, budget_total, budget_committed, ticket_price, ticket_revenue) VALUES (?, ?, ?, ?, 0, ?, 0)');
             $stmt->execute([$_SESSION['user_id'], $title, $eventDate, (float)$budgetTotal, (float)$ticketPrice]);
+
+            audit_log(
+                $pdo,
+                (int)$_SESSION['user_id'],
+                (string)$_SESSION['role'],
+                'event.create',
+                'event',
+                (string)$pdo->lastInsertId(),
+                [
+                    'title' => $title,
+                    'event_date' => $eventDate,
+                    'budget_total' => (float)$budgetTotal,
+                ]
+            );
+
             $_SESSION['flash_success'] = 'Event created successfully!';
             header('Location: create_event.php');
             exit;
         } catch (Throwable $e) {
+            audit_log(
+                $pdo,
+                (int)$_SESSION['user_id'],
+                (string)$_SESSION['role'],
+                'event.create_failed',
+                'event',
+                null,
+                ['reason' => 'exception']
+            );
             $flashError = 'Could not create event right now. Please try again.';
         }
     }

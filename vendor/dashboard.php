@@ -7,7 +7,8 @@ $fullName = $_SESSION['full_name'] ?? 'Vendor';
 $pendingBookings = [];
 $services = [];
 $hasNewAlert = false;
-$unreadMessages = 0;
+$newPendingCount = 0;
+$unreadConversations = 0;
 $flashSuccess = $_SESSION['flash_success'] ?? '';
 $flashError = $_SESSION['flash_error'] ?? '';
 unset($_SESSION['flash_success'], $_SESSION['flash_error']);
@@ -21,6 +22,15 @@ try {
         $flashError = 'Vendor profile not found. Please complete vendor setup first.';
     } else {
         $vendorId = (int)$vendor['vendor_id'];
+
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS vendor_notification_state (
+                vendor_id INT NOT NULL PRIMARY KEY,
+                last_seen_pending_bookings_at DATETIME NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                CONSTRAINT fk_vendor_notification_state_vendor FOREIGN KEY (vendor_id) REFERENCES vendors(vendor_id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        );
 
         $pdo->exec(
             "CREATE TABLE IF NOT EXISTS messages (
@@ -37,12 +47,29 @@ try {
 
         $stmt = $pdo->query("SHOW COLUMNS FROM messages LIKE 'is_read'");
         if (!$stmt->fetch()) {
-            $pdo->exec("ALTER TABLE messages ADD COLUMN is_read TINYINT(1) NOT NULL DEFAULT 0");
+            try {
+                $pdo->exec("ALTER TABLE messages ADD COLUMN is_read TINYINT(1) NOT NULL DEFAULT 0");
+            } catch (Throwable $e) {
+                if (stripos($e->getMessage(), 'Duplicate column name') === false) {
+                    throw $e;
+                }
+            }
         }
 
-        $stmt = $pdo->prepare("SELECT COUNT(*) FROM messages WHERE vendor_user_id = ? AND sender_role = 'planner' AND is_read = 0");
+        $stmt = $pdo->prepare("SELECT COUNT(DISTINCT planner_user_id) FROM messages WHERE vendor_user_id = ? AND sender_role = 'planner' AND is_read = 0");
         $stmt->execute([$_SESSION['user_id']]);
-        $unreadMessages = (int)$stmt->fetchColumn();
+        $unreadConversations = (int)$stmt->fetchColumn();
+
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['mark_pending_bookings_seen'])) {
+            $stmt = $pdo->prepare(
+                'INSERT INTO vendor_notification_state (vendor_id, last_seen_pending_bookings_at) VALUES (?, NOW())
+                 ON DUPLICATE KEY UPDATE last_seen_pending_bookings_at = NOW()'
+            );
+            $stmt->execute([$vendorId]);
+            $_SESSION['flash_success'] = 'Booking alerts marked as seen.';
+            header('Location: dashboard.php');
+            exit;
+        }
 
         if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle_service_availability'], $_POST['service_id'])) {
             $serviceId = filter_input(INPUT_POST, 'service_id', FILTER_VALIDATE_INT);
@@ -53,6 +80,21 @@ try {
                 $newAvailability = isset($_POST['availability']) ? 1 : 0;
                 $stmt = $pdo->prepare('UPDATE services SET availability = ? WHERE service_id = ? AND vendor_id = ?');
                 $stmt->execute([$newAvailability, $serviceId, $vendorId]);
+
+                audit_log(
+                    $pdo,
+                    (int)$_SESSION['user_id'],
+                    (string)$_SESSION['role'],
+                    'service.availability_update',
+                    'service',
+                    (string)$serviceId,
+                    [
+                        'vendor_id' => $vendorId,
+                        'availability' => $newAvailability,
+                        'source' => 'vendor_dashboard'
+                    ]
+                );
+
                 $_SESSION['flash_success'] = 'Service availability updated.';
             }
 
@@ -61,11 +103,11 @@ try {
         }
 
         $stmt = $pdo->prepare('SELECT service_id, name, price, availability FROM services WHERE vendor_id = ? ORDER BY name ASC');
-        $stmt->execute([$vendorId]);
+         $stmt->execute([$vendorId]);
         $services = $stmt->fetchAll();
 
         $stmt = $pdo->prepare(
-            "SELECT b.booking_id, e.title AS event_title, e.event_date, s.name AS service_name, b.status
+            "SELECT b.booking_id, e.title AS event_title, e.event_date, s.name AS service_name, b.status, b.created_at
             FROM bookings b
             JOIN events e ON b.event_id = e.event_id
             JOIN services s ON b.service_id = s.service_id
@@ -74,10 +116,28 @@ try {
         );
         $stmt->execute([$vendorId]);
         $pendingBookings = $stmt->fetchAll();
-        $hasNewAlert = count($pendingBookings) > 0;
+
+        $stmt = $pdo->prepare('SELECT last_seen_pending_bookings_at FROM vendor_notification_state WHERE vendor_id = ? LIMIT 1');
+        $stmt->execute([$vendorId]);
+        $lastSeenPendingAt = $stmt->fetchColumn();
+
+        if ($lastSeenPendingAt) {
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*)
+                FROM bookings b
+                JOIN services s ON b.service_id = s.service_id
+                WHERE s.vendor_id = ? AND b.status = 'pending' AND b.created_at > ?"
+            );
+            $stmt->execute([$vendorId, $lastSeenPendingAt]);
+            $newPendingCount = (int)$stmt->fetchColumn();
+        } else {
+            $newPendingCount = count($pendingBookings);
+        }
+
+        $hasNewAlert = $newPendingCount > 0;
     }
 } catch (Throwable $e) {
-    $flashError = 'Unable to load vendor dashboard data right now.';
+    error_log('vendor/dashboard.php error: ' . $e->getMessage());
 }
 ?>
 <!DOCTYPE html>
@@ -189,7 +249,31 @@ try {
             font-size: 14px;
             display: flex;
             align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .alert-message {
+            display: flex;
+            align-items: center;
             gap: 10px;
+        }
+
+        .alert-actions {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .alert-action-btn {
+            border: 1px solid #5f56d8;
+            background: #ffffff;
+            color: #4a42b5;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            padding: 5px 10px;
+            cursor: pointer;
         }
 
         .availability-row {
@@ -336,6 +420,7 @@ try {
             height: 100%;
             transition: background-color 0.2s, opacity 0.2s;
             opacity: 0.85;
+            position: relative;
         }
 
         .nav-link i {
@@ -359,7 +444,9 @@ try {
             line-height: 18px;
             text-align: center;
             padding: 0 5px;
-            margin-top: 2px;
+            position: absolute;
+            top: 8px;
+            right: 12px;
         }
     </style>
 </head>
@@ -384,8 +471,17 @@ try {
         <div class="dashboard-card">
             <h2 class="card-title">Booking Alerts</h2>
             <div class="alert-banner">
-                <i class="fa-solid fa-bell"></i>
-                <?php echo $hasNewAlert ? 'New Pending Booking!' : 'No new pending bookings.'; ?>
+                <div class="alert-message">
+                    <i class="fa-solid fa-bell"></i>
+                    <?php echo $hasNewAlert ? ('New pending bookings: ' . (int)$newPendingCount) : 'No new pending bookings.'; ?>
+                </div>
+                <?php if ($hasNewAlert): ?>
+                    <form method="POST" class="alert-actions">
+                        <?php echo csrf_input(); ?>
+                        <input type="hidden" name="mark_pending_bookings_seen" value="1">
+                        <button type="submit" class="alert-action-btn">Mark as seen</button>
+                    </form>
+                <?php endif; ?>
             </div>
         </div>
 
@@ -451,10 +547,10 @@ try {
             <i class="fa-solid fa-house"></i>
             <span>Home</span>
         </a>
-        <a href="messages.php" class="nav-link">
+        <a href="messages.php?unread=1" class="nav-link">
             <i class="fa-solid fa-comments"></i>
             <span>Messages</span>
-            <?php if ($unreadMessages > 0): ?><span class="badge-unread"><?php echo $unreadMessages; ?></span><?php endif; ?>
+            <?php if ($unreadConversations > 0): ?><span class="badge-unread"><?php echo $unreadConversations; ?></span><?php endif; ?>
         </a>
         <a href="services.php" class="nav-link">
             <i class="fa-solid fa-bell-concierge"></i>
@@ -463,6 +559,7 @@ try {
         <a href="bookings.php" class="nav-link">
             <i class="fa-solid fa-book-open"></i>
             <span>Bookings</span>
+            <?php if ($newPendingCount > 0): ?><span class="badge-unread"><?php echo $newPendingCount; ?></span><?php endif; ?>
         </a>
         <a href="schedule.php" class="nav-link">
             <i class="fa-solid fa-calendar-days"></i>

@@ -14,6 +14,7 @@ if (!$bookingId) {
 
 $booking = null;
 $flashError = '';
+$paymentTimeline = [];
 
 try {
 	$stmt = $pdo->prepare(
@@ -21,6 +22,7 @@ try {
 				b.event_id,
 				b.status AS booking_status,
 				b.booked_price,
+				b.platform_fee,
 				e.title AS event_title,
 				e.event_date,
 				s.name AS service_name,
@@ -44,16 +46,27 @@ try {
 		exit;
 	}
 
+	if (function_exists('ensureAuditLogsTable')) {
+		ensureAuditLogsTable($pdo);
+	}
+
 	if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		csrf_require_valid_post_token();
 
 		$mpesaCode = strtoupper(trim($_POST['mpesa_code'] ?? ''));
 		$paymentStatus = strtolower(trim($_POST['payment_status'] ?? 'pending'));
+		$oldBookingStatus = strtolower((string)$booking['booking_status']);
+		$newBookingStatus = $paymentStatus === 'paid' ? 'confirmed' : 'pending';
+		$bookedPrice = (float)$booking['booked_price'];
+		$platformFee = $bookedPrice * PLATFORM_FEE_PERCENT;
+		$mpesaCodeDb = $mpesaCode === '' ? null : $mpesaCode;
 
 		if (!in_array($paymentStatus, ['pending', 'paid', 'failed'], true)) {
 			$flashError = 'Invalid payment status selected.';
 		} elseif ($paymentStatus === 'paid' && $mpesaCode === '') {
 			$flashError = 'M-Pesa code is required when marking payment as paid.';
+		} elseif ($mpesaCode !== '' && !preg_match('/^[A-Z0-9]{6,20}$/', $mpesaCode)) {
+			$flashError = 'M-Pesa code format is invalid.';
 		} else {
 			$pdo->beginTransaction();
 
@@ -62,39 +75,79 @@ try {
 
 			if ($stmt->fetch()) {
 				$stmt = $pdo->prepare('UPDATE transactions SET mpesa_code = ?, amount = ?, status = ? WHERE booking_id = ?');
-				$stmt->execute([$mpesaCode, (float)$booking['booked_price'], $paymentStatus, $bookingId]);
+				$stmt->execute([$mpesaCodeDb, $bookedPrice, $paymentStatus, $bookingId]);
 			} else {
 				$stmt = $pdo->prepare('INSERT INTO transactions (booking_id, mpesa_code, amount, status) VALUES (?, ?, ?, ?)');
-				$stmt->execute([$bookingId, $mpesaCode, (float)$booking['booked_price'], $paymentStatus]);
+				$stmt->execute([$bookingId, $mpesaCodeDb, $bookedPrice, $paymentStatus]);
 			}
 
-			$wasConfirmedBefore = strtolower((string)$booking['booking_status']) === 'confirmed';
-			$newBookingStatus = $paymentStatus === 'paid' ? 'confirmed' : 'pending';
 			$stmt = $pdo->prepare('UPDATE bookings SET status = ? WHERE booking_id = ?');
 			$stmt->execute([$newBookingStatus, $bookingId]);
 
-			if ($paymentStatus === 'paid') {
-				$platformFee = (float)$booking['booked_price'] * PLATFORM_FEE_PERCENT;
+			if ($newBookingStatus === 'confirmed') {
 				$stmt = $pdo->prepare('UPDATE bookings SET platform_fee = ? WHERE booking_id = ?');
 				$stmt->execute([$platformFee, $bookingId]);
 
-				if (!$wasConfirmedBefore) {
+				if ($oldBookingStatus !== 'confirmed') {
 					$stmt = $pdo->prepare('UPDATE events SET budget_committed = budget_committed + ? WHERE event_id = ? AND planner_id = ?');
-					$stmt->execute([(float)$booking['booked_price'], (int)$booking['event_id'], $_SESSION['user_id']]);
+					$stmt->execute([$bookedPrice, (int)$booking['event_id'], $_SESSION['user_id']]);
+				}
+			} else {
+				$stmt = $pdo->prepare('UPDATE bookings SET platform_fee = 0 WHERE booking_id = ?');
+				$stmt->execute([$bookingId]);
+
+				if ($oldBookingStatus === 'confirmed') {
+					$stmt = $pdo->prepare('UPDATE events SET budget_committed = GREATEST(0, budget_committed - ?) WHERE event_id = ? AND planner_id = ?');
+					$stmt->execute([$bookedPrice, (int)$booking['event_id'], $_SESSION['user_id']]);
 				}
 			}
 
 			$pdo->commit();
+
+			audit_log(
+				$pdo,
+				(int)$_SESSION['user_id'],
+				(string)$_SESSION['role'],
+				'payment.update',
+				'booking',
+				(string)$bookingId,
+				[
+					'payment_status' => $paymentStatus,
+					'booking_status' => $newBookingStatus,
+					'amount' => (float)$booking['booked_price'],
+				]
+			);
 
 			$_SESSION['flash_success'] = 'Payment updated successfully.';
 			header('Location: payment_history.php');
 			exit;
 		}
 	}
+
+	$stmt = $pdo->prepare(
+		"SELECT action, role, metadata_json, created_at
+		 FROM audit_logs
+		 WHERE target_type = 'booking'
+		   AND target_id = ?
+		   AND action IN ('payment.update', 'payment.update_failed')
+		 ORDER BY created_at DESC
+		 LIMIT 20"
+	);
+	$stmt->execute([(string)$bookingId]);
+	$paymentTimeline = $stmt->fetchAll();
 } catch (Throwable $e) {
 	if ($pdo->inTransaction()) {
 		$pdo->rollBack();
 	}
+	audit_log(
+		$pdo,
+		isset($_SESSION['user_id']) ? (int)$_SESSION['user_id'] : null,
+		$_SESSION['role'] ?? null,
+		'payment.update_failed',
+		'booking',
+		$bookingId ? (string)$bookingId : null,
+		['reason' => 'exception']
+	);
 	$flashError = 'Unable to update payment right now.';
 }
 ?>
@@ -121,6 +174,18 @@ try {
 		.input, .select { width: 100%; border: 1px solid #d6d6d6; border-radius: 6px; padding: 10px; font-size: 14px; }
 		.message-error { background: #ffecec; color: #9d2020; border: 1px solid #f6caca; border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; font-size: 13px; }
 		.btn { background: #6C63FF; color: #fff; border: none; border-radius: 6px; padding: 10px 14px; font-size: 13px; cursor: pointer; }
+		.timeline { margin-top: 18px; border-top: 1px solid #efefef; padding-top: 14px; }
+		.timeline-title { font-size: 15px; font-weight: 700; margin-bottom: 10px; }
+		.timeline-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+		.timeline-item { border: 1px solid #ececec; border-radius: 8px; padding: 10px; background: #fafafa; }
+		.timeline-item strong { display: inline-block; margin-bottom: 4px; }
+		.timeline-meta { font-size: 12px; color: #666; margin-top: 4px; }
+		.timeline-empty { font-size: 13px; color: #777; }
+		.badge { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; margin-left: 6px; }
+		.badge-paid { background: #e8f9ef; color: #1c7a36; }
+		.badge-pending { background: #fff4df; color: #a36500; }
+		.badge-failed { background: #ffe8e8; color: #a22b2b; }
+		.badge-action-failed { background: #f5e8ff; color: #6a2ea1; }
 	</style>
 </head>
 <body>
@@ -163,6 +228,57 @@ try {
 
 			<button class="btn" type="submit">Save Payment</button>
 		</form>
+
+		<div class="timeline">
+			<h3 class="timeline-title">Simulated Transaction Timeline</h3>
+			<?php if (empty($paymentTimeline)): ?>
+				<div class="timeline-empty">No simulator updates yet for this booking.</div>
+			<?php else: ?>
+				<ul class="timeline-list">
+					<?php foreach ($paymentTimeline as $entry): ?>
+						<?php
+							$meta = [];
+							if (!empty($entry['metadata_json'])) {
+								$decoded = json_decode((string)$entry['metadata_json'], true);
+								if (is_array($decoded)) {
+									$meta = $decoded;
+								}
+							}
+							$paymentStatus = strtolower((string)($meta['payment_status'] ?? ''));
+							$paymentBadgeClass = '';
+							if ($paymentStatus === 'paid') {
+								$paymentBadgeClass = 'badge-paid';
+							} elseif ($paymentStatus === 'pending') {
+								$paymentBadgeClass = 'badge-pending';
+							} elseif ($paymentStatus === 'failed') {
+								$paymentBadgeClass = 'badge-failed';
+							}
+							$statusPart = '';
+							if (isset($meta['payment_status'])) {
+								$statusPart = ' | Payment: ' . ucfirst((string)$meta['payment_status']);
+							}
+							if (isset($meta['booking_status'])) {
+								$statusPart .= ' | Booking: ' . ucfirst((string)$meta['booking_status']);
+							}
+						?>
+						<li class="timeline-item">
+							<strong><?php echo htmlspecialchars((string)$entry['action']); ?></strong>
+							<?php if ((string)$entry['action'] === 'payment.update_failed'): ?>
+								<span class="badge badge-action-failed">Failed Update</span>
+							<?php endif; ?>
+							<?php if ($paymentBadgeClass !== ''): ?>
+								<span class="badge <?php echo $paymentBadgeClass; ?>"><?php echo htmlspecialchars(ucfirst($paymentStatus)); ?></span>
+							<?php endif; ?>
+							<div class="timeline-meta">
+								By role: <?php echo htmlspecialchars((string)($entry['role'] ?? 'unknown')); ?>
+								| At: <?php echo htmlspecialchars((string)$entry['created_at']); ?>
+								<?php echo htmlspecialchars($statusPart); ?>
+							</div>
+						</li>
+					<?php endforeach; ?>
+				</ul>
+			<?php endif; ?>
+		</div>
 	</section>
 </div>
 </body>

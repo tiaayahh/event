@@ -28,12 +28,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_profile'])) {
             } else {
                 $stmt = $pdo->prepare('UPDATE users SET full_name = ?, email = ? WHERE user_id = ?');
                 $stmt->execute([$newFullName, $newEmail, $_SESSION['user_id']]);
+
+                audit_log(
+                    $pdo,
+                    (int)$_SESSION['user_id'],
+                    (string)$_SESSION['role'],
+                    'profile.update',
+                    'user',
+                    (string)$_SESSION['user_id'],
+                    ['email' => $newEmail]
+                );
+
                 $_SESSION['full_name'] = $newFullName;
                 $_SESSION['flash_success'] = 'Profile updated successfully.';
                 header('Location: profile.php');
                 exit;
             }
         } catch (Throwable $e) {
+            audit_log(
+                $pdo,
+                (int)$_SESSION['user_id'],
+                (string)$_SESSION['role'],
+                'profile.update_failed',
+                'user',
+                (string)$_SESSION['user_id'],
+                ['reason' => 'exception']
+            );
             $flashError = 'Unable to update profile right now.';
         }
     }

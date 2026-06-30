@@ -5,8 +5,10 @@ requireRole('vendor');
 
 $flashError = '';
 $planners = [];
+$showUnreadOnly = isset($_GET['unread']) && $_GET['unread'] === '1';
 $selectedPlannerId = filter_input(INPUT_GET, 'planner_user_id', FILTER_VALIDATE_INT);
 $conversation = [];
+$newPendingCount = 0;
 
 try {
     $pdo->exec(
@@ -24,7 +26,14 @@ try {
 
     $stmt = $pdo->query("SHOW COLUMNS FROM messages LIKE 'is_read'");
     if (!$stmt->fetch()) {
-        $pdo->exec("ALTER TABLE messages ADD COLUMN is_read TINYINT(1) NOT NULL DEFAULT 0");
+        try {
+            $pdo->exec("ALTER TABLE messages ADD COLUMN is_read TINYINT(1) NOT NULL DEFAULT 0");
+        } catch (Throwable $e) {
+            // Another request may have added this column first.
+            if (stripos($e->getMessage(), 'Duplicate column name') === false) {
+                throw $e;
+            }
+        }
     }
 
     $stmt = $pdo->prepare('SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1');
@@ -35,6 +44,38 @@ try {
         $flashError = 'Vendor profile not found.';
     } else {
         $vendorId = (int)$vendor['vendor_id'];
+
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS vendor_notification_state (
+                vendor_id INT NOT NULL PRIMARY KEY,
+                last_seen_pending_bookings_at DATETIME NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                CONSTRAINT fk_vendor_notification_state_vendor FOREIGN KEY (vendor_id) REFERENCES vendors(vendor_id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        );
+
+        $stmt = $pdo->prepare('SELECT last_seen_pending_bookings_at FROM vendor_notification_state WHERE vendor_id = ? LIMIT 1');
+        $stmt->execute([$vendorId]);
+        $lastSeenPendingAt = $stmt->fetchColumn();
+
+        if ($lastSeenPendingAt) {
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*)
+                 FROM bookings b
+                 JOIN services s ON b.service_id = s.service_id
+                 WHERE s.vendor_id = ? AND b.status = 'pending' AND b.created_at > ?"
+            );
+            $stmt->execute([$vendorId, $lastSeenPendingAt]);
+        } else {
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*)
+                 FROM bookings b
+                 JOIN services s ON b.service_id = s.service_id
+                 WHERE s.vendor_id = ? AND b.status = 'pending'"
+            );
+            $stmt->execute([$vendorId]);
+        }
+        $newPendingCount = (int)$stmt->fetchColumn();
 
         $stmt = $pdo->prepare(
             "SELECT p.user_id AS planner_user_id,
@@ -66,10 +107,16 @@ try {
                     ON m.planner_user_id = cp.planner_user_id
                    AND m.vendor_user_id = ?
              GROUP BY p.user_id, p.full_name
-             ORDER BY (last_message_at IS NULL), last_message_at DESC, p.full_name ASC"
+             ORDER BY last_message_at DESC, p.full_name ASC"
         );
         $stmt->execute([$_SESSION['user_id'], $vendorId, $_SESSION['user_id'], $_SESSION['user_id']]);
         $planners = $stmt->fetchAll();
+
+        if ($showUnreadOnly) {
+            $planners = array_values(array_filter($planners, static function ($planner) {
+                return (int)($planner['unread_count'] ?? 0) > 0;
+            }));
+        }
 
         $allowedPlannerIds = array_map(static function ($p) {
             return (int)$p['planner_user_id'];
@@ -99,6 +146,17 @@ try {
             } else {
                 $stmt = $pdo->prepare('INSERT INTO messages (planner_user_id, vendor_user_id, sender_role, message_text, is_read) VALUES (?, ?, ?, ?, 0)');
                 $stmt->execute([$targetPlanner, $_SESSION['user_id'], 'vendor', $messageText]);
+
+                audit_log(
+                    $pdo,
+                    (int)$_SESSION['user_id'],
+                    (string)$_SESSION['role'],
+                    'message.send',
+                    'conversation',
+                    (string)$targetPlanner,
+                    ['recipient_role' => 'planner']
+                );
+
                 header('Location: messages.php?planner_user_id=' . (int)$targetPlanner);
                 exit;
             }
@@ -127,7 +185,7 @@ try {
         }
     }
 } catch (Throwable $e) {
-    $flashError = 'Unable to load messages right now.';
+    error_log('vendor/messages.php error: ' . $e->getMessage());
 }
 ?>
 <!DOCTYPE html>
@@ -153,6 +211,7 @@ try {
         .planner-list { display: flex; flex-direction: column; gap: 8px; max-height: 68vh; overflow: auto; }
         .planner-item { display: block; text-decoration: none; border: 1px solid #ececec; border-radius: 8px; padding: 10px; color: #2D2D2D; }
         .planner-item.active { border-color: #6C63FF; background: #f7f6ff; }
+        .planner-item.booking-alert { border-color: #dcd7ff; background: #f7f6ff; }
         .planner-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
         .badge-unread { display: inline-block; min-width: 18px; height: 18px; border-radius: 999px; background: #e74c3c; color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; padding: 0 5px; }
         .meta { font-size: 12px; color: #666; margin-top: 2px; }
@@ -170,6 +229,7 @@ try {
         .input { width: 100%; border: 1px solid #d6d6d6; border-radius: 8px; padding: 10px; font-size: 14px; }
         .btn { background: #6C63FF; color: #fff; border: none; border-radius: 8px; padding: 10px 14px; font-size: 13px; cursor: pointer; }
         .empty { color: #777; font-size: 14px; padding: 10px 0; }
+        .hint { background: #eef3ff; color: #2c4ea0; border: 1px solid #d9e4ff; border-radius: 6px; padding: 9px 11px; margin-bottom: 10px; font-size: 12px; }
         @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
     </style>
 </head>
@@ -182,20 +242,33 @@ try {
 <div class="container">
     <div class="top-links">
         <a class="top-link" href="dashboard.php"><i class="fa-solid fa-house"></i> Dashboard</a>
-        <a class="top-link" href="bookings.php"><i class="fa-solid fa-book-open"></i> Bookings</a>
+        <a class="top-link" href="bookings.php"><i class="fa-solid fa-book-open"></i> Bookings<?php if ($newPendingCount > 0): ?> (<?php echo $newPendingCount; ?> new)<?php endif; ?></a>
     </div>
 
     <?php if ($flashError !== ''): ?>
         <div class="error"><?php echo htmlspecialchars($flashError); ?></div>
     <?php endif; ?>
 
+    <?php if ($showUnreadOnly): ?>
+        <div class="hint"><i class="fa-solid fa-filter"></i> Showing unread conversations first. <a href="messages.php">View all</a></div>
+    <?php endif; ?>
+
     <div class="layout">
         <section class="card">
             <h2 class="title">Planners</h2>
-            <?php if (empty($planners)): ?>
-                <div class="empty">No planner conversations available yet.</div>
-            <?php else: ?>
-                <div class="planner-list">
+            <div class="planner-list">
+                <a class="planner-item booking-alert" href="bookings.php?status=pending">
+                    <div class="planner-row">
+                        <strong><i class="fa-solid fa-book-open"></i> Pending Bookings</strong>
+                        <?php if ($newPendingCount > 0): ?><span class="badge-unread"><?php echo $newPendingCount; ?></span><?php endif; ?>
+                    </div>
+                    <div class="meta">Booking notifications</div>
+                    <div class="preview"><?php echo $newPendingCount > 0 ? 'You have new pending bookings to review.' : 'No new pending booking notifications.'; ?></div>
+                </a>
+
+                <?php if (empty($planners)): ?>
+                    <div class="empty">No planner conversations available yet.</div>
+                <?php else: ?>
                     <?php foreach ($planners as $planner): ?>
                         <?php $isActive = (int)$selectedPlannerId === (int)$planner['planner_user_id']; ?>
                         <a class="planner-item <?php echo $isActive ? 'active' : ''; ?>" href="messages.php?planner_user_id=<?php echo (int)$planner['planner_user_id']; ?>">
@@ -209,8 +282,8 @@ try {
                             <?php if (!empty($planner['last_message_at'])): ?><div class="preview-time"><?php echo htmlspecialchars((string)$planner['last_message_at']); ?></div><?php endif; ?>
                         </a>
                     <?php endforeach; ?>
-                </div>
-            <?php endif; ?>
+                <?php endif; ?>
+            </div>
         </section>
 
         <section class="card">

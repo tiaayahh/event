@@ -10,6 +10,7 @@ unset($_SESSION['flash_success'], $_SESSION['flash_error']);
 $services = [];
 $editServiceId = filter_input(INPUT_GET, 'edit', FILTER_VALIDATE_INT);
 $editService = null;
+$newPendingCount = 0;
 
 try {
     $stmt = $pdo->prepare('SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1');
@@ -21,6 +22,38 @@ try {
     } else {
         $vendorId = (int)$vendor['vendor_id'];
 
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS vendor_notification_state (
+                vendor_id INT NOT NULL PRIMARY KEY,
+                last_seen_pending_bookings_at DATETIME NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                CONSTRAINT fk_vendor_notification_state_vendor FOREIGN KEY (vendor_id) REFERENCES vendors(vendor_id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        );
+
+        $stmt = $pdo->prepare('SELECT last_seen_pending_bookings_at FROM vendor_notification_state WHERE vendor_id = ? LIMIT 1');
+        $stmt->execute([$vendorId]);
+        $lastSeenPendingAt = $stmt->fetchColumn();
+
+        if ($lastSeenPendingAt) {
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*)
+                 FROM bookings b
+                 JOIN services s ON b.service_id = s.service_id
+                 WHERE s.vendor_id = ? AND b.status = 'pending' AND b.created_at > ?"
+            );
+            $stmt->execute([$vendorId, $lastSeenPendingAt]);
+        } else {
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*)
+                 FROM bookings b
+                 JOIN services s ON b.service_id = s.service_id
+                 WHERE s.vendor_id = ? AND b.status = 'pending'"
+            );
+            $stmt->execute([$vendorId]);
+        }
+        $newPendingCount = (int)$stmt->fetchColumn();
+
         if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_service'])) {
             $name = trim($_POST['name'] ?? '');
             $price = trim($_POST['price'] ?? '');
@@ -31,6 +64,21 @@ try {
             } else {
                 $stmt = $pdo->prepare('INSERT INTO services (vendor_id, name, description, price, availability) VALUES (?, ?, ?, ?, 1)');
                 $stmt->execute([$vendorId, $name, $description, $price]);
+
+                audit_log(
+                    $pdo,
+                    (int)$_SESSION['user_id'],
+                    (string)$_SESSION['role'],
+                    'service.create',
+                    'service',
+                    (string)$pdo->lastInsertId(),
+                    [
+                        'vendor_id' => $vendorId,
+                        'name' => $name,
+                        'price' => (float)$price,
+                    ]
+                );
+
                 $_SESSION['flash_success'] = 'Service added successfully.';
             }
             header('Location: services.php');
@@ -48,6 +96,21 @@ try {
             } else {
                 $stmt = $pdo->prepare('UPDATE services SET name = ?, price = ?, description = ? WHERE service_id = ? AND vendor_id = ?');
                 $stmt->execute([$name, $price, $description, $serviceId, $vendorId]);
+
+                audit_log(
+                    $pdo,
+                    (int)$_SESSION['user_id'],
+                    (string)$_SESSION['role'],
+                    'service.update',
+                    'service',
+                    (string)$serviceId,
+                    [
+                        'vendor_id' => $vendorId,
+                        'name' => $name,
+                        'price' => (float)$price,
+                    ]
+                );
+
                 $_SESSION['flash_success'] = 'Service updated successfully.';
             }
             header('Location: services.php');
@@ -64,10 +127,30 @@ try {
                 $bookingCount = (int)$stmt->fetchColumn();
 
                 if ($bookingCount > 0) {
+                    audit_log(
+                        $pdo,
+                        (int)$_SESSION['user_id'],
+                        (string)$_SESSION['role'],
+                        'service.delete_blocked_has_bookings',
+                        'service',
+                        (string)$serviceId,
+                        ['vendor_id' => $vendorId]
+                    );
                     $_SESSION['flash_error'] = 'Cannot delete a service that already has bookings.';
                 } else {
                     $stmt = $pdo->prepare('DELETE FROM services WHERE service_id = ? AND vendor_id = ?');
                     $stmt->execute([$serviceId, $vendorId]);
+
+                    audit_log(
+                        $pdo,
+                        (int)$_SESSION['user_id'],
+                        (string)$_SESSION['role'],
+                        'service.delete',
+                        'service',
+                        (string)$serviceId,
+                        ['vendor_id' => $vendorId]
+                    );
+
                     $_SESSION['flash_success'] = 'Service deleted successfully.';
                 }
             }
@@ -81,6 +164,20 @@ try {
             if ($serviceId) {
                 $stmt = $pdo->prepare('UPDATE services SET availability = ? WHERE service_id = ? AND vendor_id = ?');
                 $stmt->execute([$availability, $serviceId, $vendorId]);
+
+                audit_log(
+                    $pdo,
+                    (int)$_SESSION['user_id'],
+                    (string)$_SESSION['role'],
+                    'service.availability_update',
+                    'service',
+                    (string)$serviceId,
+                    [
+                        'vendor_id' => $vendorId,
+                        'availability' => $availability,
+                    ]
+                );
+
                 $_SESSION['flash_success'] = 'Service updated.';
             }
             header('Location: services.php');
@@ -102,7 +199,7 @@ try {
         }
     }
 } catch (Throwable $e) {
-    $flashError = 'Unable to load services at the moment.';
+    error_log('vendor/services.php error: ' . $e->getMessage());
 }
 ?>
 <!DOCTYPE html>
@@ -145,8 +242,9 @@ try {
         input:checked + .slider { background: #635bff; border-color: #635bff; }
         input:checked + .slider:before { transform: translateX(22px); background: #fff; }
         .bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; height: 65px; background: #2b2b2b; display: flex; }
-        .nav-link { color: #fff; text-decoration: none; opacity: .85; flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; font-size: 12px; }
+        .nav-link { color: #fff; text-decoration: none; opacity: .85; flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; font-size: 12px; position: relative; }
         .nav-link.active, .nav-link:hover { opacity: 1; background: rgba(255,255,255,0.08); }
+        .badge-unread { display: inline-block; min-width: 18px; height: 18px; border-radius: 999px; background: #e74c3c; color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; padding: 0 5px; position: absolute; top: 8px; right: 12px; }
         @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
     </style>
 </head>
@@ -228,7 +326,7 @@ try {
 <nav class="bottom-nav">
     <a href="dashboard.php" class="nav-link"><i class="fa-solid fa-house"></i><span>Home</span></a>
     <a href="services.php" class="nav-link active"><i class="fa-solid fa-bell-concierge"></i><span>Services</span></a>
-    <a href="bookings.php" class="nav-link"><i class="fa-solid fa-book-open"></i><span>Bookings</span></a>
+    <a href="bookings.php" class="nav-link"><i class="fa-solid fa-book-open"></i><span>Bookings</span><?php if ($newPendingCount > 0): ?><span class="badge-unread"><?php echo $newPendingCount; ?></span><?php endif; ?></a>
     <a href="schedule.php" class="nav-link"><i class="fa-solid fa-calendar-days"></i><span>Schedule</span></a>
     <a href="profile.php" class="nav-link"><i class="fa-solid fa-user"></i><span>Profile</span></a>
 </nav>

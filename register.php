@@ -1,15 +1,57 @@
 ﻿<?php
+if (session_status() !== PHP_SESSION_ACTIVE) {
+    $secureCookie = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off');
+    session_set_cookie_params([
+        'lifetime' => 0,
+        'path' => '/',
+        'secure' => $secureCookie,
+        'httponly' => true,
+        'samesite' => 'Lax',
+    ]);
+}
+
 session_start();
 require_once 'config/db.php';
 require_once 'includes/csrf.php';
+require_once 'includes/audit.php';
 
 $error = '';
+
+function isDisposableEmailDomain(string $email): bool
+{
+    $domain = strtolower((string)substr(strrchr($email, '@') ?: '', 1));
+    if ($domain === '') {
+        return false;
+    }
+
+    $blockedDomains = [
+        '10minutemail.com',
+        'guerrillamail.com',
+        'mailinator.com',
+        'tempmail.com',
+        'yopmail.com',
+    ];
+
+    return in_array($domain, $blockedDomains, true);
+}
+
+function isStrongPassword(string $password): bool
+{
+    if (strlen($password) < 8) {
+        return false;
+    }
+
+    return preg_match('/[A-Z]/', $password)
+        && preg_match('/[a-z]/', $password)
+        && preg_match('/[0-9]/', $password)
+        && preg_match('/[^A-Za-z0-9]/', $password);
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     csrf_require_valid_post_token();
 
     $fullName = trim($_POST['full_name']);
-    $email    = trim($_POST['email']);
+    $email    = strtolower(trim($_POST['email']));
     $rawPassword = $_POST['password'] ?? '';
     $role     = $_POST['role'] ?? '';
 
@@ -17,6 +59,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $error = 'Please select a valid role.';
     } elseif ($fullName === '' || $email === '' || $rawPassword === '') {
         $error = 'All required fields must be filled.';
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $error = 'Please enter a valid email address.';
+    } elseif (strlen($email) > 190) {
+        $error = 'Email address is too long.';
+    } elseif (isDisposableEmailDomain($email)) {
+        $error = 'Please use a permanent email address.';
+    } elseif (!isStrongPassword($rawPassword)) {
+        $error = 'Password must be at least 8 characters and include uppercase, lowercase, number, and symbol.';
     }
 
     if ($error === '') {
@@ -54,13 +104,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $pdo->commit();
+
+            audit_log(
+                $pdo,
+                (int)$userId,
+                $role,
+                'auth.register_success'
+            );
+
             header('Location: login.php');
             exit;
         } catch (Throwable $e) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();
             }
-            $error = $e->getMessage();
+            audit_log(
+                $pdo,
+                null,
+                $role ?: null,
+                'auth.register_failed',
+                'user',
+                $email,
+                ['reason' => 'exception']
+            );
+            $error = 'Registration failed. Please try again.';
+            error_log('register.php error: ' . $e->getMessage());
         }
     }
 }

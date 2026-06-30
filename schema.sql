@@ -113,6 +113,13 @@ CREATE TABLE IF NOT EXISTS messages (
     CONSTRAINT fk_messages_vendor_user FOREIGN KEY (vendor_user_id) REFERENCES users(user_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS vendor_notification_state (
+    vendor_id INT NOT NULL PRIMARY KEY,
+    last_seen_pending_bookings_at DATETIME DEFAULT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_vendor_notification_state_vendor FOREIGN KEY (vendor_id) REFERENCES vendors(vendor_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS service_ratings (
     rating_id INT AUTO_INCREMENT PRIMARY KEY,
     attendee_id INT NOT NULL,
@@ -142,4 +149,27 @@ CREATE TABLE IF NOT EXISTS password_resets (
     INDEX idx_password_resets_user (user_id),
     INDEX idx_password_resets_expires (expires_at),
     CONSTRAINT fk_password_resets_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    log_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NULL,
+    role VARCHAR(32) NULL,
+    action VARCHAR(80) NOT NULL,
+    target_type VARCHAR(80) DEFAULT NULL,
+    target_id VARCHAR(80) DEFAULT NULL,
+    metadata_json TEXT NULL,
+    ip_address VARCHAR(45) DEFAULT NULL,
+    user_agent VARCHAR(255) DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_audit_logs_user_created (user_id, created_at),
+    INDEX idx_audit_logs_action_created (action, created_at),
+    CONSTRAINT fk_audit_logs_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS login_attempts (
+    attempt_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    email VARCHAR(190) NOT NULL,
+    attempted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_login_attempts_email_time (email, attempted_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

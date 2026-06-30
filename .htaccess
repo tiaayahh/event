@@ -1,0 +1,19 @@
+# Disable directory listing so /event/ does not show file index
+Options -Indexes
+
+# Ensure Apache serves the PHP homepage first
+DirectoryIndex index.php index.html
+
+# Block direct access to sensitive files and folders
+<IfModule mod_authz_core.c>
+    <FilesMatch "^(\.git|\.env|composer\.(json|lock)|package(-lock)?\.json|schema\.sql|verify_schema\.sql)$">
+        Require all denied
+    </FilesMatch>
+</IfModule>
+
+<IfModule !mod_authz_core.c>
+    <FilesMatch "^(\.git|\.env|composer\.(json|lock)|package(-lock)?\.json|schema\.sql|verify_schema\.sql)$">
+        Order allow,deny
+        Deny from all
+    </FilesMatch>
+</IfModule>

@@ -4,6 +4,7 @@ checkAuth();
 requireRole('vendor');
 
 $schedule = [];
+$newPendingCount = 0;
 
 try {
     $stmt = $pdo->prepare("SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1");
@@ -11,6 +12,40 @@ try {
     $vendor = $stmt->fetch();
 
     if ($vendor) {
+        $vendorId = (int)$vendor['vendor_id'];
+
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS vendor_notification_state (
+                vendor_id INT NOT NULL PRIMARY KEY,
+                last_seen_pending_bookings_at DATETIME NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                CONSTRAINT fk_vendor_notification_state_vendor FOREIGN KEY (vendor_id) REFERENCES vendors(vendor_id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        );
+
+        $stmt = $pdo->prepare('SELECT last_seen_pending_bookings_at FROM vendor_notification_state WHERE vendor_id = ? LIMIT 1');
+        $stmt->execute([$vendorId]);
+        $lastSeenPendingAt = $stmt->fetchColumn();
+
+        if ($lastSeenPendingAt) {
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*)
+                 FROM bookings b
+                 JOIN services s ON b.service_id = s.service_id
+                 WHERE s.vendor_id = ? AND b.status = 'pending' AND b.created_at > ?"
+            );
+            $stmt->execute([$vendorId, $lastSeenPendingAt]);
+        } else {
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*)
+                 FROM bookings b
+                 JOIN services s ON b.service_id = s.service_id
+                 WHERE s.vendor_id = ? AND b.status = 'pending'"
+            );
+            $stmt->execute([$vendorId]);
+        }
+        $newPendingCount = (int)$stmt->fetchColumn();
+
         $stmt = $pdo->prepare(
             "SELECT e.title AS event_title, e.event_date, s.name AS service_name, b.status
             FROM bookings b
@@ -19,11 +54,11 @@ try {
             WHERE s.vendor_id = ?
             ORDER BY e.event_date ASC"
         );
-        $stmt->execute([$vendor['vendor_id']]);
+        $stmt->execute([$vendorId]);
         $schedule = $stmt->fetchAll();
     }
 } catch (Throwable $e) {
-    $error = 'Could not load schedule.';
+    error_log('vendor/schedule.php error: ' . $e->getMessage());
 }
 ?>
 <!DOCTYPE html>
@@ -111,9 +146,11 @@ try {
             gap: 4px;
             opacity: 0.8;
             flex: 1;
+            position: relative;
         }
         .nav-link i { font-size: 18px; }
         .nav-link.active { opacity: 1; background: rgba(255,255,255,0.08); }
+        .badge-unread { display: inline-block; min-width: 18px; height: 18px; border-radius: 999px; background: #e74c3c; color: #fff; font-size: 11px; font-weight: 700; line-height: 18px; text-align: center; padding: 0 5px; position: absolute; top: 8px; right: 12px; }
     </style>
 </head>
 <body>
@@ -149,7 +186,7 @@ try {
     <nav class="bottom-nav">
         <a href="dashboard.php" class="nav-link"><i class="fa-solid fa-house"></i><span>Home</span></a>
         <a href="services.php" class="nav-link"><i class="fa-solid fa-bell-concierge"></i><span>Services</span></a>
-        <a href="bookings.php" class="nav-link"><i class="fa-solid fa-book-open"></i><span>Bookings</span></a>
+        <a href="bookings.php" class="nav-link"><i class="fa-solid fa-book-open"></i><span>Bookings</span><?php if ($newPendingCount > 0): ?><span class="badge-unread"><?php echo $newPendingCount; ?></span><?php endif; ?></a>
         <a href="schedule.php" class="nav-link active"><i class="fa-solid fa-calendar-days"></i><span>Schedule</span></a>
         <a href="profile.php" class="nav-link"><i class="fa-solid fa-user"></i><span>Profile</span></a>
     </nav>

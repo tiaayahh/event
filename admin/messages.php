@@ -5,6 +5,7 @@ requireRole('planner');
 
 $flashError = '';
 $vendors = [];
+$showUnreadOnly = isset($_GET['unread']) && $_GET['unread'] === '1';
 $selectedVendorUserId = filter_input(INPUT_GET, 'vendor_user_id', FILTER_VALIDATE_INT);
 $conversation = [];
 
@@ -24,7 +25,14 @@ try {
 
     $stmt = $pdo->query("SHOW COLUMNS FROM messages LIKE 'is_read'");
     if (!$stmt->fetch()) {
-        $pdo->exec("ALTER TABLE messages ADD COLUMN is_read TINYINT(1) NOT NULL DEFAULT 0");
+        try {
+            $pdo->exec("ALTER TABLE messages ADD COLUMN is_read TINYINT(1) NOT NULL DEFAULT 0");
+        } catch (Throwable $e) {
+            // Another request may have added this column first.
+            if (stripos($e->getMessage(), 'Duplicate column name') === false) {
+                throw $e;
+            }
+        }
     }
 
     $stmt = $pdo->prepare(
@@ -60,10 +68,18 @@ try {
                 ON m.planner_user_id = ?
                AND m.vendor_user_id = cv.vendor_user_id
          GROUP BY v.user_id, v.business_name, u.full_name
-         ORDER BY (last_message_at IS NULL), last_message_at DESC, v.business_name ASC"
+           ORDER BY CASE WHEN MAX(m.created_at) IS NULL THEN 1 ELSE 0 END,
+                MAX(m.created_at) DESC,
+                v.business_name ASC"
     );
     $stmt->execute([$_SESSION['user_id'], $_SESSION['user_id'], $_SESSION['user_id'], $_SESSION['user_id']]);
     $vendors = $stmt->fetchAll();
+
+    if ($showUnreadOnly) {
+        $vendors = array_values(array_filter($vendors, static function ($vendor) {
+            return (int)($vendor['unread_count'] ?? 0) > 0;
+        }));
+    }
 
     $allowedVendorIds = array_map(static function ($v) {
         return (int)$v['vendor_user_id'];
@@ -93,6 +109,17 @@ try {
         } else {
             $stmt = $pdo->prepare('INSERT INTO messages (planner_user_id, vendor_user_id, sender_role, message_text, is_read) VALUES (?, ?, ?, ?, 0)');
             $stmt->execute([$_SESSION['user_id'], $targetVendor, 'planner', $messageText]);
+
+            audit_log(
+                $pdo,
+                (int)$_SESSION['user_id'],
+                (string)$_SESSION['role'],
+                'message.send',
+                'conversation',
+                (string)$targetVendor,
+                ['recipient_role' => 'vendor']
+            );
+
             header('Location: messages.php?vendor_user_id=' . (int)$targetVendor);
             exit;
         }
@@ -120,7 +147,7 @@ try {
         $conversation = $stmt->fetchAll();
     }
 } catch (Throwable $e) {
-    $flashError = 'Unable to load messages right now.';
+    error_log('admin/messages.php error: ' . $e->getMessage());
 }
 ?>
 <!DOCTYPE html>
@@ -163,7 +190,7 @@ try {
         .input { width: 100%; border: 1px solid #d6d6d6; border-radius: 8px; padding: 10px; font-size: 14px; }
         .btn { background: #6C63FF; color: #fff; border: none; border-radius: 8px; padding: 10px 14px; font-size: 13px; cursor: pointer; }
         .empty { color: #777; font-size: 14px; padding: 10px 0; }
-        .refresh-note { color: #666; font-size: 12px; margin-bottom: 10px; }
+        .hint { background: #eef3ff; color: #2c4ea0; border: 1px solid #d9e4ff; border-radius: 6px; padding: 9px 11px; margin-bottom: 10px; font-size: 12px; }
         @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
     </style>
 </head>
@@ -181,6 +208,10 @@ try {
 
     <?php if ($flashError !== ''): ?>
         <div class="error"><?php echo htmlspecialchars($flashError); ?></div>
+    <?php endif; ?>
+
+    <?php if ($showUnreadOnly): ?>
+        <div class="hint"><i class="fa-solid fa-filter"></i> Showing unread conversations first. <a href="messages.php">View all</a></div>
     <?php endif; ?>
 
     <div class="layout">
@@ -209,7 +240,6 @@ try {
 
         <section class="card">
             <h2 class="title">Conversation</h2>
-            <div class="refresh-note"><i class="fa-solid fa-rotate"></i> Auto-refresh every 10 seconds.</div>
             <?php if (!$selectedVendorUserId): ?>
                 <div class="empty">Select a vendor to start chatting.</div>
             <?php else: ?>
@@ -239,19 +269,6 @@ try {
         </section>
     </div>
 </div>
-<script>
-    (function () {
-        const REFRESH_MS = 10000;
-        setInterval(function () {
-            const active = document.activeElement;
-            const tag = active && active.tagName ? active.tagName.toLowerCase() : '';
-            const isTyping = tag === 'input' || tag === 'textarea';
-            if (!isTyping && document.visibilityState === 'visible') {
-                window.location.reload();
-            }
-        }, REFRESH_MS);
-    })();
-</script>
 </body>
 </html>
 

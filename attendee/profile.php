@@ -10,9 +10,7 @@ $rateableServices = [];
 $myServiceRatings = [];
 $flashSuccess = $_SESSION['flash_success'] ?? '';
 $flashError = $_SESSION['flash_error'] ?? '';
-$hideEditFormOnLoad = isset($_SESSION['hide_edit_profile_form']) && $_SESSION['hide_edit_profile_form'] === true;
 unset($_SESSION['flash_success'], $_SESSION['flash_error']);
-unset($_SESSION['hide_edit_profile_form']);
 
 function ensureServiceRatingsTable(PDO $pdo): void
 {
@@ -51,13 +49,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_profile'])) {
             } else {
                 $stmt = $pdo->prepare('UPDATE users SET full_name = ?, email = ? WHERE user_id = ?');
                 $stmt->execute([$newFullName, $newEmail, $_SESSION['user_id']]);
+
+                audit_log(
+                    $pdo,
+                    (int)$_SESSION['user_id'],
+                    (string)$_SESSION['role'],
+                    'profile.update',
+                    'user',
+                    (string)$_SESSION['user_id'],
+                    ['email' => $newEmail]
+                );
+
                 $_SESSION['full_name'] = $newFullName;
                 $_SESSION['flash_success'] = 'Profile updated successfully.';
-                $_SESSION['hide_edit_profile_form'] = true;
                 header('Location: profile.php');
                 exit;
             }
         } catch (Throwable $e) {
+            audit_log(
+                $pdo,
+                (int)$_SESSION['user_id'],
+                (string)$_SESSION['role'],
+                'profile.update_failed',
+                'user',
+                (string)$_SESSION['user_id'],
+                ['reason' => 'exception']
+            );
             $flashError = 'Unable to update profile right now.';
         }
     }
@@ -115,12 +132,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['rate_service'])) {
                         $feedback === '' ? null : $feedback
                     ]);
 
+                    audit_log(
+                        $pdo,
+                        (int)$_SESSION['user_id'],
+                        (string)$_SESSION['role'],
+                        'rating.upsert',
+                        'service',
+                        (string)$serviceId,
+                        [
+                            'rating' => $ratingValue,
+                            'vendor_id' => (int)$service['vendor_id'],
+                        ]
+                    );
+
                     $_SESSION['flash_success'] = 'Your service rating has been saved.';
                     header('Location: profile.php');
                     exit;
                 }
             }
         } catch (Throwable $e) {
+            audit_log(
+                $pdo,
+                (int)$_SESSION['user_id'],
+                (string)$_SESSION['role'],
+                'rating.upsert_failed',
+                'service',
+                $serviceId > 0 ? (string)$serviceId : null,
+                ['reason' => 'exception']
+            );
             $flashError = 'Unable to save your rating right now.';
         }
     }
@@ -468,11 +507,11 @@ try {
                 </div>
             </div>
 
-            <button type="button" class="btn-outline" id="toggleEditBtn" onclick="toggleEditForm()" style="<?php echo $hideEditFormOnLoad ? '' : 'display: none;'; ?>">
+            <button type="button" class="btn-outline" id="toggleEditBtn" onclick="toggleEditForm()">
                 <i class="fa-solid fa-pen-to-square"></i> Edit Profile
             </button>
 
-            <div id="editFormContainer" style="<?php echo $hideEditFormOnLoad ? 'display: none;' : 'display: block;'; ?>">
+            <div id="editFormContainer" style="display: none;">
                 <form method="POST" class="edit-form">
                     <?php echo csrf_input(); ?>
                     <h2 class="form-title"><i class="fa-solid fa-user-pen"></i> Edit Profile</h2>

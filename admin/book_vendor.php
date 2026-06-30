@@ -72,7 +72,7 @@ try {
 		if (!$serviceId) {
 			$flashError = 'Please choose a valid service.';
 		} else {
-			$stmt = $pdo->prepare('SELECT service_id, price, availability FROM services WHERE service_id = ? AND vendor_id = ? LIMIT 1');
+			$stmt = $pdo->prepare('SELECT service_id, name, price, availability FROM services WHERE service_id = ? AND vendor_id = ? LIMIT 1');
 			$stmt->execute([$serviceId, $vendorId]);
 			$service = $stmt->fetch();
 
@@ -103,6 +103,7 @@ try {
 
 					$stmt = $pdo->prepare('INSERT INTO bookings (event_id, service_id, status, booked_price, created_at) VALUES (?, ?, ?, ?, NOW())');
 					$stmt->execute([$eventId, $serviceId, 'pending', $service['price']]);
+					$newBookingId = (int)$pdo->lastInsertId();
 
 					$notificationText = sprintf(
 						'You have a new booking: "%s" was booked for event "%s" scheduled on %s.',
@@ -113,6 +114,20 @@ try {
 
 					$stmt = $pdo->prepare('INSERT INTO messages (planner_user_id, vendor_user_id, sender_role, message_text, is_read) VALUES (?, ?, ?, ?, 0)');
 					$stmt->execute([$_SESSION['user_id'], (int)$vendor['user_id'], 'planner', $notificationText]);
+
+					audit_log(
+						$pdo,
+						(int)$_SESSION['user_id'],
+						(string)$_SESSION['role'],
+						'booking.create',
+						'booking',
+						(string)$newBookingId,
+						[
+							'event_id' => (int)$eventId,
+							'service_id' => (int)$serviceId,
+							'vendor_id' => (int)$vendorId,
+						]
+					);
 
 					$pdo->commit();
 
@@ -140,6 +155,15 @@ try {
 	if ($pdo->inTransaction()) {
 		$pdo->rollBack();
 	}
+	audit_log(
+		$pdo,
+		isset($_SESSION['user_id']) ? (int)$_SESSION['user_id'] : null,
+		$_SESSION['role'] ?? null,
+		'booking.create_failed',
+		'booking',
+		null,
+		['reason' => 'exception']
+	);
 	$flashError = 'Unable to load booking details right now.';
 }
 ?>

@@ -9,17 +9,75 @@ $businessName = '';
 $serviceType = '';
 $vendorDescription = '';
 $serviceCount = 0;
+$averageRating = 0.0;
+$ratingCount = 0;
+$recentRatings = [];
+$newPendingCount = 0;
 $flashSuccess = $_SESSION['flash_success'] ?? '';
 $flashError = $_SESSION['flash_error'] ?? '';
 unset($_SESSION['flash_success'], $_SESSION['flash_error']);
 
+function ensureServiceRatingsTable(PDO $pdo): void
+{
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS service_ratings (
+            rating_id INT AUTO_INCREMENT PRIMARY KEY,
+            attendee_id INT NOT NULL,
+            service_id INT NOT NULL,
+            vendor_id INT NOT NULL,
+            rating TINYINT NOT NULL,
+            feedback VARCHAR(500) DEFAULT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_attendee_service_rating (attendee_id, service_id),
+            INDEX idx_service_ratings_service (service_id),
+            INDEX idx_service_ratings_vendor (vendor_id),
+            INDEX idx_service_ratings_attendee (attendee_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    );
+}
+
 try {
+    ensureServiceRatingsTable($pdo);
+
     $stmt = $pdo->prepare("SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1");
     $stmt->execute([$_SESSION['user_id']]);
     $vendor = $stmt->fetch();
 
     if ($vendor) {
         $vendorId = (int)$vendor['vendor_id'];
+
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS vendor_notification_state (
+                vendor_id INT NOT NULL PRIMARY KEY,
+                last_seen_pending_bookings_at DATETIME NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                CONSTRAINT fk_vendor_notification_state_vendor FOREIGN KEY (vendor_id) REFERENCES vendors(vendor_id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        );
+
+        $stmt = $pdo->prepare('SELECT last_seen_pending_bookings_at FROM vendor_notification_state WHERE vendor_id = ? LIMIT 1');
+        $stmt->execute([$vendorId]);
+        $lastSeenPendingAt = $stmt->fetchColumn();
+
+        if ($lastSeenPendingAt) {
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*)
+                 FROM bookings b
+                 JOIN services s ON b.service_id = s.service_id
+                 WHERE s.vendor_id = ? AND b.status = 'pending' AND b.created_at > ?"
+            );
+            $stmt->execute([$vendorId, $lastSeenPendingAt]);
+        } else {
+            $stmt = $pdo->prepare(
+                "SELECT COUNT(*)
+                 FROM bookings b
+                 JOIN services s ON b.service_id = s.service_id
+                 WHERE s.vendor_id = ? AND b.status = 'pending'"
+            );
+            $stmt->execute([$vendorId]);
+        }
+        $newPendingCount = (int)$stmt->fetchColumn();
 
         // Handle Account Update
         if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_account_profile'])) {
@@ -39,6 +97,17 @@ try {
                 } else {
                     $stmt = $pdo->prepare('UPDATE users SET full_name = ?, email = ? WHERE user_id = ?');
                     $stmt->execute([$newFullName, $newEmail, $_SESSION['user_id']]);
+
+                    audit_log(
+                        $pdo,
+                        (int)$_SESSION['user_id'],
+                        (string)$_SESSION['role'],
+                        'profile.update',
+                        'user',
+                        (string)$_SESSION['user_id'],
+                        ['email' => $newEmail]
+                    );
+
                     $_SESSION['full_name'] = $newFullName;
                     $_SESSION['flash_success'] = 'Account profile updated successfully.';
                 }
@@ -59,6 +128,20 @@ try {
             } else {
                 $stmt = $pdo->prepare('UPDATE vendors SET business_name = ?, service_type = ?, description = ? WHERE vendor_id = ? AND user_id = ?');
                 $stmt->execute([$newBusinessName, $newServiceType, $newDescription, $vendorId, $_SESSION['user_id']]);
+
+                audit_log(
+                    $pdo,
+                    (int)$_SESSION['user_id'],
+                    (string)$_SESSION['role'],
+                    'vendor_profile.update',
+                    'vendor',
+                    (string)$vendorId,
+                    [
+                        'business_name' => $newBusinessName,
+                        'service_type' => $newServiceType,
+                    ]
+                );
+
                 $_SESSION['flash_success'] = 'Vendor profile updated successfully.';
             }
 
@@ -81,15 +164,37 @@ try {
         $stmt = $pdo->prepare("SELECT COUNT(*) FROM services WHERE vendor_id = ?");
         $stmt->execute([$vendorId]);
         $serviceCount = (int)$stmt->fetchColumn();
+
+        $stmt = $pdo->prepare(
+            "SELECT COALESCE(AVG(rating), 0) AS avg_rating, COUNT(*) AS rating_count
+             FROM service_ratings
+             WHERE vendor_id = ?"
+        );
+        $stmt->execute([$vendorId]);
+        $ratingStats = $stmt->fetch();
+        if ($ratingStats) {
+            $averageRating = (float)$ratingStats['avg_rating'];
+            $ratingCount = (int)$ratingStats['rating_count'];
+        }
+
+        $stmt = $pdo->prepare(
+            "SELECT sr.rating, sr.feedback, sr.updated_at, u.full_name
+             FROM service_ratings sr
+             JOIN attendees a ON sr.attendee_id = a.attendee_id
+             JOIN users u ON a.user_id = u.user_id
+             WHERE sr.vendor_id = ?
+             ORDER BY sr.updated_at DESC
+             LIMIT 5"
+        );
+        $stmt->execute([$vendorId]);
+        $recentRatings = $stmt->fetchAll();
     } else {
         if ($flashError === '') {
             $flashError = 'Vendor profile not found.';
         }
     }
 } catch (Throwable $e) {
-    if ($flashError === '') {
-        $flashError = 'Unable to load profile details right now.';
-    }
+    error_log('vendor/profile.php error: ' . $e->getMessage());
 }
 ?>
 <!DOCTYPE html>
@@ -369,6 +474,68 @@ try {
             flex-wrap: wrap;
         }
 
+        .ratings-panel {
+            margin-top: 18px;
+            text-align: left;
+            border: 1px solid #EFEFEF;
+            border-radius: 12px;
+            padding: 14px;
+            background: #FAFAFA;
+        }
+
+        .ratings-title {
+            font-size: 14px;
+            font-weight: 700;
+            margin-bottom: 10px;
+            color: #2D2D2D;
+        }
+
+        .rating-item {
+            border-bottom: 1px solid #ECECEC;
+            padding: 10px 0;
+        }
+
+        .rating-item:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+
+        .rating-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+        }
+
+        .rating-author {
+            font-weight: 600;
+            color: #2D2D2D;
+        }
+
+        .rating-score {
+            color: #F39C12;
+            font-weight: 700;
+        }
+
+        .rating-note {
+            font-size: 12px;
+            color: #666;
+            margin-top: 6px;
+            line-height: 1.5;
+        }
+
+        .rating-time {
+            font-size: 11px;
+            color: #999;
+            margin-top: 4px;
+        }
+
+        .rating-empty {
+            font-size: 13px;
+            color: #777;
+        }
+
         .bottom-nav {
             position: fixed;
             bottom: 0;
@@ -394,6 +561,7 @@ try {
             gap: 4px;
             opacity: 0.85;
             flex: 1;
+            position: relative;
         }
 
         .nav-link i {
@@ -403,6 +571,23 @@ try {
         .nav-link.active {
             opacity: 1;
             background-color: rgba(255, 255, 255, 0.08);
+        }
+
+        .badge-unread {
+            display: inline-block;
+            min-width: 18px;
+            height: 18px;
+            border-radius: 999px;
+            background: #e74c3c;
+            color: #fff;
+            font-size: 11px;
+            font-weight: 700;
+            line-height: 18px;
+            text-align: center;
+            padding: 0 5px;
+            position: absolute;
+            top: 8px;
+            right: 12px;
         }
 
         @media (max-width: 500px) {
@@ -479,9 +664,29 @@ try {
                     <div class="stat-label">Services</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-number"><i class="fa-regular fa-star" style="color:#F39C12;"></i> 4.8</div>
-                    <div class="stat-label">Rating</div>
+                    <div class="stat-number"><i class="fa-regular fa-star" style="color:#F39C12;"></i> <?php echo number_format($averageRating, 1); ?></div>
+                    <div class="stat-label">Rating (<?php echo $ratingCount; ?> review<?php echo $ratingCount === 1 ? '' : 's'; ?>)</div>
                 </div>
+            </div>
+
+            <div class="ratings-panel">
+                <div class="ratings-title">Recent Attendee Ratings</div>
+                <?php if (empty($recentRatings)): ?>
+                    <div class="rating-empty">No attendee ratings yet.</div>
+                <?php else: ?>
+                    <?php foreach ($recentRatings as $rating): ?>
+                        <div class="rating-item">
+                            <div class="rating-top">
+                                <span class="rating-author"><?php echo htmlspecialchars((string)$rating['full_name']); ?></span>
+                                <span class="rating-score"><?php echo (int)$rating['rating']; ?>/5</span>
+                            </div>
+                            <?php if (!empty($rating['feedback'])): ?>
+                                <div class="rating-note"><?php echo nl2br(htmlspecialchars((string)$rating['feedback'])); ?></div>
+                            <?php endif; ?>
+                            <div class="rating-time"><?php echo htmlspecialchars((string)$rating['updated_at']); ?></div>
+                        </div>
+                    <?php endforeach; ?>
+                <?php endif; ?>
             </div>
 
             <!-- Toggle button for edit forms -->
@@ -549,6 +754,7 @@ try {
         </a>
         <a href="bookings.php" class="nav-link">
             <i class="fa-solid fa-book-open"></i><span>Bookings</span>
+            <?php if ($newPendingCount > 0): ?><span class="badge-unread"><?php echo $newPendingCount; ?></span><?php endif; ?>
         </a>
         <a href="schedule.php" class="nav-link">
             <i class="fa-solid fa-calendar-days"></i><span>Schedule</span>
