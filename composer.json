@@ -1,0 +1,12 @@
+{
+    "name": "planora/event-system",
+    "description": "Planora event system dependencies",
+    "type": "project",
+    "require": {
+        "php": ">=8.1",
+        "phpmailer/phpmailer": "^6.10"
+    },
+    "config": {
+        "vendor-dir": "third_party"
+    }
+}

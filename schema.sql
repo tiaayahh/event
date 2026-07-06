@@ -42,13 +42,65 @@ CREATE TABLE IF NOT EXISTS events (
     planner_id INT NOT NULL,
     title VARCHAR(190) NOT NULL,
     event_date DATE NOT NULL,
+    venue VARCHAR(190) DEFAULT NULL,
     budget_total DECIMAL(12,2) NOT NULL DEFAULT 0.00,
     budget_committed DECIMAL(12,2) NOT NULL DEFAULT 0.00,
     ticket_price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
     ticket_revenue DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    attendee_contribution_target DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    vendor_contribution_target DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    vendor_fee_amount DECIMAL(10,2) NOT NULL DEFAULT 100.00,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_events_planner_date (planner_id, event_date),
     CONSTRAINT fk_events_planner FOREIGN KEY (planner_id) REFERENCES users(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS event_budget_items (
+    item_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_id INT NOT NULL,
+    item_name VARCHAR(190) NOT NULL,
+    planned_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    spent_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    sort_order INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_event_budget_items_event_sort (event_id, sort_order),
+    CONSTRAINT fk_event_budget_items_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS event_ticket_types (
+    ticket_type_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_id INT NOT NULL,
+    ticket_type VARCHAR(32) NOT NULL,
+    price DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    description VARCHAR(255) DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_event_ticket_type (event_id, ticket_type),
+    CONSTRAINT fk_event_ticket_types_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS event_sponsorships (
+    sponsorship_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_id INT NOT NULL,
+    sponsor_name VARCHAR(190) NOT NULL,
+    contribution_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_event_sponsorships_event (event_id),
+    CONSTRAINT fk_event_sponsorships_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS event_financial_adjustments (
+    adjustment_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_id INT NOT NULL,
+    entry_kind ENUM('committed_paid','cash_available') NOT NULL,
+    amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    note VARCHAR(255) DEFAULT NULL,
+    created_by INT DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_event_fin_adj_event_kind (event_id, entry_kind),
+    CONSTRAINT fk_event_fin_adj_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
+    CONSTRAINT fk_event_fin_adj_user FOREIGN KEY (created_by) REFERENCES users(user_id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS services (
@@ -70,6 +122,7 @@ CREATE TABLE IF NOT EXISTS bookings (
     status ENUM('pending', 'confirmed', 'cancelled') NOT NULL DEFAULT 'pending',
     booked_price DECIMAL(12,2) NOT NULL DEFAULT 0.00,
     platform_fee DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    booth_number VARCHAR(64) DEFAULT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_booking_event_service (event_id, service_id),
     INDEX idx_bookings_status_created (status, created_at),
@@ -173,3 +226,14 @@ CREATE TABLE IF NOT EXISTS login_attempts (
     attempted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_login_attempts_email_time (email, attempted_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS user_totp_auth (
+    user_id INT NOT NULL PRIMARY KEY,
+    secret_key VARCHAR(64) NOT NULL,
+    is_enabled TINYINT(1) NOT NULL DEFAULT 0,
+    verified_at DATETIME DEFAULT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_user_totp_auth_user FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+

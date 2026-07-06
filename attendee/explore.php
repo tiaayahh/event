@@ -12,7 +12,7 @@ try {
         $stmt = $pdo->prepare(
             "SELECT event_id, title, event_date, ticket_price
             FROM events
-            WHERE event_date >= CURDATE() AND title LIKE ?
+            WHERE event_date >= CURDATE() AND archived_at IS NULL AND title LIKE ?
             ORDER BY event_date ASC
             LIMIT 20"
         );
@@ -21,7 +21,7 @@ try {
         $stmt = $pdo->query(
             "SELECT event_id, title, event_date, ticket_price
             FROM events
-            WHERE event_date >= CURDATE()
+            WHERE event_date >= CURDATE() AND archived_at IS NULL
             ORDER BY event_date ASC
             LIMIT 20"
         );
@@ -194,7 +194,7 @@ try {
                             <div class="event-date"><?php echo htmlspecialchars($event['event_date']); ?></div>
                             <div class="event-date">Price: KES <?php echo number_format((float)$event['ticket_price'], 2); ?></div>
                         </div>
-                        <a href="register_event.php?event_id=<?php echo urlencode((string)$event['event_id']); ?>" class="register-link">Register</a>
+                        <a href="register_event.php?event_id=<?php echo urlencode((string)$event['event_id']); ?>" class="register-link">Pay & Register</a>
                     </div>
                 <?php endforeach; ?>
             </div>
@@ -205,6 +205,7 @@ try {
         <a href="dashboard.php" class="nav-item"><i class="fa-solid fa-house"></i><span>Home</span></a>
         <a href="explore.php" class="nav-item active"><i class="fa-solid fa-compass"></i><span>Explore</span></a>
         <a href="my_events.php" class="nav-item"><i class="fa-solid fa-list-check"></i><span>My Events</span></a>
+        <a href="messages.php" class="nav-item"><i class="fa-solid fa-comments"></i><span>Messages</span></a>
         <a href="profile.php" class="nav-item"><i class="fa-solid fa-user"></i><span>Profile</span></a>
     </nav>
 </body>

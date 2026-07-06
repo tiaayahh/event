@@ -67,11 +67,11 @@ try {
         $email = $user['email'];
     }
 
-    $stmt = $pdo->prepare('SELECT COUNT(*) FROM events WHERE planner_id = ?');
+    $stmt = $pdo->prepare('SELECT COUNT(*) FROM events WHERE planner_id = ? AND archived_at IS NULL');
     $stmt->execute([$_SESSION['user_id']]);
     $eventCount = (int)$stmt->fetchColumn();
 
-    $stmt = $pdo->prepare('SELECT COUNT(*) FROM bookings b JOIN events e ON b.event_id = e.event_id WHERE e.planner_id = ?');
+    $stmt = $pdo->prepare('SELECT COUNT(*) FROM bookings b JOIN events e ON b.event_id = e.event_id WHERE e.planner_id = ? AND e.archived_at IS NULL');
     $stmt->execute([$_SESSION['user_id']]);
     $bookingCount = (int)$stmt->fetchColumn();
 } catch (Throwable $e) {

@@ -1,4 +1,49 @@
 <?php
+if (!function_exists('loadEnvFile')) {
+    function loadEnvFile(string $envPath): void
+    {
+        static $loaded = false;
+        if ($loaded || !is_file($envPath) || !is_readable($envPath)) {
+            return;
+        }
+
+        $lines = file($envPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($lines === false) {
+            return;
+        }
+
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if ($line === '' || str_starts_with($line, '#')) {
+                continue;
+            }
+
+            $parts = explode('=', $line, 2);
+            if (count($parts) !== 2) {
+                continue;
+            }
+
+            $key = trim($parts[0]);
+            $value = trim($parts[1]);
+            if ($key === '') {
+                continue;
+            }
+
+            $value = trim($value, " \t\n\r\0\x0B\"'");
+
+            if (getenv($key) === false || getenv($key) === '') {
+                putenv($key . '=' . $value);
+                $_ENV[$key] = $value;
+                $_SERVER[$key] = $value;
+            }
+        }
+
+        $loaded = true;
+    }
+}
+
+loadEnvFile(dirname(__DIR__) . '/.env');
+
 $host = getenv('DB_HOST') ?: 'localhost';
 $port = getenv('DB_PORT') ?: '3306';
 $db   = getenv('DB_NAME') ?: 'event_planner_db';

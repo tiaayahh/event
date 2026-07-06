@@ -122,25 +122,10 @@ try {
             if (!$serviceId) {
                 $_SESSION['flash_error'] = 'Invalid service selected for deletion.';
             } else {
-                $stmt = $pdo->prepare('SELECT COUNT(*) FROM bookings WHERE service_id = ?');
-                $stmt->execute([$serviceId]);
-                $bookingCount = (int)$stmt->fetchColumn();
+                $stmt = $pdo->prepare('DELETE FROM services WHERE service_id = ? AND vendor_id = ?');
+                $stmt->execute([$serviceId, $vendorId]);
 
-                if ($bookingCount > 0) {
-                    audit_log(
-                        $pdo,
-                        (int)$_SESSION['user_id'],
-                        (string)$_SESSION['role'],
-                        'service.delete_blocked_has_bookings',
-                        'service',
-                        (string)$serviceId,
-                        ['vendor_id' => $vendorId]
-                    );
-                    $_SESSION['flash_error'] = 'Cannot delete a service that already has bookings.';
-                } else {
-                    $stmt = $pdo->prepare('DELETE FROM services WHERE service_id = ? AND vendor_id = ?');
-                    $stmt->execute([$serviceId, $vendorId]);
-
+                if ($stmt->rowCount() > 0) {
                     audit_log(
                         $pdo,
                         (int)$_SESSION['user_id'],
@@ -150,10 +135,44 @@ try {
                         (string)$serviceId,
                         ['vendor_id' => $vendorId]
                     );
-
                     $_SESSION['flash_success'] = 'Service deleted successfully.';
+                } else {
+                    $_SESSION['flash_error'] = 'Service not found or already deleted.';
                 }
             }
+            header('Location: services.php');
+            exit;
+        }
+
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_all_services'])) {
+            $stmt = $pdo->prepare('SELECT service_id FROM services WHERE vendor_id = ?');
+            $stmt->execute([$vendorId]);
+            $serviceIds = array_map(static fn ($row) => (int)$row['service_id'], $stmt->fetchAll());
+
+            if (empty($serviceIds)) {
+                $_SESSION['flash_error'] = 'No services found to delete.';
+            } else {
+                $stmt = $pdo->prepare('DELETE FROM services WHERE vendor_id = ?');
+                $stmt->execute([$vendorId]);
+                $deletedCount = (int)$stmt->rowCount();
+
+                audit_log(
+                    $pdo,
+                    (int)$_SESSION['user_id'],
+                    (string)$_SESSION['role'],
+                    'service.delete_all',
+                    'vendor',
+                    (string)$vendorId,
+                    [
+                        'vendor_id' => $vendorId,
+                        'deleted_count' => $deletedCount,
+                        'service_ids' => $serviceIds,
+                    ]
+                );
+
+                $_SESSION['flash_success'] = 'All services deleted successfully.';
+            }
+
             header('Location: services.php');
             exit;
         }
@@ -290,6 +309,13 @@ try {
 
     <div class="dashboard-card">
         <h2 class="card-title">My Services</h2>
+        <?php if (!empty($services)): ?>
+            <form method="POST" onsubmit="return confirm('Delete all services? This will remove all your services and related bookings.');" style="margin-bottom:12px;">
+                <?php echo csrf_input(); ?>
+                <input type="hidden" name="delete_all_services" value="1">
+                <button class="action-btn delete-btn" type="submit">Delete All Services</button>
+            </form>
+        <?php endif; ?>
         <?php if (empty($services)): ?>
             <div class="service-item"><span>No services added yet.</span></div>
         <?php else: ?>

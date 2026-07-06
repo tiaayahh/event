@@ -235,6 +235,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             background: #fff;
         }
 
+        .password-hint {
+            font-size: 12px;
+            color: #666;
+            margin-top: 6px;
+            line-height: 1.5;
+        }
+
         select.form-control {
             appearance: none;
             background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%236C63FF' d='M10.293 3.293L6 7.586 1.707 3.293A1 1 0 00.293 4.707l5 5a1 1 0 001.414 0l5-5a1 1 0 10-1.414-1.414z'/%3E%3C/svg%3E");
@@ -323,7 +330,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             <div class="form-group">
                 <label for="password">Password</label>
-                <input type="password" id="password" name="password" class="form-control" placeholder="At least 6 characters" required>
+                <input type="password" id="password" name="password" class="form-control" placeholder="Use a strong password" required>
+                <p class="password-hint">Use at least 8 characters with uppercase, lowercase, number, and symbol.</p>
             </div>
 
             <div class="form-group">

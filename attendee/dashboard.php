@@ -17,7 +17,7 @@ try {
         $stmt = $pdo->prepare(
             "SELECT event_id, title, event_date, ticket_price
             FROM events
-            WHERE event_date >= CURDATE() AND title LIKE ?
+            WHERE event_date >= CURDATE() AND archived_at IS NULL AND title LIKE ?
             ORDER BY event_date ASC
             LIMIT 10"
         );
@@ -26,7 +26,7 @@ try {
         $stmt = $pdo->query(
             "SELECT event_id, title, event_date, ticket_price
             FROM events
-            WHERE event_date >= CURDATE()
+            WHERE event_date >= CURDATE() AND archived_at IS NULL
             ORDER BY event_date ASC
             LIMIT 10"
         );
@@ -44,7 +44,7 @@ try {
             "SELECT a.status, e.title, e.event_date
             FROM attendances a
             JOIN events e ON a.event_id = e.event_id
-            WHERE a.attendee_id = ?
+            WHERE a.attendee_id = ? AND e.archived_at IS NULL
             ORDER BY e.event_date DESC"
         );
         $stmt->execute([$attendee['attendee_id']]);
@@ -136,14 +136,16 @@ try {
             border-radius: 6px;
             padding: 0 16px;
             cursor: pointer;
-            font-size: 14px;
+            font-size: 16px;
             font-weight: 600;
         }
 
         .welcome-text {
             margin-bottom: 18px;
             color: #444444;
-            font-size: 14px;
+            font-size: 16px;
+            font-weight: 700;
+            font-family: "Trebuchet MS", Verdana, sans-serif;
         }
 
         .error-msg {
@@ -338,6 +340,10 @@ try {
         <a href="my_events.php" class="nav-item">
             <i class="fa-solid fa-list-check"></i>
             <span>My Events</span>
+        </a>
+        <a href="messages.php" class="nav-item">
+            <i class="fa-solid fa-comments"></i>
+            <span>Messages</span>
         </a>
         <a href="profile.php" class="nav-item">
             <i class="fa-solid fa-user"></i>

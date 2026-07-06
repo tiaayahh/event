@@ -6,9 +6,32 @@ requireRole('vendor');
 $fullName = $_SESSION['full_name'] ?? 'Vendor';
 $bookings = [];
 $newPendingCount = 0;
+$flashSuccess = (string)($_SESSION['flash_success'] ?? '');
+$flashError = (string)($_SESSION['flash_error'] ?? '');
+unset($_SESSION['flash_success'], $_SESSION['flash_error']);
 $statusFilter = strtolower(trim((string)($_GET['status'] ?? 'all')));
-if (!in_array($statusFilter, ['all', 'pending', 'confirmed'], true)) {
+if (!in_array($statusFilter, ['all', 'pending', 'confirmed', 'cancelled'], true)) {
     $statusFilter = 'all';
+}
+
+function ensureBookingDisplaySchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM events LIKE 'venue'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE events ADD COLUMN venue VARCHAR(190) DEFAULT NULL AFTER event_date");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM bookings LIKE 'booth_number'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE bookings ADD COLUMN booth_number VARCHAR(64) DEFAULT NULL AFTER platform_fee");
+    }
+
+    $ready = true;
 }
 
 try {
@@ -18,6 +41,111 @@ try {
 
     if ($vendor) {
         $vendorId = (int)$vendor['vendor_id'];
+
+        ensureBookingDisplaySchema($pdo);
+
+        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['booking_action'], $_POST['booking_id'])) {
+            csrf_require_valid_post_token();
+
+            $bookingId = filter_input(INPUT_POST, 'booking_id', FILTER_VALIDATE_INT);
+            $bookingAction = strtolower(trim((string)($_POST['booking_action'] ?? '')));
+
+            if (!$bookingId || !in_array($bookingAction, ['accept', 'decline'], true)) {
+                $_SESSION['flash_error'] = 'Invalid booking action.';
+                header('Location: bookings.php?status=' . urlencode($statusFilter));
+                exit;
+            }
+
+            $stmt = $pdo->prepare(
+                "SELECT b.booking_id, b.status, b.event_id, e.planner_id, e.title AS event_title, s.name AS service_name
+                 FROM bookings b
+                 JOIN services s ON s.service_id = b.service_id
+                 JOIN events e ON e.event_id = b.event_id
+                 WHERE b.booking_id = ? AND s.vendor_id = ?
+                 LIMIT 1"
+            );
+            $stmt->execute([$bookingId, $vendorId]);
+            $targetBooking = $stmt->fetch();
+
+            if (!$targetBooking) {
+                $_SESSION['flash_error'] = 'Booking not found.';
+                header('Location: bookings.php?status=' . urlencode($statusFilter));
+                exit;
+            }
+
+            $currentStatus = strtolower((string)($targetBooking['status'] ?? 'pending'));
+            if ($bookingAction === 'accept' && $currentStatus !== 'pending') {
+                $_SESSION['flash_error'] = 'Only pending bookings can be accepted.';
+                header('Location: bookings.php?status=' . urlencode($statusFilter));
+                exit;
+            }
+            if ($bookingAction === 'decline' && !in_array($currentStatus, ['pending', 'confirmed'], true)) {
+                $_SESSION['flash_error'] = 'Only pending or confirmed bookings can be declined.';
+                header('Location: bookings.php?status=' . urlencode($statusFilter));
+                exit;
+            }
+
+            $newStatus = $bookingAction === 'accept' ? 'confirmed' : 'cancelled';
+
+            $pdo->beginTransaction();
+            try {
+                $stmt = $pdo->prepare('UPDATE bookings SET status = ? WHERE booking_id = ?');
+                $stmt->execute([$newStatus, $bookingId]);
+
+                // Keep transaction status consistent after vendor decision.
+                $stmt = $pdo->prepare('SELECT booking_id FROM transactions WHERE booking_id = ? LIMIT 1');
+                $stmt->execute([$bookingId]);
+                $hasTransaction = (bool)$stmt->fetch();
+                if ($hasTransaction) {
+                    $stmt = $pdo->prepare('UPDATE transactions SET status = ? WHERE booking_id = ?');
+                    $stmt->execute([$newStatus === 'cancelled' ? 'failed' : 'pending', $bookingId]);
+                }
+
+                $plannerId = (int)($targetBooking['planner_id'] ?? 0);
+                if ($plannerId > 0) {
+                    $pdo->exec(
+                        "CREATE TABLE IF NOT EXISTS messages (
+                            message_id INT AUTO_INCREMENT PRIMARY KEY,
+                            planner_user_id INT NOT NULL,
+                            vendor_user_id INT NOT NULL,
+                            sender_role ENUM('planner','vendor') NOT NULL,
+                            message_text TEXT NOT NULL,
+                            is_read TINYINT(1) NOT NULL DEFAULT 0,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            INDEX idx_conversation (planner_user_id, vendor_user_id, created_at)
+                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+                    );
+
+                    $msgText = $newStatus === 'confirmed'
+                        ? ('Booking accepted for service "' . (string)$targetBooking['service_name'] . '" in event "' . (string)$targetBooking['event_title'] . '".')
+                        : ('Booking declined for service "' . (string)$targetBooking['service_name'] . '" in event "' . (string)$targetBooking['event_title'] . '".');
+
+                    $stmt = $pdo->prepare('INSERT INTO messages (planner_user_id, vendor_user_id, sender_role, message_text, is_read) VALUES (?, ?, ?, ?, 0)');
+                    $stmt->execute([$plannerId, (int)$_SESSION['user_id'], 'vendor', $msgText]);
+                }
+
+                audit_log(
+                    $pdo,
+                    (int)$_SESSION['user_id'],
+                    (string)$_SESSION['role'],
+                    $newStatus === 'confirmed' ? 'booking.accept' : 'booking.decline',
+                    'booking',
+                    (string)$bookingId,
+                    ['vendor_id' => $vendorId, 'new_status' => $newStatus]
+                );
+
+                $pdo->commit();
+                $_SESSION['flash_success'] = $newStatus === 'confirmed' ? 'Booking accepted successfully.' : 'Booking declined successfully.';
+            } catch (Throwable $txe) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                $_SESSION['flash_error'] = 'Could not update booking right now. Please try again.';
+            }
+
+            header('Location: bookings.php?status=' . urlencode($statusFilter));
+            exit;
+        }
 
         $pdo->exec(
             "CREATE TABLE IF NOT EXISTS vendor_notification_state (
@@ -45,9 +173,9 @@ try {
         $stmt->execute([$vendorId]);
         $newPendingCount = (int)$stmt->fetchColumn();
 
-        $sql = "SELECT b.booking_id, b.status AS booking_status, b.booked_price, b.platform_fee,
-                    e.title AS event_title, e.event_date, s.name AS service_name,
-                    t.mpesa_code, t.status AS payment_status
+        $sql = "SELECT b.booking_id, b.status AS booking_status, b.booked_price, b.platform_fee, b.booth_number,
+                    e.title AS event_title, e.event_date, COALESCE(e.venue, '') AS event_venue, s.name AS service_name,
+                    t.mpesa_code, COALESCE(t.status, 'pending') AS payment_status, COALESCE(t.amount, 0) AS paid_amount
                 FROM bookings b
                 JOIN events e ON b.event_id = e.event_id
                 JOIN services s ON b.service_id = s.service_id
@@ -55,11 +183,11 @@ try {
                 WHERE s.vendor_id = ?";
         $params = [$vendorId];
 
-        if ($statusFilter === 'pending' || $statusFilter === 'confirmed') {
+        if ($statusFilter === 'pending' || $statusFilter === 'confirmed' || $statusFilter === 'cancelled') {
             $sql .= " AND b.status = ?";
             $params[] = $statusFilter;
         } else {
-            $sql .= " AND b.status IN ('pending', 'confirmed')";
+            $sql .= " AND b.status IN ('pending', 'confirmed', 'cancelled')";
         }
 
         $sql .= " ORDER BY e.event_date ASC";
@@ -77,7 +205,7 @@ try {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="../assets/style.css">
-    <title>Planora - Confirmed Bookings</title>
+    <title>Planora - Bookings</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         * {
@@ -128,9 +256,10 @@ try {
         .booking-row {
             display: flex;
             justify-content: space-between;
-            align-items: center;
+            align-items: flex-start;
             padding: 12px 0;
             border-bottom: 1px solid #eee;
+            gap: 14px;
         }
         .booking-row:last-child { border-bottom: none; }
         .status-booking {
@@ -144,13 +273,40 @@ try {
         }
         .status-booking.confirmed { background: #e8f9ef; color: #1c7a36; }
         .status-booking.pending { background: #fff4df; color: #a36500; }
+        .status-booking.cancelled { background: #ffecec; color: #9d2020; }
         .status-paid { color: #2ecc71; }
         .status-pending { color: #f39c12; }
+        .status-partial { color: #d18a00; }
+        .message { border-radius: 6px; padding: 10px 12px; margin-bottom: 14px; font-size: 13px; }
+        .message-success { background: #ecfff0; color: #1c7a36; border: 1px solid #c9f0d4; }
+        .message-error { background: #ffecec; color: #9d2020; border: 1px solid #f6caca; }
+        .booking-main { flex: 1; }
+        .booking-meta { color: #666; font-size: 12px; margin-top: 4px; }
+        .booking-actions { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+        .action-btn { border: none; border-radius: 4px; padding: 6px 9px; font-size: 12px; cursor: pointer; text-decoration: none; display: inline-block; }
+        .accept-btn { background: #ecfff0; color: #1c7a36; border: 1px solid #bfeac9; }
+        .decline-btn { background: #ffecec; color: #9d2020; border: 1px solid #f6caca; }
+        .neutral-btn { background: #ece9ff; color: #3f379f; border: 1px solid #c9c2ff; }
+        .action-form { display: inline; }
         .filter-row {
             display: flex;
             gap: 8px;
             flex-wrap: wrap;
             margin-bottom: 12px;
+        }
+        .action-row {
+            margin-bottom: 12px;
+        }
+        .action-link {
+            text-decoration: none;
+            font-size: 12px;
+            font-weight: 700;
+            color: #3f379f;
+            border: 1px solid #c9c2ff;
+            background: #ece9ff;
+            padding: 6px 10px;
+            border-radius: 999px;
+            display: inline-block;
         }
         .filter-link {
             text-decoration: none;
@@ -205,36 +361,80 @@ try {
     <div class="container">
         <div class="card">
             <h2 class="card-title">Bookings</h2>
+            <?php if ($flashSuccess !== ''): ?><div class="message message-success"><?php echo htmlspecialchars($flashSuccess); ?></div><?php endif; ?>
+            <?php if ($flashError !== ''): ?><div class="message message-error"><?php echo htmlspecialchars($flashError); ?></div><?php endif; ?>
+            <div class="action-row">
+                <a class="action-link" href="pay_fee.php">Pay Vendor Selling Fee</a>
+            </div>
             <div class="filter-row">
                 <a class="filter-link <?php echo $statusFilter === 'all' ? 'active' : ''; ?>" href="bookings.php?status=all">All</a>
                 <a class="filter-link <?php echo $statusFilter === 'pending' ? 'active' : ''; ?>" href="bookings.php?status=pending">Pending</a>
                 <a class="filter-link <?php echo $statusFilter === 'confirmed' ? 'active' : ''; ?>" href="bookings.php?status=confirmed">Confirmed</a>
+                <a class="filter-link <?php echo $statusFilter === 'cancelled' ? 'active' : ''; ?>" href="bookings.php?status=cancelled">Cancelled</a>
             </div>
             <?php if (empty($bookings)): ?>
                 <?php if ($statusFilter === 'pending'): ?>
                     <p>No pending bookings yet.</p>
                 <?php elseif ($statusFilter === 'confirmed'): ?>
                     <p>No confirmed bookings yet.</p>
+                <?php elseif ($statusFilter === 'cancelled'): ?>
+                    <p>No cancelled bookings yet.</p>
                 <?php else: ?>
-                    <p>No pending or confirmed bookings yet.</p>
+                    <p>No bookings yet.</p>
                 <?php endif; ?>
             <?php else: ?>
                 <?php foreach ($bookings as $b): ?>
                     <div class="booking-row">
-                        <div>
+                        <div class="booking-main">
                             <strong><?php echo htmlspecialchars($b['service_name']); ?></strong> &mdash;
                             <?php echo htmlspecialchars($b['event_title']); ?> (<?php echo $b['event_date']; ?>)
                             <span class="status-booking <?php echo htmlspecialchars((string)$b['booking_status']); ?>"><?php echo htmlspecialchars(ucfirst((string)$b['booking_status'])); ?></span>
+                            <div class="booking-meta">Venue: <?php echo htmlspecialchars((string)($b['event_venue'] !== '' ? $b['event_venue'] : 'Not specified')); ?></div>
+                            <div class="booking-meta">Booth Number: <?php echo htmlspecialchars((string)(($b['booth_number'] ?? '') !== '' ? $b['booth_number'] : 'Not assigned')); ?></div>
+                            <div class="booking-actions">
+                                <?php if (strtolower((string)$b['booking_status']) === 'pending'): ?>
+                                    <form method="POST" class="action-form">
+                                        <?php echo csrf_input(); ?>
+                                        <input type="hidden" name="booking_action" value="accept">
+                                        <input type="hidden" name="booking_id" value="<?php echo (int)$b['booking_id']; ?>">
+                                        <button class="action-btn accept-btn" type="submit">Accept Booking</button>
+                                    </form>
+                                <?php endif; ?>
+                                <?php if (in_array(strtolower((string)$b['booking_status']), ['pending', 'confirmed'], true)): ?>
+                                    <form method="POST" class="action-form" onsubmit="return confirm('Decline this booking?');">
+                                        <?php echo csrf_input(); ?>
+                                        <input type="hidden" name="booking_action" value="decline">
+                                        <input type="hidden" name="booking_id" value="<?php echo (int)$b['booking_id']; ?>">
+                                        <button class="action-btn decline-btn" type="submit">Decline Booking</button>
+                                    </form>
+                                <?php endif; ?>
+                                <a class="action-btn neutral-btn" href="event_details.php?booking_id=<?php echo (int)$b['booking_id']; ?>">View Event Details</a>
+                                <a class="action-btn neutral-btn" href="download_agreement.php?booking_id=<?php echo (int)$b['booking_id']; ?>">Download Agreement</a>
+                            </div>
                         </div>
                         <div>
                             <?php
                             $gross = (float)$b['booked_price'];
                             $fee = (float)($b['platform_fee'] ?? 0);
                             $net = $gross - $fee;
+                            $rawPaymentStatus = strtolower((string)($b['payment_status'] ?? 'pending'));
+                            $paidAmount = (float)($b['paid_amount'] ?? 0);
+                            $displayPaymentStatus = 'Pending';
+                            $paymentClass = 'status-pending';
+                            if ($rawPaymentStatus === 'paid' && $paidAmount > 0 && $paidAmount < $gross) {
+                                $displayPaymentStatus = 'Partially Paid';
+                                $paymentClass = 'status-partial';
+                            } elseif ($rawPaymentStatus === 'paid') {
+                                $displayPaymentStatus = 'Paid';
+                                $paymentClass = 'status-paid';
+                            } elseif ($rawPaymentStatus === 'failed') {
+                                $displayPaymentStatus = 'Failed';
+                                $paymentClass = 'status-pending';
+                            }
                             ?>
-                            <span>KES <?php echo number_format($net, 2); ?> (net)</span>
+                            <span>KES <?php echo number_format($net, 2); ?> (amount payable)</span>
                             <br><small style="color:#777;">Fee: KES <?php echo number_format($fee, 2); ?></small>
-                            <br><small class="<?php echo (($b['payment_status'] ?? 'pending') === 'paid') ? 'status-paid' : 'status-pending'; ?>">Payment: <?php echo htmlspecialchars(ucfirst((string)($b['payment_status'] ?? 'pending'))); ?></small>
+                            <br><small class="<?php echo $paymentClass; ?>">Payment: <?php echo htmlspecialchars($displayPaymentStatus); ?></small>
                         </div>
                     </div>
                 <?php endforeach; ?>

@@ -9,6 +9,16 @@ $services = [];
 $hasNewAlert = false;
 $newPendingCount = 0;
 $unreadConversations = 0;
+$upcomingEvents = [];
+$confirmedBookingsCount = 0;
+$pendingBookingRequestsCount = 0;
+$paymentStatusCounts = [
+    'paid' => 0,
+    'pending' => 0,
+    'partial' => 0,
+];
+$notificationsCount = 0;
+$eventCountdownText = 'No upcoming event countdown available yet.';
 $flashSuccess = $_SESSION['flash_success'] ?? '';
 $flashError = $_SESSION['flash_error'] ?? '';
 unset($_SESSION['flash_success'], $_SESSION['flash_error']);
@@ -134,7 +144,87 @@ try {
             $newPendingCount = count($pendingBookings);
         }
 
+        $pendingBookingRequestsCount = count($pendingBookings);
+
+        $stmt = $pdo->prepare(
+            "SELECT COUNT(*)
+             FROM bookings b
+             JOIN services s ON b.service_id = s.service_id
+             WHERE s.vendor_id = ? AND b.status = 'confirmed'"
+        );
+        $stmt->execute([$vendorId]);
+        $confirmedBookingsCount = (int)$stmt->fetchColumn();
+
+        $stmt = $pdo->prepare(
+            "SELECT
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(t.status, 'pending') = 'paid' AND COALESCE(t.amount, 0) >= b.booked_price THEN 1
+                    ELSE 0
+                END), 0) AS paid_count,
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(t.status, 'pending') = 'paid' AND COALESCE(t.amount, 0) > 0 AND COALESCE(t.amount, 0) < b.booked_price THEN 1
+                    ELSE 0
+                END), 0) AS partial_count,
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(t.status, 'pending') <> 'paid' THEN 1
+                    WHEN COALESCE(t.status, 'pending') = 'paid' AND COALESCE(t.amount, 0) <= 0 THEN 1
+                    ELSE 0
+                END), 0) AS pending_count
+             FROM bookings b
+             JOIN services s ON b.service_id = s.service_id
+             LEFT JOIN transactions t ON t.booking_id = b.booking_id
+             WHERE s.vendor_id = ? AND b.status IN ('pending', 'confirmed')"
+        );
+        $stmt->execute([$vendorId]);
+        $paymentStats = $stmt->fetch();
+        if ($paymentStats) {
+            $paymentStatusCounts = [
+                'paid' => (int)($paymentStats['paid_count'] ?? 0),
+                'pending' => (int)($paymentStats['pending_count'] ?? 0),
+                'partial' => (int)($paymentStats['partial_count'] ?? 0),
+            ];
+        }
+
+        $stmt = $pdo->prepare(
+            "SELECT
+                e.event_id,
+                e.title,
+                e.event_date,
+                COUNT(DISTINCT b.booking_id) AS booking_count,
+                SUM(CASE WHEN b.status = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_count
+             FROM bookings b
+             JOIN services s ON b.service_id = s.service_id
+             JOIN events e ON e.event_id = b.event_id
+             WHERE s.vendor_id = ?
+               AND e.archived_at IS NULL
+               AND e.event_date >= CURDATE()
+               AND b.status IN ('pending', 'confirmed')
+             GROUP BY e.event_id, e.title, e.event_date
+             ORDER BY e.event_date ASC"
+        );
+        $stmt->execute([$vendorId]);
+        $upcomingEvents = $stmt->fetchAll();
+
+        if (!empty($upcomingEvents)) {
+            $nextEvent = $upcomingEvents[0];
+            $today = new DateTime('today');
+            $eventDate = DateTime::createFromFormat('Y-m-d', (string)$nextEvent['event_date']);
+            if (!$eventDate) {
+                $eventDate = new DateTime((string)$nextEvent['event_date']);
+            }
+            $daysUntil = (int)$today->diff($eventDate)->format('%r%a');
+
+            if ($daysUntil <= 0) {
+                $eventCountdownText = (string)$nextEvent['title'] . ' starts today.';
+            } elseif ($daysUntil === 1) {
+                $eventCountdownText = (string)$nextEvent['title'] . ' starts in 1 day.';
+            } else {
+                $eventCountdownText = (string)$nextEvent['title'] . ' starts in ' . $daysUntil . ' days.';
+            }
+        }
+
         $hasNewAlert = $newPendingCount > 0;
+        $notificationsCount = $newPendingCount + $unreadConversations;
     }
 } catch (Throwable $e) {
     error_log('vendor/dashboard.php error: ' . $e->getMessage());
@@ -448,6 +538,72 @@ try {
             top: 8px;
             right: 12px;
         }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 10px;
+        }
+
+        .stat-chip {
+            border: 1px solid #ececec;
+            border-radius: 8px;
+            background: #fafafa;
+            padding: 10px 12px;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+
+        .stat-value {
+            font-size: 18px;
+            font-weight: 700;
+            color: #1f1f1f;
+        }
+
+        .quick-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .quick-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            border: 1px solid #c9c2ff;
+            background: #ece9ff;
+            color: #3f379f;
+            border-radius: 999px;
+            padding: 7px 12px;
+            text-decoration: none;
+            font-size: 12px;
+            font-weight: 700;
+        }
+
+        .event-list-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #eeeeee;
+            padding: 11px 0;
+            gap: 10px;
+        }
+
+        .event-list-item:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+
+        .event-meta-small {
+            font-size: 12px;
+            color: #666;
+            margin-top: 3px;
+        }
     </style>
 </head>
 <body>
@@ -490,6 +646,63 @@ try {
         </div>
 
         <div class="dashboard-card">
+            <h2 class="card-title">Vendor Overview</h2>
+            <p class="card-subtitle"><?php echo htmlspecialchars($eventCountdownText); ?></p>
+            <div class="stats-grid">
+                <div class="stat-chip">
+                    <div class="stat-label">Upcoming Events</div>
+                    <div class="stat-value"><?php echo count($upcomingEvents); ?></div>
+                </div>
+                <div class="stat-chip">
+                    <div class="stat-label">Confirmed Bookings</div>
+                    <div class="stat-value"><?php echo (int)$confirmedBookingsCount; ?></div>
+                </div>
+                <div class="stat-chip">
+                    <div class="stat-label">Pending Booking Requests</div>
+                    <div class="stat-value"><?php echo (int)$pendingBookingRequestsCount; ?></div>
+                </div>
+                <div class="stat-chip">
+                    <div class="stat-label">Notifications</div>
+                    <div class="stat-value"><?php echo (int)$notificationsCount; ?></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="dashboard-card">
+            <h2 class="card-title">Payment Status</h2>
+            <div class="stats-grid">
+                <div class="stat-chip">
+                    <div class="stat-label">Paid</div>
+                    <div class="stat-value"><?php echo (int)$paymentStatusCounts['paid']; ?></div>
+                </div>
+                <div class="stat-chip">
+                    <div class="stat-label">Pending</div>
+                    <div class="stat-value"><?php echo (int)$paymentStatusCounts['pending']; ?></div>
+                </div>
+                <div class="stat-chip">
+                    <div class="stat-label">Partially Paid</div>
+                    <div class="stat-value"><?php echo (int)$paymentStatusCounts['partial']; ?></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="dashboard-card">
+            <h2 class="card-title">Quick Actions</h2>
+            <div class="quick-actions">
+                <a href="schedule.php" class="quick-link"><i class="fa-solid fa-calendar-days"></i> View Schedule</a>
+                <a href="messages.php?unread=1" class="quick-link"><i class="fa-solid fa-comments"></i> View Messages</a>
+                <a href="services.php" class="quick-link"><i class="fa-solid fa-bell-concierge"></i> Update Services</a>
+                <a href="download_pass.php" class="quick-link"><i class="fa-solid fa-id-badge"></i> Download Vendor Pass</a>
+            </div>
+        </div>
+
+        <div class="dashboard-card">
+            <h2 class="card-title">M-Pesa Event Fee</h2>
+            <p class="card-subtitle">Pay a small event selling fee via M-Pesa to keep your access active.</p>
+            <a href="pay_fee.php" class="save-btn" style="display:inline-block; text-decoration:none;">Pay Vendor Fee</a>
+        </div>
+
+        <div class="dashboard-card">
             <?php if (empty($services)): ?>
                 <div class="booking-item">
                     <span>No services found. <a href="services.php">Add a service</a> to control availability.</span>
@@ -511,6 +724,25 @@ try {
                             </label>
                             <button type="submit" class="save-btn">Save</button>
                         </form>
+                    </div>
+                <?php endforeach; ?>
+            <?php endif; ?>
+        </div>
+
+        <div class="dashboard-card">
+            <h2 class="card-title">Upcoming Events</h2>
+            <?php if (empty($upcomingEvents)): ?>
+                <div class="booking-item">
+                    <span>No upcoming events you're participating in yet.</span>
+                </div>
+            <?php else: ?>
+                <?php foreach ($upcomingEvents as $upcoming): ?>
+                    <div class="event-list-item">
+                        <div>
+                            <div class="service-name"><?php echo htmlspecialchars((string)$upcoming['title']); ?></div>
+                            <div class="event-meta-small"><?php echo htmlspecialchars((string)$upcoming['event_date']); ?> &middot; Bookings: <?php echo (int)$upcoming['booking_count']; ?> &middot; Confirmed: <?php echo (int)$upcoming['confirmed_count']; ?></div>
+                        </div>
+                        <i class="fa-regular fa-calendar-check status-icon"></i>
                     </div>
                 <?php endforeach; ?>
             <?php endif; ?>

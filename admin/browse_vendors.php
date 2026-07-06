@@ -32,7 +32,7 @@ function ensureServiceRatingsTable(PDO $pdo): void
 try {
     ensureServiceRatingsTable($pdo);
 
-    $stmt = $pdo->prepare('SELECT event_id, title, event_date FROM events WHERE planner_id = ? ORDER BY event_date ASC');
+    $stmt = $pdo->prepare('SELECT event_id, title, event_date FROM events WHERE planner_id = ? AND archived_at IS NULL ORDER BY event_date ASC');
     $stmt->execute([$_SESSION['user_id']]);
     $events = $stmt->fetchAll();
 

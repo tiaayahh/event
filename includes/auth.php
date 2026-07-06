@@ -21,7 +21,22 @@ const LOGIN_PATH = '../login.php';
 const ADMIN_DASHBOARD_PATH = '../admin/dashboard.php';
 const VENDOR_DASHBOARD_PATH = '../vendor/dashboard.php';
 const ATTENDEE_DASHBOARD_PATH = '../attendee/dashboard.php';
-const SESSION_IDLE_TIMEOUT_SECONDS = 1800;
+const SESSION_IDLE_TIMEOUT_SECONDS = 0;
+
+function ensureEventsArchiveColumn(PDO $pdo): void {
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM events LIKE 'archived_at'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE events ADD COLUMN archived_at DATETIME NULL DEFAULT NULL");
+        $pdo->exec("CREATE INDEX idx_events_archived_at ON events (archived_at)");
+    }
+
+    $ready = true;
+}
 
 function getDashboardPathByRole($role) {
     switch ($role) {
@@ -44,7 +59,7 @@ function checkAuth() {
 
     $now = time();
     $lastActivityAt = (int)($_SESSION['last_activity_at'] ?? 0);
-    if ($lastActivityAt > 0 && ($now - $lastActivityAt) > SESSION_IDLE_TIMEOUT_SECONDS) {
+    if (SESSION_IDLE_TIMEOUT_SECONDS > 0 && $lastActivityAt > 0 && ($now - $lastActivityAt) > SESSION_IDLE_TIMEOUT_SECONDS) {
         audit_log(
             $GLOBALS['pdo'],
             isset($_SESSION['user_id']) ? (int)$_SESSION['user_id'] : null,
@@ -58,6 +73,7 @@ function checkAuth() {
         exit;
     }
     $_SESSION['last_activity_at'] = $now;
+    ensureEventsArchiveColumn($GLOBALS['pdo']);
 
     // Prevent cached authenticated pages from replaying stale CSRF tokens.
     header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
@@ -76,6 +92,7 @@ function requireRole($role) {
     }
 
     if ($_SESSION['role'] !== $role) {
+        $_SESSION['flash_error'] = 'Access denied. This page requires ' . $role . ' role.';
         audit_log(
             $GLOBALS['pdo'],
             isset($_SESSION['user_id']) ? (int)$_SESSION['user_id'] : null,

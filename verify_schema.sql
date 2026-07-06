@@ -23,6 +23,10 @@ BEGIN
         ('vendors'),
         ('attendees'),
         ('events'),
+        ('event_budget_items'),
+        ('event_ticket_types'),
+        ('event_sponsorships'),
+        ('event_financial_adjustments'),
         ('services'),
         ('bookings'),
         ('transactions'),
@@ -32,7 +36,8 @@ BEGIN
         ('service_ratings'),
         ('password_resets'),
         ('audit_logs'),
-        ('login_attempts');
+        ('login_attempts'),
+        ('user_totp_auth');
 
     CREATE TEMPORARY TABLE expected_columns (
         table_name VARCHAR(64) NOT NULL,
@@ -60,10 +65,45 @@ BEGIN
         ('events', 'planner_id'),
         ('events', 'title'),
         ('events', 'event_date'),
+        ('events', 'venue'),
         ('events', 'budget_total'),
         ('events', 'budget_committed'),
         ('events', 'ticket_price'),
         ('events', 'ticket_revenue'),
+        ('events', 'attendee_contribution_target'),
+        ('events', 'vendor_contribution_target'),
+        ('events', 'vendor_fee_amount'),
+
+        ('event_budget_items', 'item_id'),
+        ('event_budget_items', 'event_id'),
+        ('event_budget_items', 'item_name'),
+        ('event_budget_items', 'planned_amount'),
+        ('event_budget_items', 'spent_amount'),
+        ('event_budget_items', 'sort_order'),
+        ('event_budget_items', 'created_at'),
+
+        ('event_ticket_types', 'ticket_type_id'),
+        ('event_ticket_types', 'event_id'),
+        ('event_ticket_types', 'ticket_type'),
+        ('event_ticket_types', 'price'),
+        ('event_ticket_types', 'description'),
+        ('event_ticket_types', 'created_at'),
+        ('event_ticket_types', 'updated_at'),
+
+        ('event_sponsorships', 'sponsorship_id'),
+        ('event_sponsorships', 'event_id'),
+        ('event_sponsorships', 'sponsor_name'),
+        ('event_sponsorships', 'contribution_amount'),
+        ('event_sponsorships', 'created_at'),
+        ('event_sponsorships', 'updated_at'),
+
+        ('event_financial_adjustments', 'adjustment_id'),
+        ('event_financial_adjustments', 'event_id'),
+        ('event_financial_adjustments', 'entry_kind'),
+        ('event_financial_adjustments', 'amount'),
+        ('event_financial_adjustments', 'note'),
+        ('event_financial_adjustments', 'created_by'),
+        ('event_financial_adjustments', 'created_at'),
 
         ('services', 'service_id'),
         ('services', 'vendor_id'),
@@ -78,6 +118,7 @@ BEGIN
         ('bookings', 'status'),
         ('bookings', 'booked_price'),
         ('bookings', 'platform_fee'),
+        ('bookings', 'booth_number'),
         ('bookings', 'created_at'),
 
         ('transactions', 'booking_id'),
@@ -131,7 +172,14 @@ BEGIN
 
         ('login_attempts', 'attempt_id'),
         ('login_attempts', 'email'),
-        ('login_attempts', 'attempted_at');
+        ('login_attempts', 'attempted_at'),
+
+        ('user_totp_auth', 'user_id'),
+        ('user_totp_auth', 'secret_key'),
+        ('user_totp_auth', 'is_enabled'),
+        ('user_totp_auth', 'verified_at'),
+        ('user_totp_auth', 'created_at'),
+        ('user_totp_auth', 'updated_at');
 
     CREATE TEMPORARY TABLE missing_tables AS
     SELECT et.table_name

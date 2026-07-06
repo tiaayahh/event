@@ -380,8 +380,8 @@ if ($role === 'planner') {
     <main>
         <section class="hero">
             <div class="hero-card">
-                <h1>Plan, Manage, and Monitor Events<br>with Ease</h1>
-                <p class="subhead">A complete platform for event organizers and vendors to collaborate, coordinate, and deliver successful events - all from one place.</p>
+                <h1>Run Every Event from One Unified Hub</h1>
+                <p class="subhead">Planora connects event budgets, vendor/client communication, bookings, and M-Pesa payment reconciliation in one workflow so planners do not have to juggle spreadsheets, chat apps, and manual checks.</p>
                 <div class="actions">
                     <?php if ($isLoggedIn): ?>
                         <a class="btn btn-primary" href="<?php echo htmlspecialchars($dashboardPath); ?>">
@@ -412,7 +412,7 @@ if ($role === 'planner') {
 
         <section class="section">
             <h2 class="section-title">Why Choose Planora?</h2>
-            <p class="section-text">We provide a comprehensive platform that helps individuals and organizations plan, manage, and monitor events from start to finish. Vendors can showcase their services, connect with clients, and grow their businesses through our marketplace.</p>
+            <p class="section-text">Planora was built to solve real coordination problems faced by event planners: scattered confirmations, separate chat groups, and manual transaction matching. With a centralized dashboard, teams can reduce errors, protect margins, and hit deadlines with confidence.</p>
         </section>
 
         <section class="section">
@@ -420,30 +420,35 @@ if ($role === 'planner') {
             <div class="features-grid">
                 <div class="feature-card">
                     <span class="icon"><i class="fa-regular fa-calendar"></i></span>
-                    <h3>Event Planning</h3>
-                    <p>Create and organize events with ease, set budgets, and manage timelines.</p>
+                    <h3>Event Planning Workspace</h3>
+                    <p>Create events, assign budgets, and keep timelines visible for multiple clients in one planner view.</p>
                 </div>
                 <div class="feature-card">
                     <span class="icon"><i class="fa-solid fa-chart-column"></i></span>
-                    <h3>Event Monitoring</h3>
-                    <p>Track progress and stay updated in real time with live budget overviews.</p>
+                    <h3>Live Budget Control</h3>
+                    <p>Track committed spend and available balance automatically as bookings and payments are updated.</p>
                 </div>
                 <div class="feature-card">
                     <span class="icon"><i class="fa-solid fa-handshake"></i></span>
                     <h3>Vendor Marketplace</h3>
-                    <p>Discover trusted vendors for every occasion - DJs, caterers, photographers, and more.</p>
+                    <p>Discover trusted vendors for every occasion and convert bookings into trackable payment workflows.</p>
                 </div>
                 <div class="feature-card">
                     <span class="icon"><i class="fa-regular fa-comments"></i></span>
-                    <h3>Collaboration Tools</h3>
-                    <p>Communicate effectively with your team and vendors, all within one platform.</p>
+                    <h3>Unified Communication</h3>
+                    <p>Capture planner-vendor confirmations in platform chat so important updates are not lost in inbox noise.</p>
                 </div>
                 <div class="feature-card">
                     <span class="icon"><i class="fa-solid fa-chart-line"></i></span>
-                    <h3>Performance Insights</h3>
-                    <p>Monitor event success through reports, payment history, and analytics.</p>
+                    <h3>Payment Reconciliation</h3>
+                    <p>Trigger M-Pesa payments, reconcile transaction status, and instantly confirm bookings from one dashboard.</p>
                 </div>
             </div>
+        </section>
+
+        <section class="section">
+            <h2 class="section-title">Research-Backed Impact</h2>
+            <p class="section-text">Recent studies (2021-2026) show that small businesses lose productivity when tools are fragmented. Planora addresses that gap with an integrated workflow that can reduce admin overhead, support compliance visibility, and help planners scale without compromising service quality.</p>
         </section>
 
         <section class="section">

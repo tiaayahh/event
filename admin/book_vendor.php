@@ -18,6 +18,7 @@ $services = [];
 $vendorAvgRating = 0.0;
 $vendorRatingCount = 0;
 $flashError = '';
+$boothNumber = '';
 
 function ensureServiceRatingsTable(PDO $pdo): void
 {
@@ -39,14 +40,46 @@ function ensureServiceRatingsTable(PDO $pdo): void
 	);
 }
 
+function ensureEventVendorFeeSchema(PDO $pdo): void
+{
+	static $ready = false;
+	if ($ready) {
+		return;
+	}
+
+	$stmt = $pdo->query("SHOW COLUMNS FROM events LIKE 'vendor_fee_amount'");
+	if (!$stmt->fetch()) {
+		$pdo->exec("ALTER TABLE events ADD COLUMN vendor_fee_amount DECIMAL(10,2) NOT NULL DEFAULT 100.00");
+	}
+
+	$ready = true;
+}
+
+function ensureBookingBoothSchema(PDO $pdo): void
+{
+	static $ready = false;
+	if ($ready) {
+		return;
+	}
+
+	$stmt = $pdo->query("SHOW COLUMNS FROM bookings LIKE 'booth_number'");
+	if (!$stmt->fetch()) {
+		$pdo->exec("ALTER TABLE bookings ADD COLUMN booth_number VARCHAR(64) DEFAULT NULL AFTER platform_fee");
+	}
+
+	$ready = true;
+}
+
 try {
 	ensureServiceRatingsTable($pdo);
+	ensureEventVendorFeeSchema($pdo);
+	ensureBookingBoothSchema($pdo);
 
 	$stmt = $pdo->prepare('SELECT vendor_id, user_id, business_name FROM vendors WHERE vendor_id = ? LIMIT 1');
 	$stmt->execute([$vendorId]);
 	$vendor = $stmt->fetch();
 
-	$stmt = $pdo->prepare('SELECT event_id, title, event_date FROM events WHERE event_id = ? AND planner_id = ? LIMIT 1');
+	$stmt = $pdo->prepare('SELECT event_id, title, event_date, vendor_fee_amount FROM events WHERE event_id = ? AND planner_id = ? AND archived_at IS NULL LIMIT 1');
 	$stmt->execute([$eventId, $_SESSION['user_id']]);
 	$event = $stmt->fetch();
 
@@ -68,6 +101,10 @@ try {
 		csrf_require_valid_post_token();
 
 		$serviceId = filter_input(INPUT_POST, 'service_id', FILTER_VALIDATE_INT);
+		$boothNumber = trim((string)($_POST['booth_number'] ?? ''));
+		if (strlen($boothNumber) > 64) {
+			$boothNumber = substr($boothNumber, 0, 64);
+		}
 
 		if (!$serviceId) {
 			$flashError = 'Please choose a valid service.';
@@ -101,8 +138,9 @@ try {
 				} else {
 					$pdo->beginTransaction();
 
-					$stmt = $pdo->prepare('INSERT INTO bookings (event_id, service_id, status, booked_price, created_at) VALUES (?, ?, ?, ?, NOW())');
-					$stmt->execute([$eventId, $serviceId, 'pending', $service['price']]);
+					$eventVendorFeeAmount = (float)($event['vendor_fee_amount'] ?? 100);
+					$stmt = $pdo->prepare('INSERT INTO bookings (event_id, service_id, status, booked_price, platform_fee, booth_number, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())');
+					$stmt->execute([$eventId, $serviceId, 'pending', $service['price'], $eventVendorFeeAmount, $boothNumber !== '' ? $boothNumber : null]);
 					$newBookingId = (int)$pdo->lastInsertId();
 
 					$notificationText = sprintf(
@@ -126,6 +164,7 @@ try {
 							'event_id' => (int)$eventId,
 							'service_id' => (int)$serviceId,
 							'vendor_id' => (int)$vendorId,
+								'booth_number' => $boothNumber,
 						]
 					);
 
@@ -231,6 +270,7 @@ try {
 					<form method="POST">
 						<?php echo csrf_input(); ?>
 						<input type="hidden" name="service_id" value="<?php echo (int)$service['service_id']; ?>">
+						<input type="text" name="booth_number" class="form-input" style="margin-bottom:8px; min-width:180px;" placeholder="Booth number (optional)">
 						<button type="submit" class="btn">Book Service</button>
 					</form>
 				</div>

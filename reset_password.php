@@ -44,6 +44,18 @@ function findActiveReset(PDO $pdo, string $token): ?array
     return null;
 }
 
+function isStrongPassword(string $password): bool
+{
+    if (strlen($password) < 8) {
+        return false;
+    }
+
+    return preg_match('/[A-Z]/', $password)
+        && preg_match('/[a-z]/', $password)
+        && preg_match('/[0-9]/', $password)
+        && preg_match('/[^A-Za-z0-9]/', $password);
+}
+
 try {
     ensurePasswordResetTable($pdo);
 } catch (Throwable $e) {
@@ -66,8 +78,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
 
     if ($newPassword === '' || $confirmPassword === '') {
         $error = 'Please fill in all fields.';
-    } elseif (strlen($newPassword) < 6) {
-        $error = 'Password must be at least 6 characters.';
+    } elseif (!isStrongPassword($newPassword)) {
+        $error = 'Password must be at least 8 characters and include uppercase, lowercase, number, and symbol.';
     } elseif ($newPassword !== $confirmPassword) {
         $error = 'Passwords do not match.';
     } else {
@@ -206,6 +218,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
             color: #1e8e3e;
         }
 
+        .password-hint {
+            font-size: 12px;
+            color: #666;
+            margin-top: -10px;
+            margin-bottom: 14px;
+            line-height: 1.5;
+        }
+
         .footer-text {
             text-align: center;
             font-size: 15px;
@@ -241,6 +261,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $error === '') {
                         <label for="new_password">New Password</label>
                         <input type="password" id="new_password" name="new_password" required>
                     </div>
+
+                    <p class="password-hint">Use at least 8 characters with uppercase, lowercase, number, and symbol.</p>
 
                     <div class="form-group">
                         <label for="confirm_password">Confirm Password</label>

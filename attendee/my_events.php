@@ -160,6 +160,7 @@ try {
         <a href="dashboard.php" class="nav-item"><i class="fa-solid fa-house"></i><span>Home</span></a>
         <a href="explore.php" class="nav-item"><i class="fa-solid fa-compass"></i><span>Explore</span></a>
         <a href="my_events.php" class="nav-item active"><i class="fa-solid fa-list-check"></i><span>My Events</span></a>
+        <a href="messages.php" class="nav-item"><i class="fa-solid fa-comments"></i><span>Messages</span></a>
         <a href="profile.php" class="nav-item"><i class="fa-solid fa-user"></i><span>Profile</span></a>
     </nav>
 </body>

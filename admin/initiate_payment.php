@@ -1,28 +1,47 @@
 ﻿<?php
 require_once '../includes/auth.php';
+require_once '../includes/daraja.php';
 checkAuth();
 requireRole('planner');
 
-define('PLATFORM_FEE_PERCENT', 0.10);
+function ensureEventVendorFeeSchema(PDO $pdo): void
+{
+	static $ready = false;
+	if ($ready) {
+		return;
+	}
+
+	$stmt = $pdo->query("SHOW COLUMNS FROM events LIKE 'vendor_fee_amount'");
+	if (!$stmt->fetch()) {
+		$pdo->exec("ALTER TABLE events ADD COLUMN vendor_fee_amount DECIMAL(10,2) NOT NULL DEFAULT 100.00");
+	}
+
+	$ready = true;
+}
 
 $bookingId = filter_input(INPUT_GET, 'booking_id', FILTER_VALIDATE_INT);
 if (!$bookingId) {
 	$_SESSION['flash_error'] = 'Invalid booking selected for payment.';
-	header('Location: payment_history.php');
+	header('Location: mpesa_payments.php');
 	exit;
 }
 
 $booking = null;
 $flashError = '';
+$flashSuccess = '';
 $paymentTimeline = [];
+$darajaConfigured = daraja_is_configured();
 
 try {
+	ensureEventVendorFeeSchema($pdo);
+
 	$stmt = $pdo->prepare(
 		"SELECT b.booking_id,
 				b.event_id,
 				b.status AS booking_status,
 				b.booked_price,
 				b.platform_fee,
+				e.vendor_fee_amount,
 				e.title AS event_title,
 				e.event_date,
 				s.name AS service_name,
@@ -34,7 +53,7 @@ try {
 		 JOIN services s ON b.service_id = s.service_id
 		 JOIN vendors v ON s.vendor_id = v.vendor_id
 		 LEFT JOIN transactions t ON b.booking_id = t.booking_id
-		 WHERE b.booking_id = ? AND e.planner_id = ?
+		 WHERE b.booking_id = ? AND e.planner_id = ? AND e.archived_at IS NULL
 		 LIMIT 1"
 	);
 	$stmt->execute([$bookingId, $_SESSION['user_id']]);
@@ -42,26 +61,91 @@ try {
 
 	if (!$booking) {
 		$_SESSION['flash_error'] = 'Booking not found.';
-		header('Location: payment_history.php');
+		header('Location: mpesa_payments.php');
 		exit;
 	}
 
 	if (function_exists('ensureAuditLogsTable')) {
 		ensureAuditLogsTable($pdo);
 	}
+    ensure_daraja_stk_requests_table($pdo);
 
 	if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		csrf_require_valid_post_token();
+		$action = strtolower(trim((string)($_POST['action'] ?? 'save')));
 
 		$mpesaCode = strtoupper(trim($_POST['mpesa_code'] ?? ''));
 		$paymentStatus = strtolower(trim($_POST['payment_status'] ?? 'pending'));
 		$oldBookingStatus = strtolower((string)$booking['booking_status']);
 		$newBookingStatus = $paymentStatus === 'paid' ? 'confirmed' : 'pending';
 		$bookedPrice = (float)$booking['booked_price'];
-		$platformFee = $bookedPrice * PLATFORM_FEE_PERCENT;
+		$platformFee = (float)($booking['vendor_fee_amount'] ?? 100);
 		$mpesaCodeDb = $mpesaCode === '' ? null : $mpesaCode;
 
-		if (!in_array($paymentStatus, ['pending', 'paid', 'failed'], true)) {
+		if ($action === 'stk_push') {
+			$phoneNumber = trim((string)($_POST['phone_number'] ?? ''));
+			$pushResult = daraja_stk_push(
+				$phoneNumber,
+				$bookedPrice,
+				'BOOKING-' . $bookingId,
+				'Planora booking payment'
+			);
+
+			if (!empty($pushResult['success'])) {
+				$checkoutRequestId = (string)($pushResult['checkout_request_id'] ?? '');
+				$merchantRequestId = (string)($pushResult['merchant_request_id'] ?? '');
+				$flashSuccess = 'Daraja STK push initiated successfully. Confirm payment on the customer phone.';
+
+				if ($checkoutRequestId !== '') {
+					$stmt = $pdo->prepare(
+						"INSERT INTO daraja_stk_requests
+							(booking_id, planner_user_id, checkout_request_id, merchant_request_id, phone_number, amount, status, raw_response)
+						 VALUES (?, ?, ?, ?, ?, ?, 'requested', ?)
+						 ON DUPLICATE KEY UPDATE
+							booking_id = VALUES(booking_id),
+							planner_user_id = VALUES(planner_user_id),
+							merchant_request_id = VALUES(merchant_request_id),
+							phone_number = VALUES(phone_number),
+							amount = VALUES(amount),
+							status = 'requested',
+							raw_response = VALUES(raw_response)"
+					);
+					$stmt->execute([
+						$bookingId,
+						(int)$_SESSION['user_id'],
+						$checkoutRequestId,
+						$merchantRequestId !== '' ? $merchantRequestId : null,
+						$phoneNumber !== '' ? $phoneNumber : null,
+						$bookedPrice,
+						json_encode($pushResult['payload'] ?? [], JSON_UNESCAPED_SLASHES),
+					]);
+				}
+
+				audit_log(
+					$pdo,
+					(int)$_SESSION['user_id'],
+					(string)$_SESSION['role'],
+					'payment.stk_push_requested',
+					'booking',
+					(string)$bookingId,
+					[
+						'checkout_request_id' => $checkoutRequestId,
+						'amount' => $bookedPrice,
+					]
+				);
+			} else {
+				$flashError = (string)($pushResult['message'] ?? 'Unable to initiate Daraja STK push right now.');
+				audit_log(
+					$pdo,
+					(int)$_SESSION['user_id'],
+					(string)$_SESSION['role'],
+					'payment.stk_push_failed',
+					'booking',
+					(string)$bookingId,
+					['reason' => $flashError]
+				);
+			}
+		} elseif (!in_array($paymentStatus, ['pending', 'paid', 'failed'], true)) {
 			$flashError = 'Invalid payment status selected.';
 		} elseif ($paymentStatus === 'paid' && $mpesaCode === '') {
 			$flashError = 'M-Pesa code is required when marking payment as paid.';
@@ -119,7 +203,7 @@ try {
 			);
 
 			$_SESSION['flash_success'] = 'Payment updated successfully.';
-			header('Location: payment_history.php');
+			header('Location: mpesa_payments.php');
 			exit;
 		}
 	}
@@ -129,7 +213,7 @@ try {
 		 FROM audit_logs
 		 WHERE target_type = 'booking'
 		   AND target_id = ?
-		   AND action IN ('payment.update', 'payment.update_failed')
+		   AND action IN ('payment.update', 'payment.update_failed', 'payment.stk_push_requested', 'payment.stk_push_failed', 'payment.callback_processed', 'payment.callback_failed')
 		 ORDER BY created_at DESC
 		 LIMIT 20"
 	);
@@ -157,7 +241,7 @@ try {
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="../assets/style.css">
-	<title>Planora - Initiate Payment</title>
+	<title>Planora - M-Pesa Reconciliation</title>
 	<style>
 		* { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 		body { background: #F5F5F5; color: #2D2D2D; min-height: 100vh; }
@@ -195,14 +279,24 @@ try {
 </header>
 
 <div class="container">
-	<a class="link-btn" href="payment_history.php">Back to Payment History</a>
+	<a class="link-btn" href="mpesa_payments.php">Back to M-Pesa Payments</a>
 
 	<section class="card">
-		<h2 class="title">Update Payment</h2>
+		<h2 class="title">M-Pesa Reconciliation</h2>
 
 		<?php if ($flashError !== ''): ?>
 			<div class="message-error"><?php echo htmlspecialchars($flashError); ?></div>
 		<?php endif; ?>
+
+		<?php if ($flashSuccess !== ''): ?>
+			<div class="message-error" style="background: #ecfff0; color: #1c7a36; border-color: #c9f0d4;"><?php echo htmlspecialchars($flashSuccess); ?></div>
+		<?php endif; ?>
+
+		<?php if (!$darajaConfigured): ?>
+			<div class="message-error">Daraja is not configured yet. Set DARAJA_CONSUMER_KEY, DARAJA_CONSUMER_SECRET, DARAJA_SHORTCODE, DARAJA_PASSKEY, and DARAJA_CALLBACK_URL (for example: https://your-domain/admin/mpesa_callback.php).</div>
+		<?php endif; ?>
+
+		<div class="message-error" style="background: #eef3ff; color: #2c4ea0; border-color: #d9e4ff;">Optional callback hardening: set DARAJA_CALLBACK_TOKEN and DARAJA_CALLBACK_ALLOWED_IPS to verify callback authenticity and source.</div>
 
 		<p class="meta"><strong>Event:</strong> <?php echo htmlspecialchars((string)$booking['event_title']); ?> (<?php echo htmlspecialchars((string)$booking['event_date']); ?>)</p>
 		<p class="meta"><strong>Vendor/Service:</strong> <?php echo htmlspecialchars((string)$booking['business_name']); ?> - <?php echo htmlspecialchars((string)$booking['service_name']); ?></p>
@@ -211,6 +305,15 @@ try {
 
 		<form method="POST">
 			<?php echo csrf_input(); ?>
+			<div class="field">
+				<label for="phone_number">Customer Phone Number (for STK Push)</label>
+				<input class="input" type="text" id="phone_number" name="phone_number" placeholder="e.g. 0712345678">
+			</div>
+
+			<button class="btn" type="submit" name="action" value="stk_push">Send STK Push (Daraja)</button>
+
+			<div style="height: 10px;"></div>
+
 			<div class="field">
 				<label for="payment_status">Payment Status</label>
 				<select class="select" id="payment_status" name="payment_status" required>
@@ -226,13 +329,13 @@ try {
 				<input class="input" type="text" id="mpesa_code" name="mpesa_code" value="<?php echo htmlspecialchars((string)($booking['mpesa_code'] ?? '')); ?>" placeholder="e.g. QWE123RTY">
 			</div>
 
-			<button class="btn" type="submit">Save Payment</button>
+			<button class="btn" type="submit" name="action" value="save">Save Payment</button>
 		</form>
 
 		<div class="timeline">
-			<h3 class="timeline-title">Simulated Transaction Timeline</h3>
+			<h3 class="timeline-title">Payment Activity Timeline</h3>
 			<?php if (empty($paymentTimeline)): ?>
-				<div class="timeline-empty">No simulator updates yet for this booking.</div>
+				<div class="timeline-empty">No payment updates yet for this booking.</div>
 			<?php else: ?>
 				<ul class="timeline-list">
 					<?php foreach ($paymentTimeline as $entry): ?>

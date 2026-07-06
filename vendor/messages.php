@@ -9,6 +9,12 @@ $showUnreadOnly = isset($_GET['unread']) && $_GET['unread'] === '1';
 $selectedPlannerId = filter_input(INPUT_GET, 'planner_user_id', FILTER_VALIDATE_INT);
 $conversation = [];
 $newPendingCount = 0;
+$boxFilter = strtolower(trim((string)($_GET['box'] ?? 'all')));
+if (!in_array($boxFilter, ['all', 'inbox', 'sent'], true)) {
+    $boxFilter = 'all';
+}
+$searchTerm = trim((string)($_GET['q'] ?? ''));
+$announcementUnreadCount = 0;
 
 try {
     $pdo->exec(
@@ -34,6 +40,21 @@ try {
                 throw $e;
             }
         }
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM messages LIKE 'message_kind'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE messages ADD COLUMN message_kind ENUM('direct','announcement') NOT NULL DEFAULT 'direct' AFTER message_text");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM messages LIKE 'attachment_name'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE messages ADD COLUMN attachment_name VARCHAR(255) DEFAULT NULL AFTER message_kind");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM messages LIKE 'attachment_path'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE messages ADD COLUMN attachment_path VARCHAR(500) DEFAULT NULL AFTER attachment_name");
     }
 
     $stmt = $pdo->prepare('SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1');
@@ -76,6 +97,14 @@ try {
             $stmt->execute([$vendorId]);
         }
         $newPendingCount = (int)$stmt->fetchColumn();
+
+        $stmt = $pdo->prepare(
+            "SELECT COUNT(*)
+             FROM messages
+             WHERE vendor_user_id = ? AND sender_role = 'planner' AND is_read = 0 AND message_kind = 'announcement'"
+        );
+        $stmt->execute([$_SESSION['user_id']]);
+        $announcementUnreadCount = (int)$stmt->fetchColumn();
 
         $stmt = $pdo->prepare(
             "SELECT p.user_id AS planner_user_id,
@@ -138,14 +167,50 @@ try {
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $targetPlanner = filter_input(INPUT_POST, 'planner_user_id', FILTER_VALIDATE_INT);
             $messageText = trim($_POST['message_text'] ?? '');
+            $attachmentName = null;
+            $attachmentPath = null;
 
             if (!$targetPlanner || !in_array((int)$targetPlanner, $allowedPlannerIds, true)) {
                 $flashError = 'Select a valid planner conversation.';
-            } elseif ($messageText === '') {
-                $flashError = 'Message cannot be empty.';
+            } elseif ($messageText === '' && (empty($_FILES['attachment_file']['name']) || !is_string($_FILES['attachment_file']['name']))) {
+                $flashError = 'Message cannot be empty unless you attach a document.';
             } else {
-                $stmt = $pdo->prepare('INSERT INTO messages (planner_user_id, vendor_user_id, sender_role, message_text, is_read) VALUES (?, ?, ?, ?, 0)');
-                $stmt->execute([$targetPlanner, $_SESSION['user_id'], 'vendor', $messageText]);
+                if (isset($_FILES['attachment_file']) && is_array($_FILES['attachment_file']) && (int)($_FILES['attachment_file']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_NO_FILE) {
+                    if ((int)$_FILES['attachment_file']['error'] !== UPLOAD_ERR_OK) {
+                        $flashError = 'Attachment upload failed. Please try again.';
+                    } else {
+                        $originalName = (string)($_FILES['attachment_file']['name'] ?? '');
+                        $tmpPath = (string)($_FILES['attachment_file']['tmp_name'] ?? '');
+                        $size = (int)($_FILES['attachment_file']['size'] ?? 0);
+                        $ext = strtolower(pathinfo($originalName, PATHINFO_EXTENSION));
+                        $allowedExt = ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'txt', 'jpg', 'jpeg', 'png'];
+
+                        if ($size <= 0 || $size > 5 * 1024 * 1024) {
+                            $flashError = 'Attachment must be between 1 byte and 5MB.';
+                        } elseif (!in_array($ext, $allowedExt, true)) {
+                            $flashError = 'Attachment type not allowed. Use PDF, DOC, DOCX, XLS, XLSX, TXT, JPG, JPEG, or PNG.';
+                        } else {
+                            $uploadDir = dirname(__DIR__) . '/uploads/message_docs';
+                            if (!is_dir($uploadDir)) {
+                                mkdir($uploadDir, 0775, true);
+                            }
+
+                            $safeFile = 'msg_' . time() . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
+                            $targetPath = $uploadDir . '/' . $safeFile;
+                            if (!move_uploaded_file($tmpPath, $targetPath)) {
+                                $flashError = 'Could not save attachment file.';
+                            } else {
+                                $attachmentName = $originalName;
+                                $attachmentPath = 'uploads/message_docs/' . $safeFile;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ($flashError === '') {
+                $stmt = $pdo->prepare('INSERT INTO messages (planner_user_id, vendor_user_id, sender_role, message_text, message_kind, attachment_name, attachment_path, is_read) VALUES (?, ?, ?, ?, ?, ?, ?, 0)');
+                $stmt->execute([$targetPlanner, $_SESSION['user_id'], 'vendor', $messageText, 'direct', $attachmentName, $attachmentPath]);
 
                 audit_log(
                     $pdo,
@@ -154,10 +219,14 @@ try {
                     'message.send',
                     'conversation',
                     (string)$targetPlanner,
-                    ['recipient_role' => 'planner']
+                    [
+                        'recipient_role' => 'planner',
+                        'message_kind' => 'direct',
+                        'has_attachment' => $attachmentPath !== null,
+                    ]
                 );
 
-                header('Location: messages.php?planner_user_id=' . (int)$targetPlanner);
+                header('Location: messages.php?planner_user_id=' . (int)$targetPlanner . '&box=' . urlencode($boxFilter) . '&q=' . urlencode($searchTerm));
                 exit;
             }
 
@@ -175,12 +244,33 @@ try {
             $stmt->execute([$selectedPlannerId, $_SESSION['user_id']]);
 
             $stmt = $pdo->prepare(
-                "SELECT sender_role, message_text, created_at
+                "SELECT sender_role, message_text, created_at, message_kind, attachment_name, attachment_path
                  FROM messages
-                 WHERE planner_user_id = ? AND vendor_user_id = ?
-                 ORDER BY created_at ASC, message_id ASC"
+                 WHERE planner_user_id = ? AND vendor_user_id = ?"
             );
-            $stmt->execute([$selectedPlannerId, $_SESSION['user_id']]);
+            $conversationParams = [$selectedPlannerId, $_SESSION['user_id']];
+            if ($boxFilter === 'inbox') {
+                $stmt = $pdo->prepare(
+                    "SELECT sender_role, message_text, created_at, message_kind, attachment_name, attachment_path
+                     FROM messages
+                     WHERE planner_user_id = ? AND vendor_user_id = ? AND sender_role = 'planner'"
+                );
+            } elseif ($boxFilter === 'sent') {
+                $stmt = $pdo->prepare(
+                    "SELECT sender_role, message_text, created_at, message_kind, attachment_name, attachment_path
+                     FROM messages
+                     WHERE planner_user_id = ? AND vendor_user_id = ? AND sender_role = 'vendor'"
+                );
+            }
+
+            if ($searchTerm !== '') {
+                $querySql = (string)$stmt->queryString . " AND message_text LIKE ?";
+                $stmt = $pdo->prepare($querySql);
+                $conversationParams[] = '%' . $searchTerm . '%';
+            }
+
+            $stmt = $pdo->prepare((string)$stmt->queryString . " ORDER BY created_at ASC, message_id ASC");
+            $stmt->execute($conversationParams);
             $conversation = $stmt->fetchAll();
         }
     }
@@ -226,10 +316,17 @@ try {
         .theirs .bubble { background: #fff; border: 1px solid #ececec; }
         .time { display: block; font-size: 11px; margin-top: 4px; opacity: .8; }
         .composer { margin-top: 10px; display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+        .composer-tools { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
         .input { width: 100%; border: 1px solid #d6d6d6; border-radius: 8px; padding: 10px; font-size: 14px; }
+        .file-input { border: 1px solid #d6d6d6; border-radius: 8px; padding: 8px; font-size: 13px; background: #fff; }
         .btn { background: #6C63FF; color: #fff; border: none; border-radius: 8px; padding: 10px 14px; font-size: 13px; cursor: pointer; }
         .empty { color: #777; font-size: 14px; padding: 10px 0; }
         .hint { background: #eef3ff; color: #2c4ea0; border: 1px solid #d9e4ff; border-radius: 6px; padding: 9px 11px; margin-bottom: 10px; font-size: 12px; }
+        .filters { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+        .filter-link { text-decoration: none; background: #fafafa; color: #4b4b4b; border: 1px solid #e5e5e5; border-radius: 999px; padding: 6px 10px; font-size: 12px; font-weight: 600; }
+        .filter-link.active { background: #ece9ff; border-color: #c9c2ff; color: #3f379f; }
+        .announcement-tag { display: inline-block; margin-bottom: 5px; font-size: 10px; font-weight: 700; color: #2c4ea0; background: #e8efff; border: 1px solid #d2dfff; border-radius: 999px; padding: 2px 8px; }
+        .attachment-link { display: inline-block; margin-top: 6px; color: inherit; text-decoration: underline; font-size: 12px; }
         @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
     </style>
 </head>
@@ -251,6 +348,10 @@ try {
 
     <?php if ($showUnreadOnly): ?>
         <div class="hint"><i class="fa-solid fa-filter"></i> Showing unread conversations first. <a href="messages.php">View all</a></div>
+    <?php endif; ?>
+
+    <?php if ($announcementUnreadCount > 0): ?>
+        <div class="hint"><i class="fa-solid fa-bullhorn"></i> New announcements: <strong><?php echo (int)$announcementUnreadCount; ?></strong></div>
     <?php endif; ?>
 
     <div class="layout">
@@ -292,6 +393,17 @@ try {
                 <div class="empty">Select a planner to start chatting.</div>
             <?php else: ?>
                 <div class="messages">
+                    <div class="filters">
+                        <a class="filter-link <?php echo $boxFilter === 'all' ? 'active' : ''; ?>" href="messages.php?planner_user_id=<?php echo (int)$selectedPlannerId; ?>&box=all&q=<?php echo urlencode($searchTerm); ?>">All</a>
+                        <a class="filter-link <?php echo $boxFilter === 'inbox' ? 'active' : ''; ?>" href="messages.php?planner_user_id=<?php echo (int)$selectedPlannerId; ?>&box=inbox&q=<?php echo urlencode($searchTerm); ?>">Inbox</a>
+                        <a class="filter-link <?php echo $boxFilter === 'sent' ? 'active' : ''; ?>" href="messages.php?planner_user_id=<?php echo (int)$selectedPlannerId; ?>&box=sent&q=<?php echo urlencode($searchTerm); ?>">Sent</a>
+                    </div>
+                    <form method="GET" class="composer" style="margin-top:0; margin-bottom:10px;">
+                        <input type="hidden" name="planner_user_id" value="<?php echo (int)$selectedPlannerId; ?>">
+                        <input type="hidden" name="box" value="<?php echo htmlspecialchars($boxFilter); ?>">
+                        <input class="input" type="text" name="q" value="<?php echo htmlspecialchars($searchTerm); ?>" aria-label="Search messages">
+                        <button class="btn" type="submit"><i class="fa-solid fa-magnifying-glass"></i> Search</button>
+                    </form>
                     <?php if (empty($conversation)): ?>
                         <div class="empty">No messages yet. Start the conversation below.</div>
                     <?php else: ?>
@@ -299,7 +411,13 @@ try {
                             <?php $mine = ($msg['sender_role'] === 'vendor'); ?>
                             <div class="message <?php echo $mine ? 'mine' : 'theirs'; ?>">
                                 <div class="bubble">
+                                    <?php if (($msg['message_kind'] ?? 'direct') === 'announcement'): ?><span class="announcement-tag">Announcement</span><br><?php endif; ?>
                                     <?php echo nl2br(htmlspecialchars($msg['message_text'])); ?>
+                                    <?php if (!empty($msg['attachment_path'])): ?>
+                                        <a class="attachment-link" href="../<?php echo htmlspecialchars((string)$msg['attachment_path']); ?>" target="_blank" rel="noopener noreferrer">
+                                            <i class="fa-solid fa-paperclip"></i> <?php echo htmlspecialchars((string)($msg['attachment_name'] ?: 'Attachment')); ?>
+                                        </a>
+                                    <?php endif; ?>
                                     <span class="time"><?php echo htmlspecialchars((string)$msg['created_at']); ?></span>
                                 </div>
                             </div>
@@ -307,11 +425,14 @@ try {
                     <?php endif; ?>
                 </div>
 
-                <form method="POST" class="composer">
+                <form method="POST" class="composer" enctype="multipart/form-data">
                     <?php echo csrf_input(); ?>
                     <input type="hidden" name="planner_user_id" value="<?php echo (int)$selectedPlannerId; ?>">
-                    <input class="input" type="text" name="message_text" placeholder="Type a message to planner..." maxlength="1000" required>
+                    <input class="input" type="text" name="message_text" maxlength="1000">
                     <button class="btn" type="submit"><i class="fa-solid fa-paper-plane"></i> Send</button>
+                    <div class="composer-tools" style="grid-column: 1 / -1;">
+                        <input class="file-input" type="file" name="attachment_file" aria-label="Attach document">
+                    </div>
                 </form>
             <?php endif; ?>
         </section>
