@@ -14,6 +14,8 @@ session_start();
 require_once 'config/db.php';
 require_once 'includes/csrf.php';
 require_once 'includes/audit.php';
+require_once 'includes/two_step.php';
+require_once 'includes/password_policy.php';
 
 const LOGIN_MAX_ATTEMPTS = 5;
 const LOGIN_WINDOW_MINUTES = 15;
@@ -79,34 +81,52 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $user = $stmt->fetch();
 
         if ($user && password_verify($password, $user['password_hash'])) {
-            session_regenerate_id(true);
-            $_SESSION['user_id']   = $user['user_id'];
-            $_SESSION['full_name'] = $user['full_name'];
-            $_SESSION['role']      = $user['role'];
-            $_SESSION['last_activity_at'] = time();
-
-            audit_log(
-                $pdo,
-                (int)$user['user_id'],
-                (string)$user['role'],
-                'auth.login_success'
+            $passwordNeedsUpdate = !password_policy_is_strong(
+                $password,
+                (string)$user['email'],
+                (string)$user['full_name']
             );
 
             $clearAttempts = $pdo->prepare('DELETE FROM login_attempts WHERE email = ?');
             $clearAttempts->execute([$email]);
 
-            switch ($user['role']) {
-                case 'planner':
-                    header('Location: admin/dashboard.php');
-                    break;
-                case 'vendor':
-                    header('Location: vendor/dashboard.php');
-                    break;
-                case 'attendee':
-                    header('Location: attendee/dashboard.php');
-                    break;
+            if (!$passwordNeedsUpdate && two_step_user_is_trusted((int)$user['user_id'])) {
+                session_regenerate_id(true);
+                $_SESSION['user_id'] = $user['user_id'];
+                $_SESSION['full_name'] = $user['full_name'];
+                $_SESSION['role'] = $user['role'];
+                $_SESSION['last_activity_at'] = time();
+
+                audit_log(
+                    $pdo,
+                    (int)$user['user_id'],
+                    (string)$user['role'],
+                    'auth.login_success',
+                    'user',
+                    $email,
+                    ['trusted_device' => true]
+                );
+
+                header('Location: ' . two_step_dashboard_path((string)$user['role']));
+                exit;
             }
-            exit;
+
+            $delivery = two_step_start_pending($user, $passwordNeedsUpdate);
+            if (!$delivery['email_sent']) {
+                two_step_clear_pending();
+                $error = 'We could not send your verification code. Please contact support or try again later.';
+            } else {
+                audit_log(
+                    $pdo,
+                    (int)$user['user_id'],
+                    (string)$user['role'],
+                    'auth.login_challenge_sent',
+                    'user',
+                    $email
+                );
+                header('Location: verify_login.php');
+                exit;
+            }
         } else {
             $storeAttempt = $pdo->prepare('INSERT INTO login_attempts (email) VALUES (?)');
             $storeAttempt->execute([$email]);
