@@ -5,6 +5,8 @@ requireRole('planner');
 
 $vendors = [];
 $events = [];
+$selectedEvent = null;
+$requiredVendorType = '';
 $flashSuccess = $_SESSION['flash_success'] ?? '';
 $flashError = $_SESSION['flash_error'] ?? '';
 unset($_SESSION['flash_success'], $_SESSION['flash_error']);
@@ -29,15 +31,51 @@ function ensureServiceRatingsTable(PDO $pdo): void
     );
 }
 
+function ensureVendorTypeSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM vendors LIKE 'vendor_type'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE vendors ADD COLUMN vendor_type ENUM('service_provider','market_operator') NOT NULL DEFAULT 'service_provider' AFTER service_type");
+    }
+
+    $ready = true;
+}
+
+function inferRequiredVendorTypeForCategory(?string $category): string
+{
+    $normalized = strtolower(trim((string)$category));
+    return (strpos($normalized, 'market') !== false) ? 'market_operator' : 'service_provider';
+}
+
 try {
     ensureServiceRatingsTable($pdo);
+    ensureVendorTypeSchema($pdo);
 
-    $stmt = $pdo->prepare('SELECT event_id, title, event_date FROM events WHERE planner_id = ? AND archived_at IS NULL ORDER BY event_date ASC');
+    $stmt = $pdo->prepare('SELECT event_id, title, event_date, COALESCE(category, "") AS category FROM events WHERE planner_id = ? AND archived_at IS NULL ORDER BY event_date ASC');
     $stmt->execute([$_SESSION['user_id']]);
     $events = $stmt->fetchAll();
 
-    $stmt = $pdo->query(
+    if ($selectedEventId) {
+        $stmt = $pdo->prepare('SELECT event_id, title, event_date, COALESCE(category, "") AS category FROM events WHERE event_id = ? AND planner_id = ? AND archived_at IS NULL LIMIT 1');
+        $stmt->execute([$selectedEventId, $_SESSION['user_id']]);
+        $selectedEvent = $stmt->fetch();
+
+        if (!$selectedEvent) {
+            $selectedEventId = null;
+            $flashError = 'Selected event was not found.';
+        } else {
+            $requiredVendorType = inferRequiredVendorTypeForCategory((string)$selectedEvent['category']);
+        }
+    }
+
+    $vendorSql =
         "SELECT v.vendor_id, u.full_name, v.business_name, v.service_type,
+                COALESCE(v.vendor_type, 'service_provider') AS vendor_type,
                 COUNT(DISTINCT s.service_id) AS total_services,
                 COUNT(DISTINCT CASE WHEN s.availability = 1 THEN s.service_id END) AS available_services,
                 COALESCE(AVG(sr.rating), 0) AS avg_rating,
@@ -45,10 +83,16 @@ try {
          FROM vendors v
          JOIN users u ON v.user_id = u.user_id
          LEFT JOIN services s ON v.vendor_id = s.vendor_id
-         LEFT JOIN service_ratings sr ON sr.service_id = s.service_id
-         GROUP BY v.vendor_id, u.full_name, v.business_name, v.service_type
-         ORDER BY v.business_name ASC"
-    );
+         LEFT JOIN service_ratings sr ON sr.service_id = s.service_id";
+    $params = [];
+    if ($requiredVendorType !== '') {
+        $vendorSql .= " WHERE COALESCE(v.vendor_type, 'service_provider') = ?";
+        $params[] = $requiredVendorType;
+    }
+    $vendorSql .= " GROUP BY v.vendor_id, u.full_name, v.business_name, v.service_type, v.vendor_type ORDER BY v.business_name ASC";
+
+    $stmt = $pdo->prepare($vendorSql);
+    $stmt->execute($params);
     $vendors = $stmt->fetchAll();
 } catch (Throwable $e) {
     if ($flashError === '') {
@@ -164,10 +208,22 @@ $selectedEventId = filter_input(INPUT_GET, 'event_id', FILTER_VALIDATE_INT);
     <!-- Vendor Listing -->
     <section class="card">
         <h2 class="card-title"><i class="fa-solid fa-store" style="color:#6C63FF;"></i> Available Vendors</h2>
+        <?php if ($selectedEvent && $requiredVendorType !== ''): ?>
+            <div class="alert alert-success" style="margin-bottom:14px;">
+                <i class="fa-solid fa-filter"></i>
+                Showing <?php echo $requiredVendorType === 'market_operator' ? 'Market Operator' : 'Service Provider'; ?> vendors for <?php echo htmlspecialchars((string)$selectedEvent['title']); ?>.
+            </div>
+        <?php endif; ?>
         <?php if (empty($vendors)): ?>
             <div class="empty-state">
                 <i class="fa-regular fa-face-frown"></i>
-                <p>No vendors registered yet.</p>
+                <p>
+                    <?php if ($selectedEvent && $requiredVendorType !== ''): ?>
+                        No <?php echo $requiredVendorType === 'market_operator' ? 'market operator' : 'service provider'; ?> vendors available for this event category.
+                    <?php else: ?>
+                        No vendors registered yet.
+                    <?php endif; ?>
+                </p>
             </div>
         <?php else: ?>
             <div class="vendor-grid">
@@ -179,6 +235,7 @@ $selectedEventId = filter_input(INPUT_GET, 'event_id', FILTER_VALIDATE_INT);
                         <div class="vendor-name"><?php echo htmlspecialchars($vendor['business_name']); ?></div>
                         <div class="vendor-meta"><i class="fa-regular fa-user"></i> <?php echo htmlspecialchars($vendor['full_name']); ?></div>
                         <div class="vendor-meta"><i class="fa-solid fa-tag"></i> <?php echo htmlspecialchars($vendor['service_type'] ?? 'General'); ?></div>
+                        <div class="vendor-meta"><i class="fa-solid fa-briefcase"></i> <?php echo htmlspecialchars(($vendor['vendor_type'] ?? 'service_provider') === 'market_operator' ? 'Market Operator' : 'Service Provider'); ?></div>
                         <div class="vendor-meta"><i class="fa-regular fa-star"></i> <?php echo number_format((float)$vendor['avg_rating'], 1); ?>/5 (<?php echo (int)$vendor['ratings_count']; ?>)</div>
                         <div class="vendor-services">
                             <i class="fa-solid fa-bell-concierge"></i>
@@ -187,9 +244,15 @@ $selectedEventId = filter_input(INPUT_GET, 'event_id', FILTER_VALIDATE_INT);
                         </div>
                         <div class="vendor-actions">
                             <?php if ($selectedEventId): ?>
-                                <a class="btn btn-outline" href="book_vendor.php?vendor_id=<?php echo (int)$vendor['vendor_id']; ?>&event_id=<?php echo (int)$selectedEventId; ?>">
-                                    <i class="fa-solid fa-eye"></i> View Services
-                                </a>
+                                <?php if ($requiredVendorType === 'market_operator'): ?>
+                                    <a class="btn btn-outline" href="stall_rentals.php?vendor_id=<?php echo (int)$vendor['vendor_id']; ?>&event_id=<?php echo (int)$selectedEventId; ?>">
+                                        <i class="fa-solid fa-store"></i> Stall Registration
+                                    </a>
+                                <?php else: ?>
+                                    <a class="btn btn-outline" href="book_vendor.php?vendor_id=<?php echo (int)$vendor['vendor_id']; ?>&event_id=<?php echo (int)$selectedEventId; ?>">
+                                        <i class="fa-solid fa-eye"></i> View Services
+                                    </a>
+                                <?php endif; ?>
                             <?php else: ?>
                                 <span class="disabled-text"><i class="fa-solid fa-info-circle"></i> Select an event above to book.</span>
                             <?php endif; ?>

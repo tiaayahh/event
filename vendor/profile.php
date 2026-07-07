@@ -7,6 +7,7 @@ $fullName = $_SESSION['full_name'] ?? 'Vendor';
 $email = '';
 $businessName = '';
 $serviceType = '';
+$vendorType = 'service_provider';
 $vendorDescription = '';
 $serviceCount = 0;
 $averageRating = 0.0;
@@ -37,8 +38,39 @@ function ensureServiceRatingsTable(PDO $pdo): void
     );
 }
 
+function ensureVendorTypeSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM vendors LIKE 'vendor_type'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE vendors ADD COLUMN vendor_type ENUM('service_provider','market_operator') NOT NULL DEFAULT 'service_provider' AFTER service_type");
+    }
+
+    $ready = true;
+}
+
+function vendorServiceTypeOptions(): array
+{
+    return [
+        'DJ',
+        'Entertainment',
+        'Catering',
+        'Photography',
+        'Audio & Visual',
+        'Decor',
+        'MC / Host',
+        'Security',
+        'Makeup & Styling',
+    ];
+}
+
 try {
     ensureServiceRatingsTable($pdo);
+    ensureVendorTypeSchema($pdo);
 
     $stmt = $pdo->prepare("SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1");
     $stmt->execute([$_SESSION['user_id']]);
@@ -121,13 +153,21 @@ try {
         if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_vendor_profile'])) {
             $newBusinessName = trim($_POST['business_name'] ?? '');
             $newServiceType = trim($_POST['service_type'] ?? '');
+            $newVendorType = strtolower(trim((string)($_POST['vendor_type'] ?? 'service_provider')));
             $newDescription = trim($_POST['description'] ?? '');
+
+            if (!in_array($newServiceType, vendorServiceTypeOptions(), true)) {
+                $newServiceType = '';
+            }
+            if (!in_array($newVendorType, ['service_provider', 'market_operator'], true)) {
+                $newVendorType = 'service_provider';
+            }
 
             if ($newBusinessName === '' || $newServiceType === '') {
                 $_SESSION['flash_error'] = 'Business name and service type are required.';
             } else {
-                $stmt = $pdo->prepare('UPDATE vendors SET business_name = ?, service_type = ?, description = ? WHERE vendor_id = ? AND user_id = ?');
-                $stmt->execute([$newBusinessName, $newServiceType, $newDescription, $vendorId, $_SESSION['user_id']]);
+                $stmt = $pdo->prepare('UPDATE vendors SET business_name = ?, service_type = ?, vendor_type = ?, description = ? WHERE vendor_id = ? AND user_id = ?');
+                $stmt->execute([$newBusinessName, $newServiceType, $newVendorType, $newDescription, $vendorId, $_SESSION['user_id']]);
 
                 audit_log(
                     $pdo,
@@ -139,6 +179,7 @@ try {
                     [
                         'business_name' => $newBusinessName,
                         'service_type' => $newServiceType,
+                        'vendor_type' => $newVendorType,
                     ]
                 );
 
@@ -150,7 +191,7 @@ try {
         }
 
         // Fetch current data
-        $stmt = $pdo->prepare("SELECT v.business_name, v.service_type, v.description, u.email, u.full_name FROM vendors v JOIN users u ON v.user_id = u.user_id WHERE v.user_id = ?");
+        $stmt = $pdo->prepare("SELECT v.business_name, v.service_type, COALESCE(v.vendor_type, 'service_provider') AS vendor_type, v.description, u.email, u.full_name FROM vendors v JOIN users u ON v.user_id = u.user_id WHERE v.user_id = ?");
         $stmt->execute([$_SESSION['user_id']]);
         $data = $stmt->fetch();
         if ($data) {
@@ -158,6 +199,7 @@ try {
             $fullName = $data['full_name'] ?? $fullName;
             $businessName = $data['business_name'];
             $serviceType = $data['service_type'] ?? '';
+            $vendorType = $data['vendor_type'] ?? 'service_provider';
             $vendorDescription = $data['description'] ?? '';
         }
 
@@ -727,7 +769,20 @@ try {
 
                     <div class="field">
                         <label for="service_type">Service Type</label>
-                        <input class="input" type="text" id="service_type" name="service_type" value="<?php echo htmlspecialchars($serviceType); ?>" placeholder="e.g. Cowrie Shell & Pearl Jewellery" required>
+                        <select class="input" id="service_type" name="service_type" required>
+                            <option value="">-- Select service type --</option>
+                            <?php foreach (vendorServiceTypeOptions() as $option): ?>
+                                <option value="<?php echo htmlspecialchars($option); ?>" <?php echo $serviceType === $option ? 'selected' : ''; ?>><?php echo htmlspecialchars($option); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+
+                    <div class="field">
+                        <label for="vendor_type">Vendor Type</label>
+                        <select class="input" id="vendor_type" name="vendor_type" required>
+                            <option value="service_provider" <?php echo $vendorType === 'service_provider' ? 'selected' : ''; ?>>Service Provider</option>
+                            <option value="market_operator" <?php echo $vendorType === 'market_operator' ? 'selected' : ''; ?>>Market Operator</option>
+                        </select>
                     </div>
 
                     <div class="field">

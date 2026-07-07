@@ -19,9 +19,81 @@ $paymentStatusCounts = [
 ];
 $notificationsCount = 0;
 $eventCountdownText = 'No upcoming event countdown available yet.';
+$isMarketOperator = false;
+$marketEventCount = 0;
+$stallPaidCount = 0;
+$stallPendingCount = 0;
 $flashSuccess = $_SESSION['flash_success'] ?? '';
 $flashError = $_SESSION['flash_error'] ?? '';
 unset($_SESSION['flash_success'], $_SESSION['flash_error']);
+
+function ensureVendorTypeSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM vendors LIKE 'vendor_type'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE vendors ADD COLUMN vendor_type ENUM('service_provider','market_operator') NOT NULL DEFAULT 'service_provider' AFTER service_type");
+    }
+
+    $ready = true;
+}
+
+function ensureStallRentalsSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS stall_rentals (
+            rental_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            event_id INT NOT NULL,
+            vendor_user_id INT NOT NULL,
+            created_by_planner INT DEFAULT NULL,
+            stall_label VARCHAR(80) DEFAULT NULL,
+            amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+            checkout_request_id VARCHAR(120) DEFAULT NULL,
+            merchant_request_id VARCHAR(120) DEFAULT NULL,
+            phone_number VARCHAR(20) DEFAULT NULL,
+            mpesa_code VARCHAR(64) DEFAULT NULL,
+            status ENUM('requested', 'paid', 'failed', 'cancelled') NOT NULL DEFAULT 'requested',
+            payment_status ENUM('pending', 'paid', 'failed', 'cancelled') NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_stall_rentals_event_vendor (event_id, vendor_user_id),
+            UNIQUE KEY uq_stall_rentals_checkout (checkout_request_id),
+            INDEX idx_stall_rentals_event_status (event_id, payment_status),
+            INDEX idx_stall_rentals_vendor (vendor_user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    );
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM stall_rentals LIKE 'payment_status'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE stall_rentals ADD COLUMN payment_status ENUM('pending', 'paid', 'failed', 'cancelled') NOT NULL DEFAULT 'pending' AFTER mpesa_code");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM stall_rentals LIKE 'status'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE stall_rentals ADD COLUMN status ENUM('requested', 'paid', 'failed', 'cancelled') NOT NULL DEFAULT 'requested' AFTER mpesa_code");
+    }
+
+    $pdo->exec(
+        "UPDATE stall_rentals
+         SET payment_status = CASE LOWER(COALESCE(status, 'requested'))
+            WHEN 'paid' THEN 'paid'
+            WHEN 'failed' THEN 'failed'
+            WHEN 'cancelled' THEN 'cancelled'
+            ELSE 'pending'
+         END"
+    );
+
+    $ready = true;
+}
 
 function resolveEventImageUrl(?string $rawUrl): string
 {
@@ -30,15 +102,27 @@ function resolveEventImageUrl(?string $rawUrl): string
         return '';
     }
 
+    $url = str_replace('\\', '/', $url);
+
     if (preg_match('/^(https?:)?\/\//i', $url) === 1 || stripos($url, 'data:') === 0) {
         return $url;
+    }
+
+    if (strpos($url, '../') === 0 || strpos($url, './') === 0) {
+        return $url;
+    }
+
+    if (strpos($url, '/') === 0) {
+        return '..' . $url;
     }
 
     return '../' . ltrim($url, '/');
 }
 
 try {
-    $stmt = $pdo->prepare('SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1');
+    ensureVendorTypeSchema($pdo);
+
+    $stmt = $pdo->prepare("SELECT vendor_id, COALESCE(vendor_type, 'service_provider') AS vendor_type FROM vendors WHERE user_id = ? LIMIT 1");
     $stmt->execute([$_SESSION['user_id']]);
     $vendor = $stmt->fetch();
 
@@ -46,6 +130,7 @@ try {
         $flashError = 'Vendor profile not found. Please complete vendor setup first.';
     } else {
         $vendorId = (int)$vendor['vendor_id'];
+        $isMarketOperator = ((string)($vendor['vendor_type'] ?? 'service_provider')) === 'market_operator';
 
         $pdo->exec(
             "CREATE TABLE IF NOT EXISTS vendor_notification_state (
@@ -205,16 +290,22 @@ try {
                 e.title,
                 e.event_date,
                 COALESCE(e.image_url, '') AS image_url,
+                                COALESCE(e.venue, '') AS venue,
+                                COALESCE(e.city, '') AS city,
+                                COALESCE(e.category, '') AS category,
+                                COALESCE(e.ticket_price, 0) AS ticket_price,
+                                u.full_name AS organizer_name,
                 COUNT(DISTINCT b.booking_id) AS booking_count,
                 SUM(CASE WHEN b.status = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_count
              FROM bookings b
              JOIN services s ON b.service_id = s.service_id
              JOIN events e ON e.event_id = b.event_id
+                         JOIN users u ON u.user_id = e.planner_id
              WHERE s.vendor_id = ?
                AND e.archived_at IS NULL
                AND e.event_date >= CURDATE()
                AND b.status IN ('pending', 'confirmed')
-               GROUP BY e.event_id, e.title, e.event_date, e.image_url
+                             GROUP BY e.event_id, e.title, e.event_date, e.image_url, e.venue, e.city, e.category, e.ticket_price, u.full_name
              ORDER BY e.event_date ASC"
         );
         $stmt->execute([$vendorId]);
@@ -240,6 +331,45 @@ try {
 
         $hasNewAlert = $newPendingCount > 0;
         $notificationsCount = $newPendingCount + $unreadConversations;
+
+        if ($isMarketOperator) {
+            ensureStallRentalsSchema($pdo);
+
+            $stmt = $pdo->query(
+                "SELECT COUNT(*)
+                 FROM events
+                 WHERE archived_at IS NULL
+                   AND event_date >= CURDATE()
+                   AND LOWER(COALESCE(category, '')) LIKE '%market%'"
+            );
+            $marketEventCount = (int)$stmt->fetchColumn();
+
+            $stmt = $pdo->prepare(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN COALESCE(payment_status,
+                        CASE LOWER(COALESCE(status, 'requested'))
+                            WHEN 'paid' THEN 'paid'
+                            WHEN 'failed' THEN 'failed'
+                            WHEN 'cancelled' THEN 'cancelled'
+                            ELSE 'pending'
+                        END
+                    ) = 'paid' THEN 1 ELSE 0 END), 0) AS paid_count,
+                    COALESCE(SUM(CASE WHEN COALESCE(payment_status,
+                        CASE LOWER(COALESCE(status, 'requested'))
+                            WHEN 'paid' THEN 'paid'
+                            WHEN 'failed' THEN 'failed'
+                            WHEN 'cancelled' THEN 'cancelled'
+                            ELSE 'pending'
+                        END
+                    ) = 'pending' THEN 1 ELSE 0 END), 0) AS pending_count
+                 FROM stall_rentals
+                 WHERE vendor_user_id = ?"
+            );
+            $stmt->execute([$_SESSION['user_id']]);
+            $stallStats = $stmt->fetch();
+            $stallPaidCount = (int)($stallStats['paid_count'] ?? 0);
+            $stallPendingCount = (int)($stallStats['pending_count'] ?? 0);
+        }
     }
 } catch (Throwable $e) {
     error_log('vendor/dashboard.php error: ' . $e->getMessage());
@@ -635,6 +765,66 @@ try {
             background-position: center;
             flex-shrink: 0;
         }
+
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            gap: 10px;
+        }
+
+        .event-card {
+            background: #fff;
+            border: 1px solid #ece9ff;
+            border-radius: 12px;
+            padding: 12px;
+        }
+
+        .thumb {
+            height: 88px;
+            border-radius: 8px;
+            background: linear-gradient(130deg, #6C63FF, #B8A8FF);
+            margin-bottom: 9px;
+            overflow: hidden;
+        }
+
+        .thumb img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .event-title {
+            font-size: 15px;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        .event-meta {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 4px;
+        }
+
+        .action-row {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+
+        .btn-light {
+            background: #ece9ff;
+            color: #3f379f;
+            border: none;
+            border-radius: 10px;
+            padding: 8px 11px;
+            cursor: pointer;
+            font-weight: 700;
+            font-size: 12px;
+            text-decoration: none;
+            display: inline-block;
+        }
     </style>
 </head>
 <body>
@@ -733,6 +923,28 @@ try {
             <a href="pay_fee.php" class="save-btn" style="display:inline-block; text-decoration:none;">Pay Vendor Fee</a>
         </div>
 
+        <?php if ($isMarketOperator): ?>
+            <div class="dashboard-card">
+                <h2 class="card-title">Register for Vendor Markets</h2>
+                <p class="card-subtitle">Reserve a stall for upcoming market events and pay the stall rental fee via M-Pesa.</p>
+                <div class="stats-grid" style="margin-bottom:12px;">
+                    <div class="stat-chip">
+                        <div class="stat-label">Market Events Open</div>
+                        <div class="stat-value"><?php echo (int)$marketEventCount; ?></div>
+                    </div>
+                    <div class="stat-chip">
+                        <div class="stat-label">Stalls Paid</div>
+                        <div class="stat-value"><?php echo (int)$stallPaidCount; ?></div>
+                    </div>
+                    <div class="stat-chip">
+                        <div class="stat-label">Stalls Pending</div>
+                        <div class="stat-value"><?php echo (int)$stallPendingCount; ?></div>
+                    </div>
+                </div>
+                <a href="stall_registration.php" class="save-btn" style="display:inline-block; text-decoration:none;">Open Stall Registration</a>
+            </div>
+        <?php endif; ?>
+
         <div class="dashboard-card">
             <?php if (empty($services)): ?>
                 <div class="booking-item">
@@ -767,19 +979,26 @@ try {
                     <span>No upcoming events you're participating in yet.</span>
                 </div>
             <?php else: ?>
-                <?php foreach ($upcomingEvents as $upcoming): ?>
-                    <?php $upcomingImage = resolveEventImageUrl((string)($upcoming['image_url'] ?? '')); ?>
-                    <div class="event-list-item">
-                        <div class="event-item-main">
-                            <div class="event-thumb"<?php if ($upcomingImage !== ''): ?> style="background-image:url('<?php echo htmlspecialchars($upcomingImage); ?>');"<?php endif; ?>></div>
-                            <div>
-                                <div class="service-name"><?php echo htmlspecialchars((string)$upcoming['title']); ?></div>
-                                <div class="event-meta-small"><?php echo htmlspecialchars((string)$upcoming['event_date']); ?> &middot; Bookings: <?php echo (int)$upcoming['booking_count']; ?> &middot; Confirmed: <?php echo (int)$upcoming['confirmed_count']; ?></div>
+                <div class="cards">
+                    <?php foreach ($upcomingEvents as $upcoming): ?>
+                        <?php $upcomingImage = resolveEventImageUrl((string)($upcoming['image_url'] ?? '')); ?>
+                        <div class="event-card">
+                            <div class="thumb">
+                                <?php if ($upcomingImage !== ''): ?>
+                                    <img src="<?php echo htmlspecialchars($upcomingImage); ?>" alt="Event banner">
+                                <?php endif; ?>
+                            </div>
+                            <div class="event-title"><?php echo htmlspecialchars((string)$upcoming['title']); ?></div>
+                            <div class="event-meta"><?php echo htmlspecialchars((string)$upcoming['event_date']); ?> &middot; <?php echo htmlspecialchars((string)(($upcoming['venue'] ?? '') !== '' ? $upcoming['venue'] : 'Venue TBA')); ?></div>
+                            <div class="event-meta">Organizer: <?php echo htmlspecialchars((string)($upcoming['organizer_name'] ?? 'Organizer')); ?></div>
+                            <div class="event-meta">Category: <?php echo htmlspecialchars((string)(($upcoming['category'] ?? '') !== '' ? $upcoming['category'] : 'General')); ?><?php if ((string)($upcoming['city'] ?? '') !== ''): ?> &middot; <?php echo htmlspecialchars((string)$upcoming['city']); ?><?php endif; ?></div>
+                            <div class="event-meta">Bookings: <?php echo (int)$upcoming['booking_count']; ?> &middot; Confirmed: <?php echo (int)$upcoming['confirmed_count']; ?></div>
+                            <div class="action-row">
+                                <a class="btn-light" href="schedule.php">View Schedule</a>
                             </div>
                         </div>
-                        <i class="fa-regular fa-calendar-check status-icon"></i>
-                    </div>
-                <?php endforeach; ?>
+                    <?php endforeach; ?>
+                </div>
             <?php endif; ?>
         </div>
 

@@ -25,6 +25,7 @@ $eventOpsById = [];
 $totalItemSpentAll = 0.0;
 $manualCashAvailableTotal = 0.0;
 $totalSponsorshipReceived = 0.0;
+$totalStallRevenue = 0.0;
 
 function ensureEventFinancialAdjustmentsSchema(PDO $pdo): void
 {
@@ -89,9 +90,62 @@ function ensureEventSponsorshipsSchema(PDO $pdo): void
     $ready = true;
 }
 
+function ensureStallRentalsDashboardSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS stall_rentals (
+            rental_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            event_id INT NOT NULL,
+            vendor_user_id INT NOT NULL,
+            created_by_planner INT DEFAULT NULL,
+            stall_label VARCHAR(80) DEFAULT NULL,
+            amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+            checkout_request_id VARCHAR(120) DEFAULT NULL,
+            merchant_request_id VARCHAR(120) DEFAULT NULL,
+            phone_number VARCHAR(20) DEFAULT NULL,
+            mpesa_code VARCHAR(64) DEFAULT NULL,
+            payment_status ENUM('pending', 'paid', 'failed', 'cancelled') NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_stall_rentals_event_vendor (event_id, vendor_user_id),
+            UNIQUE KEY uq_stall_rentals_checkout (checkout_request_id),
+            INDEX idx_stall_rentals_event_status (event_id, payment_status),
+            INDEX idx_stall_rentals_vendor (vendor_user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    );
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM stall_rentals LIKE 'payment_status'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE stall_rentals ADD COLUMN payment_status ENUM('pending', 'paid', 'failed', 'cancelled') NOT NULL DEFAULT 'pending' AFTER mpesa_code");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM stall_rentals LIKE 'status'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE stall_rentals ADD COLUMN status ENUM('requested', 'paid', 'failed', 'cancelled') NOT NULL DEFAULT 'requested' AFTER mpesa_code");
+    }
+
+    $pdo->exec(
+        "UPDATE stall_rentals
+         SET payment_status = CASE LOWER(COALESCE(status, 'requested'))
+             WHEN 'paid' THEN 'paid'
+             WHEN 'failed' THEN 'failed'
+             WHEN 'cancelled' THEN 'cancelled'
+             ELSE 'pending'
+         END"
+    );
+
+    $ready = true;
+}
+
 ensureEventFinancialAdjustmentsSchema($pdo);
 ensureEventBudgetItemSpentSchema($pdo);
 ensureEventSponsorshipsSchema($pdo);
+ensureStallRentalsDashboardSchema($pdo);
 
 try {
     $stmt = $pdo->prepare("SELECT * FROM events WHERE planner_id = ? AND archived_at IS NULL ORDER BY event_date DESC");
@@ -124,6 +178,7 @@ try {
             'item_spent_total' => 0.0,
             'manual_cash_available' => 0.0,
             'sponsorship_received' => 0.0,
+            'stall_revenue_received' => 0.0,
             'vendor_revenue_received' => (float)($row['vendor_revenue_received'] ?? 0),
             'unread_vendor_messages' => 0,
         ];
@@ -150,6 +205,7 @@ try {
                 'item_spent_total' => 0.0,
                 'manual_cash_available' => 0.0,
                 'sponsorship_received' => 0.0,
+                'stall_revenue_received' => 0.0,
                 'vendor_revenue_received' => 0.0,
                 'unread_vendor_messages' => 0,
             ];
@@ -177,6 +233,7 @@ try {
                 'item_spent_total' => 0.0,
                 'manual_cash_available' => 0.0,
                 'sponsorship_received' => 0.0,
+                'stall_revenue_received' => 0.0,
                 'vendor_revenue_received' => 0.0,
                 'unread_vendor_messages' => 0,
             ];
@@ -204,11 +261,49 @@ try {
                 'item_spent_total' => 0.0,
                 'manual_cash_available' => 0.0,
                 'sponsorship_received' => 0.0,
+                'stall_revenue_received' => 0.0,
                 'vendor_revenue_received' => 0.0,
                 'unread_vendor_messages' => 0,
             ];
         }
         $eventOpsById[$eventId]['sponsorship_received'] = (float)($row['sponsorship_received'] ?? 0);
+    }
+
+    $stmt = $pdo->prepare(
+        "SELECT sr.event_id,
+                COALESCE(SUM(CASE
+                    WHEN COALESCE(sr.payment_status,
+                        CASE LOWER(COALESCE(sr.status, 'requested'))
+                            WHEN 'paid' THEN 'paid'
+                            WHEN 'failed' THEN 'failed'
+                            WHEN 'cancelled' THEN 'cancelled'
+                            ELSE 'pending'
+                        END
+                    ) = 'paid' THEN sr.amount ELSE 0 END), 0) AS stall_revenue_received
+         FROM stall_rentals sr
+         JOIN events e ON e.event_id = sr.event_id
+         WHERE e.planner_id = ? AND e.archived_at IS NULL
+         GROUP BY sr.event_id"
+    );
+    $stmt->execute([$_SESSION['user_id']]);
+    foreach ($stmt->fetchAll() as $row) {
+        $eventId = (int)$row['event_id'];
+        if (!isset($eventOpsById[$eventId])) {
+            $eventOpsById[$eventId] = [
+                'total_bookings' => 0,
+                'pending_bookings' => 0,
+                'pending_payments' => 0,
+                'failed_payments' => 0,
+                'paid_transactions_total' => 0.0,
+                'item_spent_total' => 0.0,
+                'manual_cash_available' => 0.0,
+                'sponsorship_received' => 0.0,
+                'stall_revenue_received' => 0.0,
+                'vendor_revenue_received' => 0.0,
+                'unread_vendor_messages' => 0,
+            ];
+        }
+        $eventOpsById[$eventId]['stall_revenue_received'] = (float)($row['stall_revenue_received'] ?? 0);
     }
 
     $pdo->exec(
@@ -262,6 +357,7 @@ try {
                 'item_spent_total' => 0.0,
                 'manual_cash_available' => 0.0,
                 'sponsorship_received' => 0.0,
+                'stall_revenue_received' => 0.0,
                 'vendor_revenue_received' => 0.0,
                 'unread_vendor_messages' => 0,
             ];
@@ -340,6 +436,24 @@ try {
     );
     $stmt->execute([$_SESSION['user_id']]);
     $totalSponsorshipReceived = (float)$stmt->fetchColumn();
+
+    $stmt = $pdo->prepare(
+        "SELECT COALESCE(SUM(sr.amount), 0)
+         FROM stall_rentals sr
+         JOIN events e ON e.event_id = sr.event_id
+         WHERE e.planner_id = ?
+           AND e.archived_at IS NULL
+           AND COALESCE(sr.payment_status,
+                CASE LOWER(COALESCE(sr.status, 'requested'))
+                    WHEN 'paid' THEN 'paid'
+                    WHEN 'failed' THEN 'failed'
+                    WHEN 'cancelled' THEN 'cancelled'
+                    ELSE 'pending'
+                END
+           ) = 'paid'"
+    );
+    $stmt->execute([$_SESSION['user_id']]);
+    $totalStallRevenue = (float)$stmt->fetchColumn();
 
     $stmt = $pdo->prepare(
         "SELECT COALESCE(SUM(ebi.spent_amount), 0)
@@ -424,7 +538,7 @@ try {
     $flashError = 'Could not load dashboard data.';
 }
 
-$available = $totalTicketRevenue + $totalVendorRevenue + $manualCashAvailableTotal + $totalSponsorshipReceived;
+$available = $totalTicketRevenue + $totalVendorRevenue + $totalStallRevenue + $manualCashAvailableTotal + $totalSponsorshipReceived;
 $budgetRemainingForPlan = $totalBudget - $totalCommitted;
 $remainingCashAtUse = max(0, $available - $totalCommitted);
 $percent = $totalBudget > 0 ? (($totalCommitted > 0 ? $totalCommitted : 0) / $totalBudget) * 100 : 0;
@@ -1089,6 +1203,7 @@ if ($pendingBookings > 0) {
                                         'item_spent_total' => 0.0,
                                         'manual_cash_available' => 0.0,
                                         'sponsorship_received' => 0.0,
+                                        'stall_revenue_received' => 0.0,
                                         'vendor_revenue_received' => 0.0,
                                         'unread_vendor_messages' => 0,
                                     ];
@@ -1096,12 +1211,13 @@ if ($pendingBookings > 0) {
                                     $eventTotalBudget = (float)$event['budget_total'];
                                     $eventPaidTransactions = (float)($ops['paid_transactions_total'] ?? 0);
                                     $eventItemSpentTotal = (float)($ops['item_spent_total'] ?? 0);
-                                    $eventCommittedPaid = $eventPaidTransactions + $eventItemSpentTotal;
                                     $eventAttendeeRevenue = (float)$event['ticket_revenue'];
                                     $eventVendorRevenue = (float)($ops['vendor_revenue_received'] ?? 0);
+                                    $eventStallRevenue = (float)($ops['stall_revenue_received'] ?? 0);
                                     $eventSponsorships = (float)($ops['sponsorship_received'] ?? 0);
+                                    $eventCommittedPaid = $eventPaidTransactions + $eventItemSpentTotal + $eventSponsorships;
                                     $eventManualCashAtUse = (float)($ops['manual_cash_available'] ?? 0);
-                                    $eventAvailableFunds = $eventAttendeeRevenue + $eventVendorRevenue + $eventSponsorships + $eventManualCashAtUse;
+                                    $eventAvailableFunds = $eventAttendeeRevenue + $eventVendorRevenue + $eventStallRevenue + $eventSponsorships + $eventManualCashAtUse;
                                     $eventRemainingCashAtUse = max(0, $eventAvailableFunds - $eventCommittedPaid);
                                     $eventFundingGapLocal = max(0, $eventTotalBudget - $eventAvailableFunds);
                                     $eventFundingBufferLocal = max(0, $eventAvailableFunds - $eventTotalBudget);
@@ -1118,10 +1234,11 @@ if ($pendingBookings > 0) {
                                     </button>
                                     <div class="event-budget-panel">
                                         <div class="budget-metric">Budget Plan: <strong>KES <?php echo number_format($eventTotalBudget, 2); ?></strong></div>
-                                        <div class="budget-metric">Money Spent: <strong>KES <?php echo number_format($eventCommittedPaid, 2); ?></strong></div>
+                                        <div class="budget-metric">Money Spent (Incl Sponsorships): <strong>KES <?php echo number_format($eventCommittedPaid, 2); ?></strong></div>
                                         <div class="budget-metric">Item Spend Total: <strong>KES <?php echo number_format($eventItemSpentTotal, 2); ?></strong></div>
                                         <div class="budget-metric">Attendee Money: <strong>KES <?php echo number_format($eventAttendeeRevenue, 2); ?></strong></div>
                                         <div class="budget-metric">Vendor Money: <strong>KES <?php echo number_format($eventVendorRevenue, 2); ?></strong></div>
+                                        <div class="budget-metric">Stall Money: <strong>KES <?php echo number_format($eventStallRevenue, 2); ?></strong></div>
                                         <div class="budget-metric">Sponsorships: <strong>KES <?php echo number_format($eventSponsorships, 2); ?></strong></div>
                                         <div class="budget-metric">Extra Cash: <strong>KES <?php echo number_format($eventManualCashAtUse, 2); ?></strong></div>
                                         <div class="budget-metric">Money Received: <strong>KES <?php echo number_format($eventAvailableFunds, 2); ?></strong></div>
@@ -1263,12 +1380,14 @@ if ($pendingBookings > 0) {
                                     'item_spent_total' => 0.0,
                                     'manual_cash_available' => 0.0,
                                     'sponsorship_received' => 0.0,
+                                    'stall_revenue_received' => 0.0,
                                     'vendor_revenue_received' => 0.0,
                                     'unread_vendor_messages' => 0,
                                 ];
                                 $availableBudget = (float)$event['budget_total'] - (float)$event['budget_committed'];
                                 $availableFundsReceived = (float)$event['ticket_revenue']
                                     + (float)($ops['vendor_revenue_received'] ?? 0)
+                                    + (float)($ops['stall_revenue_received'] ?? 0)
                                     + (float)($ops['sponsorship_received'] ?? 0)
                                     + (float)($ops['manual_cash_available'] ?? 0);
                                 $eventFundingGap = max(0, (float)$event['budget_total'] - $availableFundsReceived);

@@ -149,7 +149,7 @@ try {
                 ]
             );
 
-            $success = 'M-Pesa STK push sent. Complete the prompt on your phone, then confirm payment.';
+            $success = 'M-Pesa STK push sent. Complete the prompt on your phone. Payment status will update automatically after callback.';
         } elseif ($action === 'confirm_paid') {
             $mpesaCode = strtoupper(trim((string)($_POST['mpesa_code'] ?? '')));
             if (!preg_match('/^[A-Z0-9]{6,20}$/', $mpesaCode)) {
@@ -537,13 +537,6 @@ try {
 
     <div class="container">
         <div class="dashboard-card">
-            <div class="top-actions">
-                <a href="dashboard.php" class="btn-secondary">
-                    <i class="fa-solid fa-arrow-left"></i>
-                    Back to Dashboard
-                </a>
-            </div>
-
             <h2 class="card-title">Vendor Event Fee (M-Pesa)</h2>
             <p class="card-subtitle">Pay event fee set by the planner for each event via M-Pesa to keep selling services.</p>
 

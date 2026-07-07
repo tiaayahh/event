@@ -17,6 +17,36 @@ require_once 'includes/audit.php';
 
 $error = '';
 
+function vendorServiceTypeOptions(): array
+{
+    return [
+        'DJ',
+        'Entertainment',
+        'Catering',
+        'Photography',
+        'Audio & Visual',
+        'Decor',
+        'MC / Host',
+        'Security',
+        'Makeup & Styling',
+    ];
+}
+
+function ensureVendorTypeSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM vendors LIKE 'vendor_type'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE vendors ADD COLUMN vendor_type ENUM('service_provider','market_operator') NOT NULL DEFAULT 'service_provider' AFTER service_type");
+    }
+
+    $ready = true;
+}
+
 function isDisposableEmailDomain(string $email): bool
 {
     $domain = strtolower((string)substr(strrchr($email, '@') ?: '', 1));
@@ -88,16 +118,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $userId = $pdo->lastInsertId();
 
             if ($role === 'vendor') {
+                ensureVendorTypeSchema($pdo);
                 $businessName = trim($_POST['business_name'] ?? '');
                 $serviceType  = trim($_POST['service_type'] ?? '');
+                $vendorType = strtolower(trim((string)($_POST['vendor_type'] ?? '')));
                 $desc         = trim($_POST['description'] ?? '');
+
+                $allowedServiceTypes = vendorServiceTypeOptions();
+                if (!in_array($serviceType, $allowedServiceTypes, true)) {
+                    $serviceType = '';
+                }
+
+                if (!in_array($vendorType, ['service_provider', 'market_operator'], true)) {
+                    $vendorType = 'service_provider';
+                }
 
                 if ($businessName === '' || $serviceType === '') {
                     throw new RuntimeException('Business name and service type are required for vendors.');
                 }
 
-                $stmt = $pdo->prepare("INSERT INTO vendors (user_id, business_name, service_type, description) VALUES (?, ?, ?, ?)");
-                $stmt->execute([$userId, $businessName, $serviceType, $desc]);
+                $stmt = $pdo->prepare("INSERT INTO vendors (user_id, business_name, service_type, vendor_type, description) VALUES (?, ?, ?, ?, ?)");
+                $stmt->execute([$userId, $businessName, $serviceType, $vendorType, $desc]);
             } elseif ($role === 'attendee') {
                 $stmt = $pdo->prepare("INSERT INTO attendees (user_id) VALUES (?)");
                 $stmt->execute([$userId]);
@@ -346,12 +387,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             <div id="vendorFields" class="vendor-fields">
                 <div class="form-group">
+                    <label for="vendor_type">Are you a</label>
+                    <select id="vendor_type" name="vendor_type" class="form-control">
+                        <option value="service_provider">Service Provider (DJ, Caterer, Photographer - hired by planners to do a job)</option>
+                        <option value="market_operator">Market Operator (Small business selling goods - pays a stall fee to sell at events)</option>
+                    </select>
+                </div>
+                <div class="form-group">
                     <label for="business_name">Business Name</label>
                     <input type="text" id="business_name" name="business_name" class="form-control" placeholder="e.g. DJ Brian Entertainments">
                 </div>
                 <div class="form-group">
                     <label for="service_type">Service Type</label>
-                    <input type="text" id="service_type" name="service_type" class="form-control" placeholder="e.g. DJ, Catering, Photography">
+                    <select id="service_type" name="service_type" class="form-control">
+                        <option value="">-- Select service type --</option>
+                        <?php foreach (vendorServiceTypeOptions() as $option): ?>
+                            <option value="<?php echo htmlspecialchars($option); ?>"><?php echo htmlspecialchars($option); ?></option>
+                        <?php endforeach; ?>
+                    </select>
                 </div>
                 <div class="form-group">
                     <label for="description">Description</label>

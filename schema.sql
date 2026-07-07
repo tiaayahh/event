@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS vendors (
     user_id INT NOT NULL,
     business_name VARCHAR(190) NOT NULL,
     service_type VARCHAR(120) NOT NULL,
+    vendor_type ENUM('service_provider','market_operator') NOT NULL DEFAULT 'service_provider',
     description TEXT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_vendors_user (user_id),
@@ -135,6 +136,30 @@ CREATE TABLE IF NOT EXISTS bookings (
     INDEX idx_bookings_status_created (status, created_at),
     CONSTRAINT fk_bookings_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
     CONSTRAINT fk_bookings_service FOREIGN KEY (service_id) REFERENCES services(service_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS stall_rentals (
+    rental_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_id INT NOT NULL,
+    vendor_user_id INT NOT NULL,
+    created_by_planner INT DEFAULT NULL,
+    stall_label VARCHAR(80) DEFAULT NULL,
+    amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    checkout_request_id VARCHAR(120) DEFAULT NULL,
+    merchant_request_id VARCHAR(120) DEFAULT NULL,
+    phone_number VARCHAR(20) DEFAULT NULL,
+    mpesa_code VARCHAR(64) DEFAULT NULL,
+    status ENUM('requested', 'paid', 'failed', 'cancelled') NOT NULL DEFAULT 'requested',
+    payment_status ENUM('pending', 'paid', 'failed', 'cancelled') NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_stall_rentals_event_vendor (event_id, vendor_user_id),
+    UNIQUE KEY uq_stall_rentals_checkout (checkout_request_id),
+    INDEX idx_stall_rentals_event_status (event_id, payment_status),
+    INDEX idx_stall_rentals_vendor (vendor_user_id),
+    CONSTRAINT fk_stall_rentals_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
+    CONSTRAINT fk_stall_rentals_vendor_user FOREIGN KEY (vendor_user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    CONSTRAINT fk_stall_rentals_planner_user FOREIGN KEY (created_by_planner) REFERENCES users(user_id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS transactions (

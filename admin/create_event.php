@@ -16,15 +16,29 @@ $eventType = 'in_person';
 $imageUrl = '';
 $budgetTotal = '';
 $ticketPrice = '0.00';
+$ticketTypePrices = [
+    'early_bird' => '0.00',
+    'regular' => '0.00',
+    'vip' => '0.00',
+    'vvip' => '0.00',
+];
+$ticketTypeDescriptions = [
+    'early_bird' => '',
+    'regular' => '',
+    'vip' => '',
+    'vvip' => '',
+];
 $ticketsAvailable = '200';
 $expectedAttendees = '0';
 $vendorContributionTarget = '0.00';
+$stallPrice = '0.00';
 $budgetItemNames = ['', '', ''];
 $budgetItemAmounts = ['', '', ''];
 $events = [];
 $archivedEvents = [];
 $eventOpsById = [];
 $eventBudgetItemsByEventId = [];
+$eventTicketTypesByEventId = [];
 $eventsNeedingAttention = 0;
 $eventView = strtolower(trim((string)($_GET['event_view'] ?? 'active')));
 if (!in_array($eventView, ['active', 'archived', 'all'], true)) {
@@ -76,6 +90,11 @@ function ensureEventBudgetPlanningSchema(PDO $pdo): void
     $stmt = $pdo->query("SHOW COLUMNS FROM events LIKE 'tickets_available'");
     if (!$stmt->fetch()) {
         $pdo->exec("ALTER TABLE events ADD COLUMN tickets_available INT NOT NULL DEFAULT 200 AFTER ticket_price");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM events LIKE 'stall_price'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE events ADD COLUMN stall_price DECIMAL(10,2) NOT NULL DEFAULT 0.00 AFTER ticket_price");
     }
 
     $pdo->exec(
@@ -187,6 +206,56 @@ function normalizeBannerInputUrl(string $value): ?string
     return null;
 }
 
+function pdfEscapeText(string $text): string
+{
+    $safe = preg_replace('/[^\x20-\x7E]/', '?', $text);
+    if ($safe === null) {
+        $safe = '';
+    }
+    return str_replace(['\\', '(', ')'], ['\\\\', '\\(', '\\)'], $safe);
+}
+
+function buildSimplePdfDocument(array $lines): string
+{
+    $maxLines = 48;
+    if (count($lines) > $maxLines) {
+        $lines = array_slice($lines, 0, $maxLines - 1);
+        $lines[] = '... truncated ...';
+    }
+
+    $y = 800;
+    $stream = '';
+    foreach ($lines as $line) {
+        $escaped = pdfEscapeText((string)$line);
+        $stream .= sprintf("BT /F1 11 Tf 50 %d Td (%s) Tj ET\n", $y, $escaped);
+        $y -= 15;
+    }
+
+    $objects = [];
+    $objects[1] = '<< /Type /Catalog /Pages 2 0 R >>';
+    $objects[2] = '<< /Type /Pages /Kids [3 0 R] /Count 1 >>';
+    $objects[3] = '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>';
+    $objects[4] = "<< /Length " . strlen($stream) . " >>\nstream\n" . $stream . "endstream";
+    $objects[5] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>';
+
+    $pdf = "%PDF-1.4\n";
+    $offsets = [0];
+    for ($i = 1; $i <= 5; $i++) {
+        $offsets[$i] = strlen($pdf);
+        $pdf .= $i . " 0 obj\n" . $objects[$i] . "\nendobj\n";
+    }
+
+    $xrefPos = strlen($pdf);
+    $pdf .= "xref\n0 6\n";
+    $pdf .= "0000000000 65535 f \n";
+    for ($i = 1; $i <= 5; $i++) {
+        $pdf .= sprintf("%010d 00000 n \n", $offsets[$i]);
+    }
+
+    $pdf .= "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n" . $xrefPos . "\n%%EOF";
+    return $pdf;
+}
+
 function ensureEventFinancialAdjustmentsSchema(PDO $pdo): void
 {
     static $ready = false;
@@ -235,9 +304,39 @@ function ensureEventSponsorshipsSchema(PDO $pdo): void
     $ready = true;
 }
 
+function ensureEventTicketTypesSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS event_ticket_types (
+            ticket_type_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            event_id INT NOT NULL,
+            ticket_type VARCHAR(32) NOT NULL,
+            price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+            description VARCHAR(255) DEFAULT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_event_ticket_type (event_id, ticket_type),
+            CONSTRAINT fk_event_ticket_types_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    );
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM event_ticket_types LIKE 'description'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE event_ticket_types ADD COLUMN description VARCHAR(255) DEFAULT NULL AFTER price");
+    }
+
+    $ready = true;
+}
+
 ensureEventBudgetPlanningSchema($pdo);
 ensureEventFinancialAdjustmentsSchema($pdo);
 ensureEventSponsorshipsSchema($pdo);
+ensureEventTicketTypesSchema($pdo);
 
 // Handle form submission
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -250,10 +349,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $eventType = strtolower(trim((string)($_POST['event_type'] ?? 'in_person')));
         $imageUrl = trim($_POST['image_url'] ?? '');
         $budgetTotal = trim($_POST['budget_total'] ?? '');
-        $ticketPrice = trim($_POST['ticket_price'] ?? '0.00');
+        $formTicketTypePrices = $_POST['ticket_type_price'] ?? [];
+        $formTicketTypeDescriptions = $_POST['ticket_type_description'] ?? [];
         $ticketsAvailable = trim($_POST['tickets_available'] ?? '200');
         $expectedAttendees = trim($_POST['expected_attendees'] ?? '0');
         $vendorContributionTarget = trim($_POST['vendor_contribution_target'] ?? '0.00');
+        $stallPrice = trim($_POST['stall_price'] ?? '0.00');
         $budgetItemNames = $_POST['budget_item_name'] ?? [];
         $budgetItemAmounts = $_POST['budget_item_amount'] ?? [];
 
@@ -263,6 +364,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!is_array($budgetItemAmounts)) {
             $budgetItemAmounts = [];
         }
+        if (!is_array($formTicketTypePrices)) {
+            $formTicketTypePrices = [];
+        }
+        if (!is_array($formTicketTypeDescriptions)) {
+            $formTicketTypeDescriptions = [];
+        }
+
+        $allowedTicketTypes = ['early_bird', 'regular', 'vip', 'vvip'];
+        foreach ($allowedTicketTypes as $ticketType) {
+            $rawPrice = trim((string)($formTicketTypePrices[$ticketType] ?? '0.00'));
+            if ($rawPrice === '' || !is_numeric($rawPrice) || (float)$rawPrice < 0) {
+                $flashError = 'Each ticket type price must be a valid non-negative amount.';
+                break;
+            }
+            $ticketTypePrices[$ticketType] = number_format((float)$rawPrice, 2, '.', '');
+            $ticketTypeDescriptions[$ticketType] = trim((string)($formTicketTypeDescriptions[$ticketType] ?? ''));
+        }
+        $ticketPrice = (string)($ticketTypePrices['regular'] ?? '0.00');
 
         $plannedItems = [];
         $plannedCommitted = 0.0;
@@ -297,10 +416,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $flashError = 'Title, event date, and a valid non-negative budget are required.';
         }
 
-        if ($flashError === '' && ($ticketPrice === '' || !is_numeric($ticketPrice) || (float)$ticketPrice < 0)) {
-            $flashError = 'Ticket price must be a valid non-negative amount.';
-        }
-
         if ($flashError === '' && !in_array($eventType, ['in_person', 'online'], true)) {
             $flashError = 'Choose a valid event type.';
         }
@@ -325,6 +440,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $flashError = 'Vendor contribution target must be a valid non-negative amount.';
         }
 
+        if ($flashError === '' && ($stallPrice === '' || !is_numeric($stallPrice) || (float)$stallPrice < 0)) {
+            $flashError = 'Stall price must be a valid non-negative amount.';
+        }
+
+        $hasBannerUrlInput = $imageUrl !== '';
+        $hasBannerFileInput = isset($_FILES['banner_file'])
+            && is_array($_FILES['banner_file'])
+            && (int)($_FILES['banner_file']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_NO_FILE;
+
+        if ($flashError === '' && $hasBannerUrlInput && $hasBannerFileInput) {
+            $flashError = 'Use either a banner URL or an uploaded banner file, not both.';
+        }
+
         if ($flashError === '' && $imageUrl !== '') {
             $normalized = normalizeBannerInputUrl($imageUrl);
             if ($normalized === null) {
@@ -344,6 +472,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $ticketsAvailableInt = max(0, (int)$ticketsAvailable);
         $expectedAttendeesInt = max(0, (int)$expectedAttendees);
         $vendorContributionTargetFloat = (float)$vendorContributionTarget;
+        $stallPriceFloat = (float)$stallPrice;
         $attendeeContributionTarget = $ticketPriceFloat * $expectedAttendeesInt;
         $finalImageUrl = $uploadedBannerPath ?? ($imageUrl !== '' ? $imageUrl : null);
 
@@ -356,8 +485,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $pdo->beginTransaction();
 
                 $stmt = $pdo->prepare(
-                    'INSERT INTO events (planner_id, title, category, event_date, venue, city, event_type, image_url, budget_total, budget_committed, ticket_price, tickets_available, ticket_revenue, attendee_contribution_target, vendor_contribution_target)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)'
+                    'INSERT INTO events (planner_id, title, category, event_date, venue, city, event_type, image_url, budget_total, budget_committed, ticket_price, stall_price, tickets_available, ticket_revenue, attendee_contribution_target, vendor_contribution_target)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)'
                 );
                 $stmt->execute([
                     $_SESSION['user_id'],
@@ -371,6 +500,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $budgetTotalFloat,
                     $plannedCommitted,
                     $ticketPriceFloat,
+                    $stallPriceFloat,
                     $ticketsAvailableInt,
                     $attendeeContributionTarget,
                     $vendorContributionTargetFloat,
@@ -385,6 +515,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     foreach ($plannedItems as $index => $item) {
                         $itemStmt->execute([$eventId, $item['name'], $item['amount'], $index + 1]);
                     }
+                }
+
+                $ticketTypeStmt = $pdo->prepare(
+                    'INSERT INTO event_ticket_types (event_id, ticket_type, price, description) VALUES (?, ?, ?, ?)'
+                );
+                foreach ($allowedTicketTypes as $ticketType) {
+                    $ticketTypeStmt->execute([
+                        $eventId,
+                        $ticketType,
+                        (float)($ticketTypePrices[$ticketType] ?? 0),
+                        $ticketTypeDescriptions[$ticketType] !== '' ? $ticketTypeDescriptions[$ticketType] : null,
+                    ]);
                 }
 
                 $pdo->commit();
@@ -408,6 +550,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'budget_committed' => $plannedCommitted,
                         'tickets_available' => $ticketsAvailableInt,
                         'planned_item_count' => count($plannedItems),
+                        'ticket_type_prices' => $ticketTypePrices,
+                        'stall_price' => $stallPriceFloat,
                         'attendee_contribution_target' => $attendeeContributionTarget,
                         'vendor_contribution_target' => $vendorContributionTargetFloat,
                     ]
@@ -435,11 +579,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } elseif (isset($_POST['update_event_banner'])) {
         $updateEventId = filter_input(INPUT_POST, 'event_id', FILTER_VALIDATE_INT);
         $newBannerUrl = trim((string)($_POST['image_url'] ?? ''));
+        $hasBannerUrlInput = $newBannerUrl !== '';
+        $hasBannerFileInput = isset($_FILES['banner_file'])
+            && is_array($_FILES['banner_file'])
+            && (int)($_FILES['banner_file']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_NO_FILE;
 
         if (!$updateEventId) {
             $flashError = 'Invalid event selected for banner update.';
         } else {
             try {
+                if ($hasBannerUrlInput && $hasBannerFileInput) {
+                    $flashError = 'Use either a banner URL or an uploaded banner file, not both.';
+                }
+
                 $uploadedBannerPath = null;
                 if (isset($_FILES['banner_file']) && is_array($_FILES['banner_file'])) {
                     $uploadedBannerPath = storeEventBannerUpload($_FILES['banner_file'], $flashError);
@@ -482,6 +634,139 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
             } catch (Throwable $e) {
                 $flashError = 'Could not update event banner right now. Please try again.';
+            }
+        }
+    } elseif (isset($_POST['update_event_details'])) {
+        $updateEventId = filter_input(INPUT_POST, 'event_id', FILTER_VALIDATE_INT);
+        $newCategory = trim((string)($_POST['category'] ?? ''));
+        $newVenue = trim((string)($_POST['venue'] ?? ''));
+        $newCity = trim((string)($_POST['city'] ?? ''));
+        $newStallPriceRaw = trim((string)($_POST['stall_price'] ?? '0.00'));
+
+        if (!$updateEventId) {
+            $flashError = 'Invalid event selected for details update.';
+        } elseif (strlen($newCategory) > 64) {
+            $flashError = 'Category must be 64 characters or fewer.';
+        } elseif (strlen($newVenue) > 190) {
+            $flashError = 'Venue must be 190 characters or fewer.';
+        } elseif (strlen($newCity) > 120) {
+            $flashError = 'City must be 120 characters or fewer.';
+        } elseif ($newStallPriceRaw === '' || !is_numeric($newStallPriceRaw) || (float)$newStallPriceRaw < 0) {
+            $flashError = 'Stall price must be a valid non-negative amount.';
+        } else {
+            try {
+                $stmt = $pdo->prepare(
+                    'UPDATE events SET category = ?, venue = ?, city = ?, stall_price = ? WHERE event_id = ? AND planner_id = ? AND archived_at IS NULL LIMIT 1'
+                );
+                $stmt->execute([
+                    $newCategory !== '' ? $newCategory : null,
+                    $newVenue !== '' ? $newVenue : null,
+                    $newCity !== '' ? $newCity : null,
+                    (float)$newStallPriceRaw,
+                    $updateEventId,
+                    $_SESSION['user_id'],
+                ]);
+
+                if ($stmt->rowCount() > 0) {
+                    audit_log(
+                        $pdo,
+                        (int)$_SESSION['user_id'],
+                        (string)$_SESSION['role'],
+                        'event.details_update',
+                        'event',
+                        (string)$updateEventId,
+                        [
+                            'category' => $newCategory,
+                            'venue' => $newVenue,
+                            'city' => $newCity,
+                            'stall_price' => (float)$newStallPriceRaw,
+                        ]
+                    );
+                    $_SESSION['flash_success'] = 'Event details updated successfully.';
+                    header('Location: create_event.php?event_view=' . urlencode($eventView) . '#event-views-anchor');
+                    exit;
+                }
+
+                $flashError = 'Event not found or no details were changed.';
+            } catch (Throwable $e) {
+                $flashError = 'Could not update event details right now. Please try again.';
+            }
+        }
+    } elseif (isset($_POST['update_event_ticket_types'])) {
+        $updateEventId = filter_input(INPUT_POST, 'event_id', FILTER_VALIDATE_INT);
+        $formTicketTypePrices = $_POST['ticket_type_price'] ?? [];
+        $formTicketTypeDescriptions = $_POST['ticket_type_description'] ?? [];
+        if (!is_array($formTicketTypePrices)) {
+            $formTicketTypePrices = [];
+        }
+        if (!is_array($formTicketTypeDescriptions)) {
+            $formTicketTypeDescriptions = [];
+        }
+
+        $allowedTicketTypes = ['early_bird', 'regular', 'vip', 'vvip'];
+        $normalizedTicketTypes = [];
+        $normalizedTicketTypeDescriptions = [];
+
+        if (!$updateEventId) {
+            $flashError = 'Invalid event selected for ticket update.';
+        } else {
+            foreach ($allowedTicketTypes as $ticketType) {
+                $rawPrice = trim((string)($formTicketTypePrices[$ticketType] ?? '0.00'));
+                if ($rawPrice === '' || !is_numeric($rawPrice) || (float)$rawPrice < 0) {
+                    $flashError = 'Each ticket type price must be a valid non-negative amount.';
+                    break;
+                }
+                $normalizedTicketTypes[$ticketType] = (float)$rawPrice;
+                $normalizedTicketTypeDescriptions[$ticketType] = trim((string)($formTicketTypeDescriptions[$ticketType] ?? ''));
+            }
+        }
+
+        if ($flashError === '') {
+            try {
+                $stmt = $pdo->prepare('SELECT event_id FROM events WHERE event_id = ? AND planner_id = ? AND archived_at IS NULL LIMIT 1');
+                $stmt->execute([$updateEventId, $_SESSION['user_id']]);
+                if (!$stmt->fetch()) {
+                    $flashError = 'Event not found or cannot be updated.';
+                } else {
+                    $pdo->beginTransaction();
+
+                    $stmt = $pdo->prepare('UPDATE events SET ticket_price = ? WHERE event_id = ? AND planner_id = ? LIMIT 1');
+                    $stmt->execute([$normalizedTicketTypes['regular'] ?? 0, $updateEventId, $_SESSION['user_id']]);
+
+                    $stmt = $pdo->prepare('DELETE FROM event_ticket_types WHERE event_id = ?');
+                    $stmt->execute([$updateEventId]);
+
+                    $typeStmt = $pdo->prepare('INSERT INTO event_ticket_types (event_id, ticket_type, price, description) VALUES (?, ?, ?, ?)');
+                    foreach ($allowedTicketTypes as $ticketType) {
+                        $typeStmt->execute([
+                            $updateEventId,
+                            $ticketType,
+                            $normalizedTicketTypes[$ticketType] ?? 0,
+                            $normalizedTicketTypeDescriptions[$ticketType] !== '' ? $normalizedTicketTypeDescriptions[$ticketType] : null,
+                        ]);
+                    }
+
+                    $pdo->commit();
+
+                    audit_log(
+                        $pdo,
+                        (int)$_SESSION['user_id'],
+                        (string)$_SESSION['role'],
+                        'event.ticket_types_update',
+                        'event',
+                        (string)$updateEventId,
+                        ['ticket_type_prices' => $normalizedTicketTypes]
+                    );
+
+                    $_SESSION['flash_success'] = 'Event ticket types updated successfully.';
+                    header('Location: create_event.php?event_view=' . urlencode($eventView) . '#event-views-anchor');
+                    exit;
+                }
+            } catch (Throwable $e) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                $flashError = 'Could not update ticket types right now. Please try again.';
             }
         }
     } elseif (isset($_POST['delete_event'])) {
@@ -619,6 +904,100 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $flashError = 'Could not restore event right now. Please try again.';
             }
         }
+    } elseif (isset($_POST['download_budget_preview'])) {
+        $downloadEventId = filter_input(INPUT_POST, 'event_id', FILTER_VALIDATE_INT);
+
+        if (!$downloadEventId) {
+            $flashError = 'Invalid event selected for budget preview download.';
+        } else {
+            try {
+                $stmt = $pdo->prepare(
+                    "SELECT e.event_id, e.title, e.event_date, e.budget_total, e.budget_committed,
+                            COALESCE(e.ticket_revenue, 0) AS ticket_revenue,
+                            COALESCE(e.tickets_available, 200) AS tickets_available,
+                            COUNT(DISTINCT a.attendance_id) AS attendee_count,
+                            COALESCE(SUM(CASE WHEN b.status = 'confirmed' THEN b.platform_fee ELSE 0 END), 0) AS vendor_revenue_received,
+                            COALESCE(SUM(CASE WHEN t.status = 'paid' THEN COALESCE(t.amount, 0) ELSE 0 END), 0) AS paid_transactions_total,
+                            COALESCE((SELECT SUM(es.contribution_amount) FROM event_sponsorships es WHERE es.event_id = e.event_id), 0) AS sponsorship_received
+                     FROM events e
+                     LEFT JOIN attendances a ON a.event_id = e.event_id AND a.status IN ('registered', 'attended')
+                     LEFT JOIN bookings b ON b.event_id = e.event_id
+                     LEFT JOIN transactions t ON t.booking_id = b.booking_id
+                     WHERE e.event_id = ? AND e.planner_id = ?
+                     GROUP BY e.event_id, e.title, e.event_date, e.budget_total, e.budget_committed, e.ticket_revenue, e.tickets_available"
+                );
+                $stmt->execute([$downloadEventId, $_SESSION['user_id']]);
+                $eventSummary = $stmt->fetch();
+
+                if (!$eventSummary) {
+                    $flashError = 'Event not found or you do not have permission to download its budget preview.';
+                } else {
+                    $stmt = $pdo->prepare(
+                        "SELECT item_name, planned_amount, spent_amount
+                         FROM event_budget_items
+                         WHERE event_id = ?
+                         ORDER BY sort_order ASC, item_id ASC"
+                    );
+                    $stmt->execute([$downloadEventId]);
+                    $budgetItems = $stmt->fetchAll();
+
+                    $moneyReceived = (float)($eventSummary['ticket_revenue'] ?? 0)
+                        + (float)($eventSummary['vendor_revenue_received'] ?? 0)
+                        + (float)($eventSummary['sponsorship_received'] ?? 0);
+                    $moneySpent = (float)($eventSummary['paid_transactions_total'] ?? 0)
+                        + (float)($eventSummary['sponsorship_received'] ?? 0);
+                    foreach ($budgetItems as $budgetItem) {
+                        $moneySpent += (float)($budgetItem['spent_amount'] ?? 0);
+                    }
+                    $cashLeft = max(0, $moneyReceived - $moneySpent);
+
+                    $safeTitle = preg_replace('/[^a-zA-Z0-9_-]+/', '_', (string)($eventSummary['title'] ?? 'event'));
+                    if ($safeTitle === null || $safeTitle === '') {
+                        $safeTitle = 'event';
+                    }
+
+                    $pdfLines = [
+                        'Event Budget Preview',
+                        'Event ID: ' . (string)$eventSummary['event_id'],
+                        'Title: ' . (string)$eventSummary['title'],
+                        'Event Date: ' . (string)$eventSummary['event_date'],
+                        'Ticket Capacity: ' . (string)$eventSummary['attendee_count'] . ' / ' . (string)$eventSummary['tickets_available'],
+                        '',
+                        'Budget Plan: KES ' . number_format((float)$eventSummary['budget_total'], 2, '.', ''),
+                        'Planned Spend: KES ' . number_format((float)$eventSummary['budget_committed'], 2, '.', ''),
+                        'Attendee Money: KES ' . number_format((float)$eventSummary['ticket_revenue'], 2, '.', ''),
+                        'Vendor Money: KES ' . number_format((float)$eventSummary['vendor_revenue_received'], 2, '.', ''),
+                        'Sponsorships (Assumed Paid): KES ' . number_format((float)$eventSummary['sponsorship_received'], 2, '.', ''),
+                        'Cash at Use (Auto): KES ' . number_format($moneyReceived, 2, '.', ''),
+                        'Money Received: KES ' . number_format($moneyReceived, 2, '.', ''),
+                        'Money Spent (Incl Sponsorships): KES ' . number_format($moneySpent, 2, '.', ''),
+                        'Cash Left: KES ' . number_format($cashLeft, 2, '.', ''),
+                        '',
+                        'Planned Budget Items',
+                    ];
+
+                    if (empty($budgetItems)) {
+                        $pdfLines[] = 'No planned budget items found.';
+                    } else {
+                        foreach ($budgetItems as $budgetItem) {
+                            $pdfLines[] = '- ' . (string)($budgetItem['item_name'] ?? '')
+                                . ' | Planned: KES ' . number_format((float)($budgetItem['planned_amount'] ?? 0), 2, '.', '')
+                                . ' | Spent: KES ' . number_format((float)($budgetItem['spent_amount'] ?? 0), 2, '.', '');
+                        }
+                    }
+
+                    $pdfBytes = buildSimplePdfDocument($pdfLines);
+
+                    header('Content-Type: application/pdf');
+                    header('Content-Disposition: attachment; filename="budget_preview_' . $downloadEventId . '_' . $safeTitle . '.pdf"');
+                    header('Content-Length: ' . strlen($pdfBytes));
+                    echo $pdfBytes;
+                    exit;
+                }
+            } catch (Throwable $e) {
+                $flashError = 'Could not download budget preview right now. Please try again.';
+            }
+        }
     } elseif (isset($_POST['save_item_spent'])) {
         $entryEventId = filter_input(INPUT_POST, 'event_id', FILTER_VALIDATE_INT);
         $itemIds = $_POST['item_id'] ?? [];
@@ -690,20 +1069,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             $stmt->execute([$entryEventId]);
                             $paidTransactions = (float)$stmt->fetchColumn();
 
-                            $stmt = $pdo->prepare(
-                                "SELECT COALESCE(SUM(amount), 0)
-                                 FROM event_financial_adjustments
-                                 WHERE event_id = ? AND entry_kind = 'cash_available'"
-                            );
-                            $stmt->execute([$entryEventId]);
-                            $manualCash = (float)$stmt->fetchColumn();
-
                             $moneyReceived = (float)($eventRow['ticket_revenue'] ?? 0)
                                 + (float)($eventRow['vendor_revenue_received'] ?? 0)
-                                + (float)($eventRow['sponsorship_received'] ?? 0)
-                                + $manualCash;
+                                + (float)($eventRow['sponsorship_received'] ?? 0);
 
-                            $moneySpentCandidate = $paidTransactions + $totalItemSpent;
+                            $moneySpentCandidate = $paidTransactions
+                                + $totalItemSpent
+                                + (float)($eventRow['sponsorship_received'] ?? 0);
                             if ($moneySpentCandidate > $moneyReceived) {
                                 $flashError = 'Cannot save item spending. Total money spent would be higher than money received.';
                             } else {
@@ -741,70 +1113,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } elseif (isset($_POST['add_committed_paid'])) {
         $flashError = 'Use the planned budget items section to record money spent per item.';
     } elseif (isset($_POST['add_cash_at_use'])) {
-        $entryKind = 'cash_available';
-        $entryEventId = filter_input(INPUT_POST, 'event_id', FILTER_VALIDATE_INT);
-        $entryAmountRaw = trim((string)($_POST['amount'] ?? ''));
-        $entryNote = trim((string)($_POST['note'] ?? ''));
-
-        if (!$entryEventId) {
-            $flashError = 'Invalid event selected for financial adjustment.';
-        } elseif ($entryAmountRaw === '' || !is_numeric($entryAmountRaw) || (float)$entryAmountRaw <= 0) {
-            $flashError = 'Please enter a valid positive amount.';
-        } else {
-            try {
-                $stmt = $pdo->prepare('SELECT title FROM events WHERE event_id = ? AND planner_id = ? AND archived_at IS NULL LIMIT 1');
-                $stmt->execute([$entryEventId, $_SESSION['user_id']]);
-                $entryEvent = $stmt->fetch();
-
-                if (!$entryEvent) {
-                    $flashError = 'Event not found or cannot be adjusted.';
-                } else {
-                    $entryAmount = (float)$entryAmountRaw;
-
-                    if ($flashError === '') {
-                    $stmt = $pdo->prepare(
-                        'INSERT INTO event_financial_adjustments (event_id, entry_kind, amount, note, created_by) VALUES (?, ?, ?, ?, ?)'
-                    );
-                    $stmt->execute([
-                        $entryEventId,
-                        $entryKind,
-                        $entryAmount,
-                        $entryNote !== '' ? $entryNote : null,
-                        (int)$_SESSION['user_id'],
-                    ]);
-
-                    audit_log(
-                        $pdo,
-                        (int)$_SESSION['user_id'],
-                        (string)$_SESSION['role'],
-                        'event.financial_adjustment_added',
-                        'event',
-                        (string)$entryEventId,
-                        [
-                            'entry_kind' => $entryKind,
-                            'amount' => $entryAmount,
-                            'note' => $entryNote,
-                        ]
-                    );
-
-                    $_SESSION['flash_success'] = 'Extra cash added.';
-                    header('Location: create_event.php?event_view=' . urlencode($eventView) . '#event-views-anchor');
-                    exit;
-                    }
-                }
-            } catch (Throwable $e) {
-                audit_log(
-                    $pdo,
-                    (int)$_SESSION['user_id'],
-                    (string)$_SESSION['role'],
-                    'event.financial_adjustment_add_failed',
-                    'event',
-                    $entryEventId ? (string)$entryEventId : null,
-                    ['entry_kind' => $entryKind, 'reason' => 'exception']
-                );
-                $flashError = 'Could not save financial adjustment right now. Please try again.';
-            }
-        }
+        $flashSuccess = 'Cash at Use is now auto-calculated from attendee payments, vendor payments, and sponsorships.';
     }
 }
 
@@ -812,30 +1121,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 try {
     $stmt = $pdo->prepare(
         "SELECT e.event_id, e.title, e.event_date, e.budget_total, e.budget_committed, e.ticket_revenue,
-            e.ticket_price, COALESCE(e.tickets_available, 200) AS tickets_available,
+            e.ticket_price, COALESCE(e.stall_price, 0) AS stall_price, COALESCE(e.tickets_available, 200) AS tickets_available,
             COALESCE(e.category, '') AS category,
             COALESCE(e.venue, '') AS venue,
             COALESCE(e.city, '') AS city,
             COALESCE(e.event_type, 'in_person') AS event_type,
             COALESCE(e.image_url, '') AS image_url,
                 COUNT(DISTINCT a.attendance_id) AS attendee_count,
-                COALESCE(adj_cash.total_cash_available, 0) AS manual_cash_available,
                 COALESCE(adj_sponsor.total_sponsorship_received, 0) AS sponsorship_received
          FROM events e
          LEFT JOIN attendances a ON a.event_id = e.event_id AND a.status IN ('registered', 'attended')
-         LEFT JOIN (
-             SELECT event_id, SUM(amount) AS total_cash_available
-             FROM event_financial_adjustments
-             WHERE entry_kind = 'cash_available'
-             GROUP BY event_id
-         ) adj_cash ON adj_cash.event_id = e.event_id
          LEFT JOIN (
              SELECT event_id, SUM(contribution_amount) AS total_sponsorship_received
              FROM event_sponsorships
              GROUP BY event_id
          ) adj_sponsor ON adj_sponsor.event_id = e.event_id
          WHERE e.planner_id = ? AND e.archived_at IS NULL
-         GROUP BY e.event_id, e.title, e.event_date, e.budget_total, e.budget_committed, e.ticket_revenue, e.ticket_price, e.tickets_available, e.category, e.venue, e.city, e.event_type, e.image_url, adj_cash.total_cash_available, adj_sponsor.total_sponsorship_received
+         GROUP BY e.event_id, e.title, e.event_date, e.budget_total, e.budget_committed, e.ticket_revenue, e.ticket_price, e.stall_price, e.tickets_available, e.category, e.venue, e.city, e.event_type, e.image_url, adj_sponsor.total_sponsorship_received
          ORDER BY e.event_date DESC"
     );
     $stmt->execute([$_SESSION['user_id']]);
@@ -929,6 +1231,31 @@ try {
                 'spent_amount' => (float)($row['spent_amount'] ?? 0),
             ];
         }
+
+        $stmt = $pdo->prepare(
+            "SELECT event_id, ticket_type, price, COALESCE(description, '') AS description
+             FROM event_ticket_types
+             WHERE event_id IN ($placeholders)"
+        );
+        $stmt->execute($eventIds);
+        foreach ($stmt->fetchAll() as $row) {
+            $eventId = (int)$row['event_id'];
+            if (!isset($eventTicketTypesByEventId[$eventId])) {
+                $eventTicketTypesByEventId[$eventId] = [
+                    'early_bird' => ['price' => 0.0, 'description' => ''],
+                    'regular' => ['price' => 0.0, 'description' => ''],
+                    'vip' => ['price' => 0.0, 'description' => ''],
+                    'vvip' => ['price' => 0.0, 'description' => ''],
+                ];
+            }
+            $typeKey = strtolower((string)$row['ticket_type']);
+            if (isset($eventTicketTypesByEventId[$eventId][$typeKey])) {
+                $eventTicketTypesByEventId[$eventId][$typeKey] = [
+                    'price' => (float)($row['price'] ?? 0),
+                    'description' => (string)($row['description'] ?? ''),
+                ];
+            }
+        }
     }
 
     foreach ($events as $event) {
@@ -948,8 +1275,7 @@ try {
         $ops = $eventOpsById[$eventId];
         $availableFundsReceived = (float)$event['ticket_revenue']
             + (float)($ops['vendor_revenue_received'] ?? 0)
-            + (float)($event['sponsorship_received'] ?? 0)
-            + (float)($event['manual_cash_available'] ?? 0);
+            + (float)($event['sponsorship_received'] ?? 0);
         $hasBudgetOverrun = $availableFundsReceived < (float)$event['budget_total'];
         if ($hasBudgetOverrun || $ops['pending_bookings'] > 0 || $ops['pending_payments'] > 0 || $ops['failed_payments'] > 0 || $ops['unread_vendor_messages'] > 0) {
             $eventsNeedingAttention++;
@@ -962,10 +1288,10 @@ try {
 $totalEvents = count($events);
 $totalBudgetAll = array_sum(array_column($events, 'budget_total'));
 $draftBudgetTotal = is_numeric($budgetTotal) ? (float)$budgetTotal : 0.00;
-$draftTicketPrice = is_numeric($ticketPrice) ? (float)$ticketPrice : 0.00;
+$draftRegularTicketPrice = is_numeric((string)($ticketTypePrices['regular'] ?? '0')) ? (float)$ticketTypePrices['regular'] : 0.00;
 $draftExpectedAttendees = is_numeric($expectedAttendees) ? max(0, (int)$expectedAttendees) : 0;
 $draftVendorContribution = is_numeric($vendorContributionTarget) ? (float)$vendorContributionTarget : 0.00;
-$draftAttendeeContribution = $draftTicketPrice * $draftExpectedAttendees;
+$draftAttendeeContribution = $draftRegularTicketPrice * $draftExpectedAttendees;
 $draftCommittedAtCreation = 0.00;
 foreach ($budgetItemAmounts as $amountRaw) {
     if (is_numeric($amountRaw) && (float)$amountRaw >= 0) {
@@ -1169,6 +1495,7 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
             <div class="form-group">
                 <label for="image_url">Banner Image URL</label>
                 <input type="url" id="image_url" name="image_url" class="form-input" placeholder="https://example.com/banner.jpg" value="<?php echo htmlspecialchars($imageUrl); ?>">
+                <div class="item-example-text">Use URL or Upload, not both.</div>
             </div>
             <div class="form-group">
                 <label for="banner_file">Or Upload Banner</label>
@@ -1178,9 +1505,15 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                 <label for="budget_total">Budget (KES)</label>
                 <input type="number" id="budget_total" name="budget_total" step="0.01" min="0" class="form-input" placeholder="15000" value="<?php echo htmlspecialchars($budgetTotal); ?>" required>
             </div>
-            <div class="form-group">
-                <label for="ticket_price">Ticket Price (KES) <small>(per attendee)</small></label>
-                <input type="number" step="0.01" min="0" id="ticket_price" name="ticket_price" class="form-input" placeholder="0.00" value="<?php echo htmlspecialchars($ticketPrice ?? '0.00'); ?>">
+            <div class="form-group" style="grid-column: 1 / -1;">
+                <label>Ticket Types (KES)</label>
+                <div style="display:grid; grid-template-columns:repeat(4, minmax(140px, 1fr)); gap:10px;">
+                    <input type="number" step="0.01" min="0" id="ticket_type_early_bird" name="ticket_type_price[early_bird]" class="form-input" placeholder="Early Bird" value="<?php echo htmlspecialchars((string)($ticketTypePrices['early_bird'] ?? '0.00')); ?>">
+                    <input type="number" step="0.01" min="0" id="ticket_type_regular" name="ticket_type_price[regular]" class="form-input" placeholder="Regular" value="<?php echo htmlspecialchars((string)($ticketTypePrices['regular'] ?? '0.00')); ?>">
+                    <input type="number" step="0.01" min="0" id="ticket_type_vip" name="ticket_type_price[vip]" class="form-input" placeholder="VIP" value="<?php echo htmlspecialchars((string)($ticketTypePrices['vip'] ?? '0.00')); ?>">
+                    <input type="number" step="0.01" min="0" id="ticket_type_vvip" name="ticket_type_price[vvip]" class="form-input" placeholder="VVIP" value="<?php echo htmlspecialchars((string)($ticketTypePrices['vvip'] ?? '0.00')); ?>">
+                </div>
+                <div class="item-example-text">Attendee contribution preview uses the Regular ticket type.</div>
             </div>
             <div class="form-group">
                 <label for="tickets_available">Tickets Available</label>
@@ -1193,6 +1526,10 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
             <div class="form-group">
                 <label for="vendor_contribution_target">Vendor Contribution Target (KES)</label>
                 <input type="number" step="0.01" min="0" id="vendor_contribution_target" name="vendor_contribution_target" class="form-input" placeholder="0.00" value="<?php echo htmlspecialchars($vendorContributionTarget ?? '0.00'); ?>">
+            </div>
+            <div class="form-group">
+                <label for="stall_price">Stall Price (KES) <small>(for Market events)</small></label>
+                <input type="number" step="0.01" min="0" id="stall_price" name="stall_price" class="form-input" placeholder="0.00" value="<?php echo htmlspecialchars($stallPrice ?? '0.00'); ?>">
             </div>
             <div class="budget-items" style="grid-column: 1 / -1;">
                 <div class="budget-items-title"><i class="fa-solid fa-list-check" style="color:#6C63FF;"></i> Planned Budget Line Items</div>
@@ -1237,7 +1574,7 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                 </div>
                 <div class="breakdown-item">
                     <div class="breakdown-label">Ticket Price Per Attendee</div>
-                    <div class="breakdown-value" id="draft_ticket_price">KES <?php echo number_format($draftTicketPrice, 2); ?></div>
+                    <div class="breakdown-value" id="draft_ticket_price">KES <?php echo number_format($draftRegularTicketPrice, 2); ?></div>
                 </div>
                 <div class="breakdown-item">
                     <div class="breakdown-label">Attendee Contribution (Projected)</div>
@@ -1292,10 +1629,18 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                         foreach ($budgetItems as $budgetItem) {
                             $itemSpentTotal += (float)($budgetItem['spent_amount'] ?? 0);
                         }
-                        $manualCashAvailable = (float)($event['manual_cash_available'] ?? 0);
+                        $ticketTypesForEvent = $eventTicketTypesByEventId[$eventId] ?? [
+                            'early_bird' => ['price' => 0.0, 'description' => ''],
+                            'regular' => ['price' => (float)($event['ticket_price'] ?? 0), 'description' => ''],
+                            'vip' => ['price' => 0.0, 'description' => ''],
+                            'vvip' => ['price' => 0.0, 'description' => ''],
+                        ];
                         $sponsorshipReceived = (float)($event['sponsorship_received'] ?? 0);
-                        $committedPaid = (float)($ops['paid_transactions_total'] ?? 0) + $itemSpentTotal;
-                        $availableFundsReceived = (float)$event['ticket_revenue'] + (float)($ops['vendor_revenue_received'] ?? 0) + $sponsorshipReceived + $manualCashAvailable;
+                        $committedPaid = (float)($ops['paid_transactions_total'] ?? 0)
+                            + $itemSpentTotal
+                            + $sponsorshipReceived;
+                        $availableFundsReceived = (float)$event['ticket_revenue'] + (float)($ops['vendor_revenue_received'] ?? 0) + $sponsorshipReceived;
+                        $cashAtUseAuto = $availableFundsReceived;
                         $cashLeftRaw = $availableFundsReceived - $committedPaid;
                         $cashLeft = max(0, $cashLeftRaw);
                         $isBudgetOverrun = $availableFundsReceived < (float)$event['budget_total'];
@@ -1344,14 +1689,18 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                                 <span><span class="detail-label">Venue:</span> <?php echo htmlspecialchars((string)(($event['venue'] ?? '') !== '' ? $event['venue'] : 'Not specified')); ?></span>
                                 <span><span class="detail-label">City:</span> <?php echo htmlspecialchars((string)(($event['city'] ?? '') !== '' ? $event['city'] : 'Not specified')); ?></span>
                                 <span><span class="detail-label">Type:</span> <?php echo ((string)($event['event_type'] ?? 'in_person') === 'online') ? 'Online' : 'In-person'; ?></span>
-                                <span><span class="detail-label">Ticket Price:</span> <?php echo ((float)$event['ticket_price'] <= 0) ? 'Free' : ('KES ' . number_format((float)$event['ticket_price'], 2)); ?></span>
+                                <span><span class="detail-label">Stall Price:</span> KES <?php echo number_format((float)($event['stall_price'] ?? 0), 2); ?></span>
+                                <span><span class="detail-label">Ticket Type - Early Bird:</span> <?php echo ((float)$ticketTypesForEvent['early_bird']['price'] <= 0) ? 'Free' : ('KES ' . number_format((float)$ticketTypesForEvent['early_bird']['price'], 2)); ?></span>
+                                <span><span class="detail-label">Ticket Type - Regular:</span> <?php echo ((float)$ticketTypesForEvent['regular']['price'] <= 0) ? 'Free' : ('KES ' . number_format((float)$ticketTypesForEvent['regular']['price'], 2)); ?></span>
+                                <span><span class="detail-label">Ticket Type - VIP:</span> <?php echo ((float)$ticketTypesForEvent['vip']['price'] <= 0) ? 'Free' : ('KES ' . number_format((float)$ticketTypesForEvent['vip']['price'], 2)); ?></span>
+                                <span><span class="detail-label">Ticket Type - VVIP:</span> <?php echo ((float)$ticketTypesForEvent['vvip']['price'] <= 0) ? 'Free' : ('KES ' . number_format((float)$ticketTypesForEvent['vvip']['price'], 2)); ?></span>
                                 <span><span class="detail-label">Ticket Capacity:</span> <?php echo (int)$event['attendee_count']; ?> / <?php echo (int)$event['tickets_available']; ?></span>
                                 <span><span class="detail-label">Budget Plan:</span> KES <?php echo number_format($event['budget_total'], 2); ?></span>
                                 <span><span class="detail-label">Planned Spend:</span> KES <?php echo number_format($event['budget_committed'], 2); ?></span>
-                                <span><span class="detail-label">Money Spent:</span> KES <?php echo number_format($committedPaid, 2); ?></span>
+                                <span><span class="detail-label">Money Spent (Incl Sponsorships):</span> KES <?php echo number_format($committedPaid, 2); ?></span>
                                 <span><span class="detail-label">Item Spend Total:</span> KES <?php echo number_format($itemSpentTotal, 2); ?></span>
-                                <span><span class="detail-label">Extra Cash:</span> KES <?php echo number_format($manualCashAvailable, 2); ?></span>
-                                <span><span class="detail-label">Sponsorships:</span> KES <?php echo number_format($sponsorshipReceived, 2); ?></span>
+                                <span><span class="detail-label">Cash at Use (Auto):</span> KES <?php echo number_format($cashAtUseAuto, 2); ?></span>
+                                <span><span class="detail-label">Sponsorships (Assumed Paid):</span> KES <?php echo number_format($sponsorshipReceived, 2); ?></span>
                                 <span><span class="detail-label">Budget Left (Plan):</span> KES <?php echo number_format($availableBudget, 2); ?></span>
                                 <span><span class="detail-label">Money Received:</span> KES <?php echo number_format($availableFundsReceived, 2); ?></span>
                                 <span><span class="detail-label">Cash Left:</span> KES <?php echo number_format($cashLeft, 2); ?></span>
@@ -1366,7 +1715,36 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                                         <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
                                         <input type="url" name="image_url" class="form-input" placeholder="Banner URL" value="<?php echo htmlspecialchars((string)($event['image_url'] ?? '')); ?>">
                                         <input type="file" name="banner_file" class="form-input" accept=".jpg,.jpeg,.png,.webp,.gif">
+                                        <span class="item-example-text" style="width:100%;">Use URL or Upload, not both.</span>
                                         <button type="submit" class="btn btn-outline"><i class="fa-regular fa-image"></i> Save Banner</button>
+                                    </form>
+                                </div>
+
+                                <div class="event-action-row">
+                                    <form method="POST" class="event-action-row" style="width:100%;">
+                                        <?php echo csrf_input(); ?>
+                                        <input type="hidden" name="update_event_details" value="1">
+                                        <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
+                                        <input type="text" name="category" class="form-input" placeholder="Category" maxlength="64" value="<?php echo htmlspecialchars((string)($event['category'] ?? '')); ?>">
+                                        <input type="text" name="venue" class="form-input" placeholder="Venue" maxlength="190" value="<?php echo htmlspecialchars((string)($event['venue'] ?? '')); ?>">
+                                        <input type="text" name="city" class="form-input" placeholder="City" maxlength="120" value="<?php echo htmlspecialchars((string)($event['city'] ?? '')); ?>">
+                                        <input type="number" step="0.01" min="0" name="stall_price" class="form-input" placeholder="Stall Price" value="<?php echo htmlspecialchars(number_format((float)($event['stall_price'] ?? 0), 2, '.', '')); ?>">
+                                        <button type="submit" class="btn btn-outline"><i class="fa-solid fa-pen"></i> Save Details</button>
+                                    </form>
+                                </div>
+
+                                <div class="event-action-row">
+                                    <form method="POST" class="event-action-row" style="width:100%;">
+                                        <?php echo csrf_input(); ?>
+                                        <input type="hidden" name="update_event_ticket_types" value="1">
+                                        <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
+                                        <input type="number" step="0.01" min="0" name="ticket_type_price[early_bird]" class="form-input" placeholder="Early Bird" value="<?php echo htmlspecialchars(number_format((float)$ticketTypesForEvent['early_bird']['price'], 2, '.', '')); ?>">
+                                        <input type="number" step="0.01" min="0" name="ticket_type_price[regular]" class="form-input" placeholder="Regular" value="<?php echo htmlspecialchars(number_format((float)$ticketTypesForEvent['regular']['price'], 2, '.', '')); ?>">
+                                        <input type="number" step="0.01" min="0" name="ticket_type_price[vip]" class="form-input" placeholder="VIP" value="<?php echo htmlspecialchars(number_format((float)$ticketTypesForEvent['vip']['price'], 2, '.', '')); ?>">
+                                        <input type="number" step="0.01" min="0" name="ticket_type_price[vvip]" class="form-input" placeholder="VVIP" value="<?php echo htmlspecialchars(number_format((float)$ticketTypesForEvent['vvip']['price'], 2, '.', '')); ?>">
+                                        <input type="text" name="ticket_type_description[vip]" class="form-input" placeholder="VIP description" value="<?php echo htmlspecialchars((string)$ticketTypesForEvent['vip']['description']); ?>">
+                                        <input type="text" name="ticket_type_description[vvip]" class="form-input" placeholder="VVIP description" value="<?php echo htmlspecialchars((string)$ticketTypesForEvent['vvip']['description']); ?>">
+                                        <button type="submit" class="btn btn-outline"><i class="fa-solid fa-ticket"></i> Save Ticket Types</button>
                                     </form>
                                 </div>
 
@@ -1383,6 +1761,12 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                                     <a href="budget_breakdown.php?event_id=<?php echo (int)$event['event_id']; ?>" class="btn btn-outline">
                                         <i class="fa-solid fa-pen-to-square"></i> Edit Budget Breakdown
                                     </a>
+                                    <form method="POST" style="display:inline-flex;">
+                                        <?php echo csrf_input(); ?>
+                                        <input type="hidden" name="download_budget_preview" value="1">
+                                        <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
+                                        <button type="submit" class="btn btn-outline"><i class="fa-solid fa-file-arrow-down"></i> Download Budget Preview (PDF)</button>
+                                    </form>
                                 </div>
 
                                 <div class="event-action-row">
@@ -1418,14 +1802,7 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                                 </div>
 
                                 <div class="event-action-row">
-                                    <form method="POST" class="event-action-row">
-                                        <?php echo csrf_input(); ?>
-                                        <input type="hidden" name="add_cash_at_use" value="1">
-                                        <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
-                                        <input type="number" step="100" min="0" name="amount" class="form-input" placeholder="Cash at use" required>
-                                        <input type="text" name="note" class="form-input" placeholder="Note (optional)">
-                                        <button type="submit" class="btn btn-outline"><i class="fa-solid fa-plus"></i> Add Cash at Use</button>
-                                    </form>
+                                    <span class="adjustment-hint">Cash at Use is auto-filled from attendee revenue, vendor payments, and sponsorships.</span>
                                 </div>
 
                                 <div class="event-action-row-danger">
@@ -1503,7 +1880,7 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
 <script>
     (function () {
         const budgetInput = document.getElementById('budget_total');
-        const ticketInput = document.getElementById('ticket_price');
+        const regularTicketInput = document.getElementById('ticket_type_regular');
         const expectedAttendeesInput = document.getElementById('expected_attendees');
         const vendorContributionInput = document.getElementById('vendor_contribution_target');
         const rowsWrap = document.getElementById('budget_item_rows');
@@ -1581,7 +1958,7 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
 
         function updatePreview() {
             const budget = toAmount(budgetInput ? budgetInput.value : '0');
-            const ticket = toAmount(ticketInput ? ticketInput.value : '0');
+            const ticket = toAmount(regularTicketInput ? regularTicketInput.value : '0');
             const expectedAttendees = toInt(expectedAttendeesInput ? expectedAttendeesInput.value : '0');
             const vendorContribution = toAmount(vendorContributionInput ? vendorContributionInput.value : '0');
             const committed = getCommittedTotal();
@@ -1636,8 +2013,8 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
         if (budgetInput) {
             budgetInput.addEventListener('input', updatePreview);
         }
-        if (ticketInput) {
-            ticketInput.addEventListener('input', updatePreview);
+        if (regularTicketInput) {
+            regularTicketInput.addEventListener('input', updatePreview);
         }
         if (expectedAttendeesInput) {
             expectedAttendeesInput.addEventListener('input', updatePreview);

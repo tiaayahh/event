@@ -20,6 +20,12 @@ $vendorRatingCount = 0;
 $flashError = '';
 $boothNumber = '';
 
+function inferRequiredVendorTypeForCategory(?string $category): string
+{
+	$normalized = strtolower(trim((string)$category));
+	return (strpos($normalized, 'market') !== false) ? 'market_operator' : 'service_provider';
+}
+
 function ensureServiceRatingsTable(PDO $pdo): void
 {
 	$pdo->exec(
@@ -55,6 +61,21 @@ function ensureEventVendorFeeSchema(PDO $pdo): void
 	$ready = true;
 }
 
+function ensureVendorTypeSchema(PDO $pdo): void
+{
+	static $ready = false;
+	if ($ready) {
+		return;
+	}
+
+	$stmt = $pdo->query("SHOW COLUMNS FROM vendors LIKE 'vendor_type'");
+	if (!$stmt->fetch()) {
+		$pdo->exec("ALTER TABLE vendors ADD COLUMN vendor_type ENUM('service_provider','market_operator') NOT NULL DEFAULT 'service_provider' AFTER service_type");
+	}
+
+	$ready = true;
+}
+
 function ensureBookingBoothSchema(PDO $pdo): void
 {
 	static $ready = false;
@@ -74,12 +95,13 @@ try {
 	ensureServiceRatingsTable($pdo);
 	ensureEventVendorFeeSchema($pdo);
 	ensureBookingBoothSchema($pdo);
+	ensureVendorTypeSchema($pdo);
 
-	$stmt = $pdo->prepare('SELECT vendor_id, user_id, business_name FROM vendors WHERE vendor_id = ? LIMIT 1');
+	$stmt = $pdo->prepare("SELECT vendor_id, user_id, business_name, COALESCE(vendor_type, 'service_provider') AS vendor_type FROM vendors WHERE vendor_id = ? LIMIT 1");
 	$stmt->execute([$vendorId]);
 	$vendor = $stmt->fetch();
 
-	$stmt = $pdo->prepare('SELECT event_id, title, event_date, vendor_fee_amount FROM events WHERE event_id = ? AND planner_id = ? AND archived_at IS NULL LIMIT 1');
+	$stmt = $pdo->prepare('SELECT event_id, title, event_date, vendor_fee_amount, COALESCE(category, "") AS category FROM events WHERE event_id = ? AND planner_id = ? AND archived_at IS NULL LIMIT 1');
 	$stmt->execute([$eventId, $_SESSION['user_id']]);
 	$event = $stmt->fetch();
 
@@ -94,6 +116,19 @@ try {
 	if (!$vendor || !$event) {
 		$_SESSION['flash_error'] = 'Selected vendor or event was not found.';
 		header('Location: browse_vendors.php');
+		exit;
+	}
+
+	$requiredVendorType = inferRequiredVendorTypeForCategory((string)$event['category']);
+	$actualVendorType = (string)($vendor['vendor_type'] ?? 'service_provider');
+	if ($actualVendorType !== $requiredVendorType) {
+		$_SESSION['flash_error'] = 'This vendor type cannot be booked for the selected event category.';
+		header('Location: browse_vendors.php?event_id=' . (int)$eventId);
+		exit;
+	}
+	if ($requiredVendorType === 'market_operator') {
+		$_SESSION['flash_error'] = 'This is a market event. Use Stall Registration instead of service booking.';
+		header('Location: stall_rentals.php?vendor_id=' . (int)$vendorId . '&event_id=' . (int)$eventId);
 		exit;
 	}
 
@@ -251,8 +286,10 @@ try {
 	<section class="card">
 		<h2 class="title">Book Vendor Service</h2>
 		<div class="meta">Vendor: <strong><?php echo htmlspecialchars((string)($vendor['business_name'] ?? '')); ?></strong></div>
+		<div class="meta">Vendor Type: <strong><?php echo (($vendor['vendor_type'] ?? 'service_provider') === 'market_operator') ? 'Market Operator' : 'Service Provider'; ?></strong></div>
 		<div class="meta">Vendor Rating: <strong><?php echo number_format($vendorAvgRating, 1); ?>/5</strong> (<?php echo $vendorRatingCount; ?> ratings)</div>
 		<div class="meta">Event: <strong><?php echo htmlspecialchars((string)($event['title'] ?? '')); ?></strong> (<?php echo htmlspecialchars((string)($event['event_date'] ?? '')); ?>)</div>
+		<div class="meta">Event Category: <strong><?php echo htmlspecialchars((string)(($event['category'] ?? '') !== '' ? $event['category'] : 'General')); ?></strong></div>
 	</section>
 
 	<section class="card">
