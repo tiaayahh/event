@@ -361,6 +361,7 @@ try {
                     $rawStatus = strtolower((string)($event['payment_status'] ?? 'pending'));
                     $statusClass = in_array($rawStatus, ['paid', 'failed', 'cancelled'], true) ? $rawStatus : 'pending';
                     $statusLabel = ucfirst($statusClass);
+                    $awaitingCallback = !empty($event['checkout_request_id']) && $statusClass === 'pending';
                 ?>
                 <article class="event-card">
                     <div class="event-title"><?php echo htmlspecialchars((string)$event['title']); ?></div>
@@ -386,13 +387,17 @@ try {
                         <button type="submit" class="btn btn-primary">Pay via STK</button>
                     </form>
 
-                    <form method="post" class="action-row">
-                        <?php echo csrf_input(); ?>
-                        <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
-                        <input type="hidden" name="action" value="confirm_paid">
-                        <input type="text" name="mpesa_code" maxlength="20" placeholder="Enter M-Pesa code" required>
-                        <button type="submit" class="btn btn-secondary">Manual Confirm</button>
-                    </form>
+                    <?php if ($awaitingCallback): ?>
+                        <div class="note">STK request sent. Waiting for M-Pesa callback to update status automatically.</div>
+                    <?php else: ?>
+                        <form method="post" class="action-row">
+                            <?php echo csrf_input(); ?>
+                            <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
+                            <input type="hidden" name="action" value="confirm_paid">
+                            <input type="text" name="mpesa_code" maxlength="20" placeholder="Enter M-Pesa code" required>
+                            <button type="submit" class="btn btn-secondary">Manual Confirm</button>
+                        </form>
+                    <?php endif; ?>
 
                     <div class="note">If callback is configured, paid status is updated automatically after successful STK completion.</div>
                 </article>

@@ -15,6 +15,8 @@ session_start();
 require_once 'config/db.php';
 require_once 'includes/csrf.php';
 require_once 'includes/audit.php';
+require_once 'two_factor_setup.php';
+require_once 'includes/password_policy.php';
 require_once 'includes/mailer.php';
 require_once 'includes/totp.php';
 

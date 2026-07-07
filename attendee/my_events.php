@@ -76,6 +76,7 @@ function ensureAttendeeTicketPaymentsTable(PDO $pdo): void
             payment_id BIGINT AUTO_INCREMENT PRIMARY KEY,
             event_id INT NOT NULL,
             attendee_id INT NOT NULL,
+            ticket_type VARCHAR(32) NOT NULL DEFAULT 'regular',
             mpesa_code VARCHAR(64) DEFAULT NULL,
             amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
             status ENUM('requested', 'paid', 'failed') NOT NULL DEFAULT 'requested',
@@ -87,7 +88,29 @@ function ensureAttendeeTicketPaymentsTable(PDO $pdo): void
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     );
 
+    $stmt = $pdo->query("SHOW COLUMNS FROM attendee_ticket_payments LIKE 'ticket_type'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE attendee_ticket_payments ADD COLUMN ticket_type VARCHAR(32) NOT NULL DEFAULT 'regular' AFTER attendee_id");
+    }
+
     $ready = true;
+}
+
+function attendeeTicketTypeLabel(string $ticketType): string
+{
+    $labels = [
+        'early_bird' => 'Early Bird',
+        'regular' => 'Regular',
+        'vip' => 'VIP',
+        'vvip' => 'VVIP',
+    ];
+
+    $key = strtolower(trim($ticketType));
+    if ($key === '') {
+        return 'Regular';
+    }
+
+    return $labels[$key] ?? ucfirst(str_replace('_', ' ', $key));
 }
 
 function resolveEventImageUrl(?string $rawUrl): string
@@ -155,6 +178,7 @@ try {
                 COALESCE(e.category, '') AS category,
                 COALESCE(e.event_type, 'in_person') AS event_type,
                 a.status, COALESCE(p.status, 'requested') AS payment_status, COALESCE(p.mpesa_code, '') AS mpesa_code,
+                COALESCE(p.ticket_type, 'regular') AS attendee_ticket_type,
                 COALESCE(p.amount, e.ticket_price) AS ticket_amount
          FROM attendances a
          JOIN events e ON e.event_id = a.event_id
@@ -201,7 +225,7 @@ function attendeePaymentLabel(string $status): string
         return 'Failed';
     }
 
-    return 'Pending';
+    return 'Not paid';
 }
 ?>
 <!DOCTYPE html>
@@ -286,6 +310,7 @@ function attendeePaymentLabel(string $status): string
                         <div class="thumb"<?php if ($eventImage !== ''): ?> style="background-image:url('<?php echo htmlspecialchars($eventImage); ?>');"<?php endif; ?>></div>
                         <div class="title"><?php echo htmlspecialchars((string)$event['title']); ?></div>
                         <div class="meta"><?php echo htmlspecialchars((string)$event['event_date']); ?> &middot; <?php echo htmlspecialchars((string)(($event['venue'] ?? '') !== '' ? $event['venue'] : 'Venue TBA')); ?></div>
+                        <div class="meta">Ticket Tier: <?php echo htmlspecialchars(attendeeTicketTypeLabel((string)($event['attendee_ticket_type'] ?? 'regular'))); ?></div>
                         <div class="meta">Payment: <?php echo htmlspecialchars(attendeePaymentLabel((string)$event['payment_status'])); ?></div>
                         <span class="status-chip">Registered</span>
                         <div class="action-row">
@@ -315,6 +340,7 @@ function attendeePaymentLabel(string $status): string
                         <div class="thumb"<?php if ($eventImage !== ''): ?> style="background-image:url('<?php echo htmlspecialchars($eventImage); ?>');"<?php endif; ?>></div>
                         <div class="title"><?php echo htmlspecialchars((string)$event['title']); ?></div>
                         <div class="meta"><?php echo htmlspecialchars((string)$event['event_date']); ?></div>
+                        <div class="meta">Ticket Tier: <?php echo htmlspecialchars(attendeeTicketTypeLabel((string)($event['attendee_ticket_type'] ?? 'regular'))); ?></div>
                         <span class="status-chip done">Attended</span>
                         <div class="action-row">
                             <a class="btn btn-light" href="profile.php#rate-services">Rate Event</a>
@@ -353,12 +379,14 @@ function attendeePaymentLabel(string $status): string
             <?php else: ?>
                 <?php foreach ($ticketCards as $event): ?>
                     <?php $ticketCode = strtoupper(substr(sha1((string)$event['event_id'] . '-' . (string)$attendeeId . '-' . (string)$event['event_date']), 0, 14)); ?>
-                    <?php $ticketType = ((string)($event['event_type'] ?? 'in_person') === 'online') ? 'Online Access' : 'In-person'; ?>
+                    <?php $accessType = ((string)($event['event_type'] ?? 'in_person') === 'online') ? 'Online Access' : 'In-person'; ?>
+                    <?php $tierType = attendeeTicketTypeLabel((string)($event['attendee_ticket_type'] ?? 'regular')); ?>
                     <?php $ticketCategory = trim((string)($event['category'] ?? '')); ?>
                     <?php $ticketAmount = (float)($event['ticket_amount'] ?? 0); ?>
                     <div class="ticket">
                         <div><strong><?php echo htmlspecialchars((string)$event['title']); ?></strong></div>
-                        <div style="font-size:12px; opacity:.85; margin-top:4px;">Ticket Type: <?php echo htmlspecialchars($ticketType); ?></div>
+                        <div style="font-size:12px; opacity:.85; margin-top:4px;">Access: <?php echo htmlspecialchars($accessType); ?></div>
+                        <div style="font-size:12px; opacity:.85;">Ticket Tier: <?php echo htmlspecialchars($tierType); ?></div>
                         <div style="font-size:12px; opacity:.85;">Category: <?php echo htmlspecialchars($ticketCategory !== '' ? $ticketCategory : 'General'); ?></div>
                         <div style="font-size:12px; opacity:.85;">Amount: <?php echo $ticketAmount > 0 ? 'KES ' . number_format($ticketAmount, 2) : 'Free'; ?></div>
                         <div style="font-size:12px; opacity:.85;">Payment: <?php echo htmlspecialchars(attendeePaymentLabel((string)$event['payment_status'])); ?></div>

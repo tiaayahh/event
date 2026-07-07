@@ -17,6 +17,7 @@ $featuredOrganizers = [];
 $popularVenues = [];
 $savedEventIds = [];
 $attendeeId = 0;
+$ticketTypesByEvent = [];
 
 function ensureAttendeeDiscoverySchema(PDO $pdo): void
 {
@@ -68,6 +69,52 @@ function ensureAttendeeWishlistSchema(PDO $pdo): void
     $ready = true;
 }
 
+function ensureEventTicketTypesSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS event_ticket_types (
+            ticket_type_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            event_id INT NOT NULL,
+            ticket_type VARCHAR(32) NOT NULL,
+            price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+            description VARCHAR(255) DEFAULT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_event_ticket_type (event_id, ticket_type),
+            CONSTRAINT fk_event_ticket_types_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    );
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM event_ticket_types LIKE 'description'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE event_ticket_types ADD COLUMN description VARCHAR(255) DEFAULT NULL AFTER price");
+    }
+
+    $ready = true;
+}
+
+function attendeeTicketTypeLabel(string $ticketType): string
+{
+    $labels = [
+        'early_bird' => 'Early Bird',
+        'regular' => 'Regular',
+        'vip' => 'VIP',
+        'vvip' => 'VVIP',
+    ];
+
+    $key = strtolower(trim($ticketType));
+    if ($key === '') {
+        return 'Regular';
+    }
+
+    return $labels[$key] ?? ucfirst(str_replace('_', ' ', $key));
+}
+
 function resolveEventImageUrl(?string $rawUrl): string
 {
     $url = trim((string)$rawUrl);
@@ -85,6 +132,7 @@ function resolveEventImageUrl(?string $rawUrl): string
 try {
     ensureAttendeeDiscoverySchema($pdo);
     ensureAttendeeWishlistSchema($pdo);
+    ensureEventTicketTypesSchema($pdo);
 
     $stmt = $pdo->prepare('SELECT attendee_id FROM attendees WHERE user_id = ? LIMIT 1');
     $stmt->execute([$_SESSION['user_id']]);
@@ -186,6 +234,36 @@ try {
     $stmt->execute($params);
     $events = $stmt->fetchAll();
 
+    if (!empty($events)) {
+        $eventIds = array_map(static fn(array $row): int => (int)$row['event_id'], $events);
+        $eventIds = array_values(array_filter($eventIds, static fn(int $id): bool => $id > 0));
+
+        if (!empty($eventIds)) {
+            $placeholders = implode(',', array_fill(0, count($eventIds), '?'));
+            $typesStmt = $pdo->prepare(
+                "SELECT event_id, ticket_type, price, description
+                 FROM event_ticket_types
+                 WHERE event_id IN ($placeholders)
+                 ORDER BY event_id, FIELD(ticket_type, 'early_bird', 'regular', 'vip', 'vvip'), ticket_type"
+            );
+            $typesStmt->execute($eventIds);
+
+            foreach ($typesStmt->fetchAll() as $typeRow) {
+                $eventTypeEventId = (int)($typeRow['event_id'] ?? 0);
+                $typeKey = strtolower(trim((string)($typeRow['ticket_type'] ?? '')));
+                if ($eventTypeEventId <= 0 || $typeKey === '') {
+                    continue;
+                }
+
+                $ticketTypesByEvent[$eventTypeEventId][$typeKey] = [
+                    'label' => attendeeTicketTypeLabel($typeKey),
+                    'price' => (float)($typeRow['price'] ?? 0),
+                    'description' => trim((string)($typeRow['description'] ?? '')),
+                ];
+            }
+        }
+    }
+
     $stmt = $pdo->query(
         "SELECT u.full_name AS organizer_name, COUNT(e.event_id) AS events_count
          FROM events e
@@ -237,6 +315,18 @@ try {
         .title { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
         .meta { font-size: 12px; color: #666; margin-bottom: 3px; }
         .action-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+        .tier-chip {
+            display: inline-block;
+            border: 1px solid #d8d4ff;
+            border-radius: 999px;
+            padding: 5px 10px;
+            font-size: 11px;
+            color: #3f379f;
+            background: #f4f2ff;
+            text-decoration: none;
+            font-weight: 700;
+        }
+        .tier-chip:hover { border-color: #6C63FF; color: #2f2887; }
         .aux-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
         .list { list-style: none; display: grid; gap: 8px; }
         .list li { background: #fff; border: 1px solid #ece9ff; border-radius: 10px; padding: 10px; font-size: 13px; }
@@ -288,13 +378,39 @@ try {
                 $availableTickets = max(0, (int)$event['tickets_available'] - (int)$event['attendees_count']);
                 $score = min(5.0, 3.0 + ((int)$event['attendees_count'] / 20.0));
                 $eventImage = resolveEventImageUrl((string)($event['image_url'] ?? ''));
+                $eventTicketTypes = $ticketTypesByEvent[$eid] ?? [];
+                if (!empty($eventTicketTypes)) {
+                    $typePrices = array_map(static fn(array $row): float => (float)$row['price'], $eventTicketTypes);
+                    $minTypePrice = min($typePrices);
+                    $maxTypePrice = max($typePrices);
+                } else {
+                    $minTypePrice = $price;
+                    $maxTypePrice = $price;
+                }
                 ?>
                 <div class="card">
                     <div class="thumb"<?php if ($eventImage !== ''): ?> style="background-image: url('<?php echo htmlspecialchars($eventImage); ?>'); background-size: cover; background-position: center;"<?php endif; ?>></div>
                     <div class="title"><?php echo htmlspecialchars((string)$event['title']); ?></div>
                     <div class="meta"><?php echo htmlspecialchars((string)$event['event_date']); ?> &middot; <?php echo htmlspecialchars((string)(($event['venue'] ?? '') !== '' ? $event['venue'] : 'Venue TBA')); ?></div>
                     <div class="meta">Category: <?php echo htmlspecialchars((string)(($event['category'] ?? '') !== '' ? $event['category'] : 'General')); ?> &middot; <?php echo htmlspecialchars((string)(($event['event_type'] ?? 'in_person') === 'online' ? 'Online' : 'In-person')); ?></div>
-                    <div class="meta">Price: <?php echo $price <= 0 ? 'Free' : ('KES ' . number_format($price, 2)); ?></div>
+                    <?php if ($minTypePrice === $maxTypePrice): ?>
+                        <div class="meta">Price: <?php echo $minTypePrice <= 0 ? 'Free' : ('KES ' . number_format($minTypePrice, 2)); ?></div>
+                    <?php else: ?>
+                        <div class="meta">Price: <?php echo ($minTypePrice <= 0 ? 'Free' : 'KES ' . number_format($minTypePrice, 2)); ?> to <?php echo $maxTypePrice <= 0 ? 'Free' : ('KES ' . number_format($maxTypePrice, 2)); ?></div>
+                    <?php endif; ?>
+
+                    <?php if (!empty($eventTicketTypes)): ?>
+                        <?php foreach ($eventTicketTypes as $typeMeta): ?>
+                            <div class="meta">
+                                <?php echo htmlspecialchars((string)$typeMeta['label']); ?>:
+                                <?php echo (float)$typeMeta['price'] <= 0 ? 'Free' : ('KES ' . number_format((float)$typeMeta['price'], 2)); ?>
+                                <?php if ((string)$typeMeta['description'] !== ''): ?>
+                                    - <?php echo htmlspecialchars((string)$typeMeta['description']); ?>
+                                <?php endif; ?>
+                            </div>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+
                     <div class="meta">Available Tickets: <?php echo $availableTickets; ?></div>
                     <div class="meta">Rating: <?php echo number_format($score, 1); ?> / 5</div>
                     <div class="action-row">
@@ -314,6 +430,16 @@ try {
                             </form>
                         <?php endif; ?>
                     </div>
+
+                    <?php if (!empty($eventTicketTypes)): ?>
+                        <div class="action-row" style="margin-top:6px;">
+                            <?php foreach ($eventTicketTypes as $typeKey => $typeMeta): ?>
+                                <a class="tier-chip" href="register_event.php?event_id=<?php echo $eid; ?>&amp;ticket_type=<?php echo urlencode((string)$typeKey); ?>">
+                                    <?php echo htmlspecialchars((string)$typeMeta['label']); ?>
+                                </a>
+                            <?php endforeach; ?>
+                        </div>
+                    <?php endif; ?>
                 </div>
             <?php endforeach; ?>
         <?php endif; ?>

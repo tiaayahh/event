@@ -51,19 +51,40 @@ function ensureEventVendorFeeSchema(PDO $pdo): void {
     $ready = true;
 }
 
+function ensureVendorTypeSchema(PDO $pdo): void {
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM vendors LIKE 'vendor_type'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE vendors ADD COLUMN vendor_type ENUM('service_provider','market_operator') NOT NULL DEFAULT 'service_provider' AFTER service_type");
+    }
+
+    $ready = true;
+}
+
 $vendorUserId = (int)$_SESSION['user_id'];
 $vendorId = 0;
+$vendorType = 'service_provider';
 $events = [];
 $error = '';
 $success = '';
 $defaultFeeAmount = 100.00;
 $selectedEventId = 0;
 $darajaConfigured = daraja_is_configured();
+$isServiceProvider = true;
 
 try {
-    $stmt = $pdo->prepare('SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1');
+    ensureVendorTypeSchema($pdo);
+
+    $stmt = $pdo->prepare("SELECT vendor_id, COALESCE(vendor_type, 'service_provider') AS vendor_type FROM vendors WHERE user_id = ? LIMIT 1");
     $stmt->execute([$vendorUserId]);
-    $vendorId = (int)($stmt->fetchColumn() ?: 0);
+    $vendor = $stmt->fetch();
+    $vendorId = (int)($vendor['vendor_id'] ?? 0);
+    $vendorType = (string)($vendor['vendor_type'] ?? 'service_provider');
+    $isServiceProvider = $vendorType === 'service_provider';
 
     if ($vendorId <= 0) {
         throw new RuntimeException('Vendor profile not found.');
@@ -75,6 +96,10 @@ try {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!validate_csrf_token($_POST['csrf_token'] ?? '')) {
             throw new RuntimeException('Invalid CSRF token.');
+        }
+
+        if ($isServiceProvider) {
+            throw new RuntimeException('Service providers are paid by planners. You do not pay vendor fees.');
         }
 
         $eventId = (int)($_POST['event_id'] ?? 0);
@@ -189,24 +214,26 @@ try {
         }
     }
 
-    $stmt = $pdo->prepare(
-        "SELECT e.event_id, e.title, e.event_date, COALESCE(e.vendor_fee_amount, 100) AS vendor_fee_amount,
-                esp.status AS fee_status,
-                esp.checkout_request_id,
-                esp.mpesa_code,
-                esp.updated_at
-         FROM events e
-         JOIN bookings b ON b.event_id = e.event_id
-         JOIN services s ON s.service_id = b.service_id AND s.vendor_id = ?
-           LEFT JOIN vendor_fee_payments esp
-                ON esp.event_id = e.event_id
-               AND esp.vendor_user_id = ?
-           WHERE e.archived_at IS NULL
-           GROUP BY e.event_id, e.title, e.event_date, esp.status, esp.checkout_request_id, esp.mpesa_code, esp.updated_at
-         ORDER BY e.event_date DESC"
-    );
-    $stmt->execute([$vendorId, $vendorUserId]);
-    $events = $stmt->fetchAll();
+        if (!$isServiceProvider) {
+                $stmt = $pdo->prepare(
+                        "SELECT e.event_id, e.title, e.event_date, COALESCE(e.vendor_fee_amount, 100) AS vendor_fee_amount,
+                                        esp.status AS fee_status,
+                                        esp.checkout_request_id,
+                                        esp.mpesa_code,
+                                        esp.updated_at
+                         FROM events e
+                         JOIN bookings b ON b.event_id = e.event_id
+                         JOIN services s ON s.service_id = b.service_id AND s.vendor_id = ?
+                             LEFT JOIN vendor_fee_payments esp
+                                        ON esp.event_id = e.event_id
+                                     AND esp.vendor_user_id = ?
+                             WHERE e.archived_at IS NULL
+                             GROUP BY e.event_id, e.title, e.event_date, esp.status, esp.checkout_request_id, esp.mpesa_code, esp.updated_at
+                         ORDER BY e.event_date DESC"
+                );
+                $stmt->execute([$vendorId, $vendorUserId]);
+                $events = $stmt->fetchAll();
+        }
 } catch (Throwable $e) {
     $error = $e->getMessage();
     error_log('vendor/pay_fee.php error: ' . $e->getMessage());
@@ -538,7 +565,11 @@ try {
     <div class="container">
         <div class="dashboard-card">
             <h2 class="card-title">Vendor Event Fee (M-Pesa)</h2>
-            <p class="card-subtitle">Pay event fee set by the planner for each event via M-Pesa to keep selling services.</p>
+            <?php if ($isServiceProvider): ?>
+                <p class="card-subtitle">Service providers are paid by planners. No vendor fee payment is required.</p>
+            <?php else: ?>
+                <p class="card-subtitle">Pay event fee set by the planner for each event via M-Pesa to keep selling services.</p>
+            <?php endif; ?>
 
             <?php if (!$darajaConfigured): ?>
                 <div class="message error">Daraja is not configured yet. Set DARAJA_CONSUMER_KEY, DARAJA_CONSUMER_SECRET, DARAJA_SHORTCODE, DARAJA_PASSKEY, and DARAJA_CALLBACK_URL.</div>
@@ -552,7 +583,9 @@ try {
                 <div class="message success"><?php echo htmlspecialchars($success); ?></div>
             <?php endif; ?>
 
-            <?php if (empty($events)): ?>
+            <?php if ($isServiceProvider): ?>
+                <div class="message success">No fee needed: your services are paid by planners through the normal booking and payment flow.</div>
+            <?php elseif (empty($events)): ?>
                 <div class="message">No events are linked to your bookings yet.</div>
             <?php else: ?>
                 <form method="POST" class="payment-form">
@@ -592,6 +625,7 @@ try {
                     } elseif ($status === 'failed') {
                         $statusClass = 'status-failed';
                     }
+                    $awaitingCallback = !empty($event['checkout_request_id']) && in_array($status, ['requested', 'pending'], true);
                     ?>
                     <div class="fee-item">
                         <div class="fee-title"><?php echo htmlspecialchars($event['title']); ?></div>
@@ -608,16 +642,22 @@ try {
                             <div class="fee-meta">M-Pesa Code: <?php echo htmlspecialchars($event['mpesa_code']); ?></div>
                         <?php endif; ?>
 
-                        <form method="POST" class="fee-form" style="margin-top: 10px;">
-                            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars(generate_csrf_token()); ?>">
-                            <input type="hidden" name="action" value="confirm_paid">
-                            <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
-                            <div class="field" style="min-width: 0;">
-                                <label for="mpesa_code_<?php echo (int)$event['event_id']; ?>">Confirm with M-Pesa Code</label>
-                                <input id="mpesa_code_<?php echo (int)$event['event_id']; ?>" type="text" name="mpesa_code" maxlength="20" placeholder="e.g. QWE123RTY" required>
+                        <?php if ($awaitingCallback): ?>
+                            <div class="fee-meta" style="margin-top:10px; color:#2c4ea0;">
+                                STK request sent. Waiting for M-Pesa callback to update status automatically.
                             </div>
-                            <button type="submit" class="btn-primary"><i class="fa-solid fa-check"></i> Confirm Paid</button>
-                        </form>
+                        <?php else: ?>
+                            <form method="POST" class="fee-form" style="margin-top: 10px;">
+                                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars(generate_csrf_token()); ?>">
+                                <input type="hidden" name="action" value="confirm_paid">
+                                <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
+                                <div class="field" style="min-width: 0;">
+                                    <label for="mpesa_code_<?php echo (int)$event['event_id']; ?>">Confirm with M-Pesa Code</label>
+                                    <input id="mpesa_code_<?php echo (int)$event['event_id']; ?>" type="text" name="mpesa_code" maxlength="20" placeholder="e.g. QWE123RTY" required>
+                                </div>
+                                <button type="submit" class="btn-primary"><i class="fa-solid fa-check"></i> Confirm Paid</button>
+                            </form>
+                        <?php endif; ?>
 
                     </div>
                 <?php endforeach; ?>

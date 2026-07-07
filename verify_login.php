@@ -1,7 +1,7 @@
 <?php
 session_start();
 require_once 'includes/csrf.php';
-require_once 'includes/two_step.php';
+require_once 'two_factor_setup.php';
 
 $pending = two_step_pending_login();
 

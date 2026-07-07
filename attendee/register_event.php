@@ -18,6 +18,7 @@ function ensureAttendeeTicketPaymentsTable(PDO $pdo): void {
             payment_id BIGINT AUTO_INCREMENT PRIMARY KEY,
             event_id INT NOT NULL,
             attendee_id INT NOT NULL,
+            ticket_type VARCHAR(32) NOT NULL DEFAULT 'regular',
             checkout_request_id VARCHAR(120) DEFAULT NULL,
             merchant_request_id VARCHAR(120) DEFAULT NULL,
             phone_number VARCHAR(20) DEFAULT NULL,
@@ -34,6 +35,11 @@ function ensureAttendeeTicketPaymentsTable(PDO $pdo): void {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     );
 
+    $stmt = $pdo->query("SHOW COLUMNS FROM attendee_ticket_payments LIKE 'ticket_type'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE attendee_ticket_payments ADD COLUMN ticket_type VARCHAR(32) NOT NULL DEFAULT 'regular' AFTER attendee_id");
+    }
+
     $ready = true;
 }
 
@@ -49,6 +55,87 @@ function ensureEventTicketsSchema(PDO $pdo): void {
     }
 
     $ready = true;
+}
+
+function ensureEventTicketTypesSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS event_ticket_types (
+            ticket_type_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            event_id INT NOT NULL,
+            ticket_type VARCHAR(32) NOT NULL,
+            price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+            description VARCHAR(255) DEFAULT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_event_ticket_type (event_id, ticket_type),
+            CONSTRAINT fk_event_ticket_types_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    );
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM event_ticket_types LIKE 'description'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE event_ticket_types ADD COLUMN description VARCHAR(255) DEFAULT NULL AFTER price");
+    }
+
+    $ready = true;
+}
+
+function attendee_ticket_type_label(string $ticketType): string
+{
+    $labels = [
+        'early_bird' => 'Early Bird',
+        'regular' => 'Regular',
+        'vip' => 'VIP',
+        'vvip' => 'VVIP',
+    ];
+
+    $key = strtolower(trim($ticketType));
+    if ($key === '') {
+        return 'Regular';
+    }
+
+    return $labels[$key] ?? ucfirst(str_replace('_', ' ', $key));
+}
+
+function load_event_ticket_types(PDO $pdo, int $eventId, float $fallbackPrice): array
+{
+    $stmt = $pdo->prepare(
+        "SELECT ticket_type, price, description
+         FROM event_ticket_types
+         WHERE event_id = ?
+         ORDER BY FIELD(ticket_type, 'early_bird', 'regular', 'vip', 'vvip'), ticket_type"
+    );
+    $stmt->execute([$eventId]);
+
+    $types = [];
+    foreach ($stmt->fetchAll() as $row) {
+        $key = strtolower(trim((string)($row['ticket_type'] ?? '')));
+        if ($key === '') {
+            continue;
+        }
+
+        $types[$key] = [
+            'label' => attendee_ticket_type_label($key),
+            'price' => (float)($row['price'] ?? 0),
+            'description' => trim((string)($row['description'] ?? '')),
+        ];
+    }
+
+    if (empty($types)) {
+        $types['regular'] = [
+            'label' => 'Regular',
+            'price' => $fallbackPrice,
+            'description' => '',
+        ];
+    }
+
+    return $types;
 }
 
 function assertEventHasCapacity(PDO $pdo, int $eventId, int $attendeeId): void
@@ -91,14 +178,16 @@ $event = null;
 $payment = null;
 $isRegistered = false;
 $ticketAmount = 0.00;
+$ticketTypeOptions = [];
+$selectedTicketType = strtolower(trim((string)($_GET['ticket_type'] ?? 'regular')));
 $ticketsAvailable = 0;
 $registeredCount = 0;
 $ticketsRemaining = 0;
 $isFreeEvent = false;
 $paymentStatus = 'not started';
-$paymentStatusLabel = 'Pending';
+$paymentStatusLabel = 'Not paid';
 $isPaymentComplete = false;
-$registrationLabel = 'Pending payment';
+$registrationLabel = 'Not paid';
 $darajaConfigured = daraja_is_configured();
 $darajaMissingFields = daraja_missing_required_fields();
 $darajaStkConfigured = daraja_is_stk_configured();
@@ -114,12 +203,13 @@ function attendee_payment_status_label(string $rawStatus): string
         return 'Failed';
     }
 
-    return 'Pending';
+    return 'Not paid';
 }
 
 try {
     ensureAttendeeTicketPaymentsTable($pdo);
     ensureEventTicketsSchema($pdo);
+    ensureEventTicketTypesSchema($pdo);
 
     $stmt = $pdo->prepare(
         "SELECT e.event_id, e.title, e.event_date,
@@ -138,7 +228,12 @@ try {
         throw new RuntimeException('Event not found.');
     }
 
-    $ticketAmount = (float)($event['ticket_price'] ?? 0);
+    $ticketTypeOptions = load_event_ticket_types($pdo, $eventId, (float)($event['ticket_price'] ?? 0));
+    if (!isset($ticketTypeOptions[$selectedTicketType])) {
+        $selectedTicketType = array_key_first($ticketTypeOptions) ?: 'regular';
+    }
+
+    $ticketAmount = (float)($ticketTypeOptions[$selectedTicketType]['price'] ?? 0);
     $isFreeEvent = $ticketAmount <= 0;
     $ticketsAvailable = max(0, (int)($event['tickets_available'] ?? 0));
     $registeredCount = max(0, (int)($event['registered_count'] ?? 0));
@@ -160,17 +255,26 @@ try {
     }
 
     $stmt = $pdo->prepare(
-           "SELECT payment_id, checkout_request_id, merchant_request_id, phone_number, mpesa_code, amount, status, updated_at
+              "SELECT payment_id, ticket_type, checkout_request_id, merchant_request_id, phone_number, mpesa_code, amount, status, updated_at
             FROM attendee_ticket_payments
             WHERE event_id = ? AND attendee_id = ?
          LIMIT 1"
     );
     $stmt->execute([$eventId, $attendeeId]);
     $payment = $stmt->fetch() ?: null;
+    if (!empty($payment['ticket_type'])) {
+        $storedTicketType = strtolower((string)$payment['ticket_type']);
+        if (isset($ticketTypeOptions[$storedTicketType])) {
+            $selectedTicketType = $storedTicketType;
+            $ticketAmount = (float)($ticketTypeOptions[$selectedTicketType]['price'] ?? $ticketAmount);
+            $isFreeEvent = $ticketAmount <= 0;
+        }
+    }
+
     $paymentStatus = strtolower((string)($payment['status'] ?? 'not started'));
     $paymentStatusLabel = attendee_payment_status_label($paymentStatus);
     $isPaymentComplete = $isFreeEvent ? $isRegistered : ($paymentStatus === 'paid');
-    $registrationLabel = $isPaymentComplete ? 'Confirmed' : 'Pending payment';
+    $registrationLabel = $isPaymentComplete ? 'Confirmed' : 'Not paid';
 
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!validate_csrf_token($_POST['csrf_token'] ?? '')) {
@@ -178,6 +282,14 @@ try {
         }
 
         $action = strtolower(trim((string)($_POST['action'] ?? '')));
+        $postedTicketType = strtolower(trim((string)($_POST['ticket_type'] ?? $selectedTicketType)));
+        if (!isset($ticketTypeOptions[$postedTicketType])) {
+            throw new RuntimeException('Please choose a valid ticket type.');
+        }
+
+        $selectedTicketType = $postedTicketType;
+        $ticketAmount = (float)($ticketTypeOptions[$selectedTicketType]['price'] ?? 0);
+        $isFreeEvent = $ticketAmount <= 0;
 
         if ($action === 'stk_push') {
             if ($isFreeEvent) {
@@ -204,9 +316,10 @@ try {
 
             $stmt = $pdo->prepare(
                 "INSERT INTO attendee_ticket_payments
-                    (event_id, attendee_id, checkout_request_id, merchant_request_id, phone_number, amount, status)
-                 VALUES (?, ?, ?, ?, ?, ?, 'requested')
+                          (event_id, attendee_id, ticket_type, checkout_request_id, merchant_request_id, phone_number, amount, status)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, 'requested')
                  ON DUPLICATE KEY UPDATE
+                          ticket_type = VALUES(ticket_type),
                     checkout_request_id = VALUES(checkout_request_id),
                     merchant_request_id = VALUES(merchant_request_id),
                     phone_number = VALUES(phone_number),
@@ -217,6 +330,7 @@ try {
             $stmt->execute([
                 $eventId,
                 $attendeeId,
+                $selectedTicketType,
                 (string)($pushResult['checkout_request_id'] ?? ''),
                 (string)($pushResult['merchant_request_id'] ?? ''),
                 $phoneNumber,
@@ -232,6 +346,7 @@ try {
                 $eventId,
                 [
                     'amount' => $ticketAmount,
+                    'ticket_type' => $selectedTicketType,
                     'checkout_request_id' => (string)($pushResult['checkout_request_id'] ?? ''),
                 ]
             );
@@ -258,15 +373,16 @@ try {
 
                 $stmt = $pdo->prepare(
                     "INSERT INTO attendee_ticket_payments
-                        (event_id, attendee_id, mpesa_code, amount, status)
-                     VALUES (?, ?, ?, 0, 'paid')
+                                (event_id, attendee_id, ticket_type, mpesa_code, amount, status)
+                            VALUES (?, ?, ?, ?, 0, 'paid')
                      ON DUPLICATE KEY UPDATE
+                                ticket_type = VALUES(ticket_type),
                         mpesa_code = VALUES(mpesa_code),
                         amount = 0,
                         status = 'paid',
                         updated_at = CURRENT_TIMESTAMP"
                 );
-                $stmt->execute([$eventId, $attendeeId, 'FREE-' . $eventId . '-' . $attendeeId]);
+                     $stmt->execute([$eventId, $attendeeId, $selectedTicketType, 'FREE-' . $eventId . '-' . $attendeeId]);
 
                 audit_log(
                     $pdo,
@@ -275,7 +391,7 @@ try {
                     'attendee.free_registration_confirmed',
                     'event',
                     $eventId,
-                    ['amount' => 0, 'registered_now' => !$attendanceExists]
+                    ['amount' => 0, 'ticket_type' => $selectedTicketType, 'registered_now' => !$attendanceExists]
                 );
 
                 $pdo->commit();
@@ -306,15 +422,16 @@ try {
 
                 $stmt = $pdo->prepare(
                     "INSERT INTO attendee_ticket_payments
-                        (event_id, attendee_id, mpesa_code, amount, status)
-                     VALUES (?, ?, ?, ?, 'paid')
+                                (event_id, attendee_id, ticket_type, mpesa_code, amount, status)
+                            VALUES (?, ?, ?, ?, ?, 'paid')
                      ON DUPLICATE KEY UPDATE
+                                ticket_type = VALUES(ticket_type),
                         mpesa_code = VALUES(mpesa_code),
                         amount = VALUES(amount),
                         status = 'paid',
                         updated_at = CURRENT_TIMESTAMP"
                 );
-                $stmt->execute([$eventId, $attendeeId, $mpesaCode, $ticketAmount]);
+                     $stmt->execute([$eventId, $attendeeId, $selectedTicketType, $mpesaCode, $ticketAmount]);
 
                 $stmt = $pdo->prepare("SELECT attendance_id FROM attendances WHERE event_id = ? AND attendee_id = ? LIMIT 1");
                 $stmt->execute([$eventId, $attendeeId]);
@@ -339,6 +456,7 @@ try {
                     $eventId,
                     [
                         'amount' => $ticketAmount,
+                        'ticket_type' => $selectedTicketType,
                         'mpesa_code' => $mpesaCode,
                         'registered_now' => !$attendanceExists,
                     ]
@@ -374,17 +492,25 @@ try {
         $ticketsRemaining = max(0, $ticketsAvailable - $registeredCount);
 
         $stmt = $pdo->prepare(
-              "SELECT payment_id, checkout_request_id, merchant_request_id, phone_number, mpesa_code, amount, status, updated_at
+              "SELECT payment_id, ticket_type, checkout_request_id, merchant_request_id, phone_number, mpesa_code, amount, status, updated_at
                FROM attendee_ticket_payments
                WHERE event_id = ? AND attendee_id = ?
              LIMIT 1"
         );
         $stmt->execute([$eventId, $attendeeId]);
         $payment = $stmt->fetch() ?: null;
+        if (!empty($payment['ticket_type'])) {
+            $storedTicketType = strtolower((string)$payment['ticket_type']);
+            if (isset($ticketTypeOptions[$storedTicketType])) {
+                $selectedTicketType = $storedTicketType;
+                $ticketAmount = (float)($ticketTypeOptions[$selectedTicketType]['price'] ?? $ticketAmount);
+                $isFreeEvent = $ticketAmount <= 0;
+            }
+        }
         $paymentStatus = strtolower((string)($payment['status'] ?? 'not started'));
         $paymentStatusLabel = attendee_payment_status_label($paymentStatus);
         $isPaymentComplete = $isFreeEvent ? $isRegistered : ($paymentStatus === 'paid');
-        $registrationLabel = $isPaymentComplete ? 'Confirmed' : 'Pending payment';
+        $registrationLabel = $isPaymentComplete ? 'Confirmed' : 'Not paid';
     }
 } catch (Throwable $e) {
     if ($error === '') {
@@ -447,6 +573,39 @@ try {
             gap: 8px 12px;
             font-size: 14px;
         }
+        .ticket-type-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 10px;
+            margin-top: 12px;
+        }
+        .ticket-type-card {
+            position: relative;
+            border: 1px solid #dad6ff;
+            border-radius: 12px;
+            padding: 12px;
+            background: #fbfaff;
+            cursor: pointer;
+            transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+        }
+        .ticket-type-card:hover {
+            border-color: #6C63FF;
+            box-shadow: 0 6px 18px rgba(108, 99, 255, 0.14);
+            transform: translateY(-1px);
+        }
+        .ticket-type-card.active {
+            border-color: #6C63FF;
+            background: #f2f0ff;
+            box-shadow: 0 6px 18px rgba(108, 99, 255, 0.16);
+        }
+        .ticket-type-card input[type="radio"] {
+            position: absolute;
+            opacity: 0;
+            pointer-events: none;
+        }
+        .ticket-type-name { font-size: 14px; font-weight: 700; color: #2a2463; }
+        .ticket-type-price { font-size: 13px; margin-top: 4px; color: #403aa8; font-weight: 700; }
+        .ticket-type-desc { font-size: 12px; margin-top: 6px; color: #666; min-height: 16px; }
         .chip {
             display: inline-block;
             padding: 4px 9px;
@@ -487,6 +646,7 @@ try {
         }
         .btn-primary { background: #6C63FF; color: #fff; }
         .form-actions { display: flex; align-items: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+        .hidden { display: none; }
         .bottom-nav {
             position: fixed;
             bottom: 0;
@@ -547,10 +707,10 @@ try {
                 <h3><?php echo htmlspecialchars($event['title']); ?></h3>
                 <div class="summary-grid">
                     <p><strong>Date:</strong> <?php echo htmlspecialchars($event['event_date']); ?></p>
-                    <p><strong>Ticket Amount:</strong> <?php echo $isFreeEvent ? 'Free' : ('KES ' . number_format($ticketAmount, 2)); ?></p>
+                    <p><strong>Ticket Type:</strong> <span id="selected_ticket_type_label"><?php echo htmlspecialchars(attendee_ticket_type_label($selectedTicketType)); ?></span></p>
+                    <p><strong>Ticket Amount:</strong> <span id="selected_ticket_amount_label"><?php echo $isFreeEvent ? 'Free' : ('KES ' . number_format($ticketAmount, 2)); ?></span></p>
                     <p><strong>Tickets Remaining:</strong> <?php echo (int)$ticketsRemaining; ?> / <?php echo (int)$ticketsAvailable; ?></p>
                     <p><strong>Registration:</strong> <span class="chip <?php echo $isPaymentComplete ? 'chip-ok' : 'chip-pending'; ?>"><?php echo htmlspecialchars($registrationLabel); ?></span></p>
-                    <p><strong>Payment Status:</strong> <?php echo htmlspecialchars($paymentStatusLabel); ?></p>
                     <?php if (!empty($payment['checkout_request_id'])): ?>
                         <p><strong>Checkout Request ID:</strong> <?php echo htmlspecialchars((string)$payment['checkout_request_id']); ?></p>
                     <?php endif; ?>
@@ -559,13 +719,35 @@ try {
                         <p><strong>Last Updated:</strong> <?php echo htmlspecialchars($payment['updated_at']); ?></p>
                     <?php endif; ?>
                 </div>
+
+                <div style="margin-top:12px;">
+                    <div style="font-size:13px; color:#555; margin-bottom:6px;"><strong>Select Ticket Type</strong></div>
+                    <div class="ticket-type-grid" id="ticket_type_selector">
+                        <?php foreach ($ticketTypeOptions as $typeKey => $typeMeta): ?>
+                            <label class="ticket-type-card <?php echo $selectedTicketType === $typeKey ? 'active' : ''; ?>" data-ticket-type="<?php echo htmlspecialchars($typeKey); ?>">
+                                <input
+                                    type="radio"
+                                    name="ticket_type_choice"
+                                    value="<?php echo htmlspecialchars($typeKey); ?>"
+                                    <?php echo $selectedTicketType === $typeKey ? 'checked' : ''; ?>
+                                >
+                                <div class="ticket-type-name"><?php echo htmlspecialchars((string)$typeMeta['label']); ?></div>
+                                <div class="ticket-type-price"><?php echo (float)$typeMeta['price'] <= 0 ? 'Free' : ('KES ' . number_format((float)$typeMeta['price'], 2)); ?></div>
+                                <div class="ticket-type-desc"><?php echo htmlspecialchars((string)$typeMeta['description']); ?></div>
+                            </label>
+                        <?php endforeach; ?>
+                    </div>
+
+                    <div style="font-size:12px; color:#666; margin-top:8px;">Choose one ticket type, then proceed to pay via M-Pesa.</div>
+                </div>
             </div>
 
-            <?php if ($isFreeEvent): ?>
+            <div id="free_registration_wrapper" class="<?php echo $isFreeEvent ? '' : 'hidden'; ?>">
                 <form method="POST" class="form-card">
                     <div class="form-title">Free Registration</div>
                     <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars(generate_csrf_token()); ?>">
                     <input type="hidden" name="action" value="register_free">
+                    <input type="hidden" name="ticket_type" class="js-ticket-type-input" value="<?php echo htmlspecialchars($selectedTicketType); ?>">
 
                     <p style="font-size:13px; color:#555; margin-bottom:10px;">This event is free. Click below to reserve your slot.</p>
 
@@ -573,11 +755,15 @@ try {
                         <button type="submit" class="btn btn-primary">Confirm Free Registration</button>
                     </div>
                 </form>
-            <?php elseif ($darajaStkConfigured): ?>
+            </div>
+
+            <?php if ($darajaStkConfigured): ?>
+                <div id="pay_forms_wrapper" class="<?php echo $isFreeEvent ? 'hidden' : ''; ?>">
                 <form method="POST" class="form-card">
                     <div class="form-title">STK Push</div>
                     <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars(generate_csrf_token()); ?>">
                     <input type="hidden" name="action" value="stk_push">
+                    <input type="hidden" name="ticket_type" class="js-ticket-type-input" value="<?php echo htmlspecialchars($selectedTicketType); ?>">
 
                     <label for="phone_number">Phone Number (for STK Push)</label>
                     <input
@@ -590,16 +776,18 @@ try {
                     >
 
                     <div class="form-actions">
-                        <button type="submit" class="btn btn-primary">Send STK Push</button>
+                        <button type="submit" id="stk_pay_btn" class="btn btn-primary">Pay via M-Pesa (KES <?php echo number_format($ticketAmount, 2); ?>)</button>
                     </div>
                 </form>
+                </div>
             <?php endif; ?>
 
-            <?php if (!$isFreeEvent): ?>
+            <div id="manual_payment_wrapper" class="<?php echo $isFreeEvent ? 'hidden' : ''; ?>">
                 <form method="POST" class="form-card">
                     <div class="form-title">Manual Payment Confirmation</div>
                     <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars(generate_csrf_token()); ?>">
                     <input type="hidden" name="action" value="confirm_paid">
+                    <input type="hidden" name="ticket_type" class="js-ticket-type-input" value="<?php echo htmlspecialchars($selectedTicketType); ?>">
 
                     <label for="mpesa_code">Confirm with M-Pesa Transaction Code</label>
                     <input
@@ -612,11 +800,11 @@ try {
                     >
 
                     <div class="form-actions">
-                        <button type="submit" class="btn btn-primary">Confirm Payment</button>
+                        <button type="submit" id="manual_pay_btn" class="btn btn-primary">Confirm Payment (KES <?php echo number_format($ticketAmount, 2); ?>)</button>
                         <a class="btn" href="my_events.php">Back to My Events</a>
                     </div>
                 </form>
-            <?php endif; ?>
+            </div>
         <?php endif; ?>
     </div>
 
@@ -628,5 +816,86 @@ try {
         <a href="notifications.php" class="nav-item"><i class="fa-solid fa-bell"></i><span>Alerts</span></a>
         <a href="profile.php" class="nav-item"><i class="fa-solid fa-user"></i><span>Profile</span></a>
     </nav>
+
+    <?php if ($event): ?>
+        <script>
+            (function () {
+                const ticketData = <?php echo json_encode($ticketTypeOptions, JSON_UNESCAPED_SLASHES); ?>;
+                const cards = Array.from(document.querySelectorAll('.ticket-type-card'));
+                const radios = Array.from(document.querySelectorAll('input[name="ticket_type_choice"]'));
+                const typeInputs = Array.from(document.querySelectorAll('.js-ticket-type-input'));
+                const ticketTypeLabel = document.getElementById('selected_ticket_type_label');
+                const ticketAmountLabel = document.getElementById('selected_ticket_amount_label');
+                const freeWrap = document.getElementById('free_registration_wrapper');
+                const payWrap = document.getElementById('pay_forms_wrapper');
+                const manualWrap = document.getElementById('manual_payment_wrapper');
+                const stkBtn = document.getElementById('stk_pay_btn');
+                const manualBtn = document.getElementById('manual_pay_btn');
+
+                function formatKES(amount) {
+                    if (amount <= 0) {
+                        return 'Free';
+                    }
+                    return 'KES ' + Number(amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                }
+
+                function updateSelection(typeKey) {
+                    if (!ticketData[typeKey]) {
+                        return;
+                    }
+
+                    const meta = ticketData[typeKey];
+                    const amount = Number(meta.price || 0);
+                    const isFree = amount <= 0;
+
+                    cards.forEach(function (card) {
+                        card.classList.toggle('active', card.getAttribute('data-ticket-type') === typeKey);
+                    });
+                    radios.forEach(function (radio) {
+                        radio.checked = radio.value === typeKey;
+                    });
+
+                    typeInputs.forEach(function (input) {
+                        input.value = typeKey;
+                    });
+
+                    if (ticketTypeLabel) {
+                        ticketTypeLabel.textContent = String(meta.label || typeKey);
+                    }
+                    if (ticketAmountLabel) {
+                        ticketAmountLabel.textContent = formatKES(amount);
+                    }
+
+                    if (freeWrap) {
+                        freeWrap.classList.toggle('hidden', !isFree);
+                    }
+                    if (payWrap) {
+                        payWrap.classList.toggle('hidden', isFree);
+                    }
+                    if (manualWrap) {
+                        manualWrap.classList.toggle('hidden', isFree);
+                    }
+
+                    if (stkBtn) {
+                        stkBtn.textContent = isFree ? 'Send STK Push' : ('Pay via M-Pesa (' + formatKES(amount) + ')');
+                    }
+                    if (manualBtn) {
+                        manualBtn.textContent = isFree ? 'Confirm Payment' : ('Confirm Payment (' + formatKES(amount) + ')');
+                    }
+                }
+
+                radios.forEach(function (radio) {
+                    radio.addEventListener('change', function () {
+                        updateSelection(radio.value);
+                    });
+                });
+
+                const initiallyChecked = radios.find(function (radio) { return radio.checked; });
+                if (initiallyChecked) {
+                    updateSelection(initiallyChecked.value);
+                }
+            })();
+        </script>
+    <?php endif; ?>
 </body>
 </html>

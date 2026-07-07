@@ -6,21 +6,25 @@ on:
   # Allow manually triggering the workflow.
   workflow_dispatch:
 
-permissions:
-  contents: read # to fetch code (actions/checkout)
+permissions: {}
 
 jobs:
 
   coding-standard:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     name: Coding standards
+
+    permissions:
+      contents: read # to fetch code (actions/checkout)
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Set up PHP
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@accd6127cb78bee3e8082180cb391013d204ef9f # 2.37.0
         with:
           php-version: 'latest'
           coverage: none
@@ -29,7 +33,7 @@ jobs:
       # Install dependencies and handle caching in one go.
       # @link https://github.com/marketplace/actions/install-php-dependencies-with-composer
       - name: Install Composer dependencies
-        uses: "ramsey/composer-install@v3"
+        uses: "ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda" # 4.0.0
         with:
           # Bust the cache at least once a month - output format: YYYY-MM.
           custom-cache-suffix: $(date -u "+%Y-%m")
@@ -43,51 +47,57 @@ jobs:
         run: cs2pr ./phpcs-report.xml
 
   lint:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        php: ['5.5', '7.2', '8.0', '8.4']
+        php: ['5.5', '7.2', '8.0', '8.5']
         experimental: [false]
         include:
-          - php: '8.5'
+          - php: 'nightly'
             experimental: true
 
     name: "Lint: PHP ${{ matrix.php }}"
     continue-on-error: ${{ matrix.experimental }}
 
+    permissions:
+      contents: read # to fetch code (actions/checkout)
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Install PHP
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@accd6127cb78bee3e8082180cb391013d204ef9f # 2.37.0
         with:
           php-version: ${{ matrix.php }}
+          ini-values: error_reporting=-1, display_errors=On, display_startup_errors=On
           coverage: none
           tools: cs2pr
 
       # Install dependencies and handle caching in one go.
       # @link https://github.com/marketplace/actions/install-php-dependencies-with-composer
       - name: Install Composer dependencies
-        uses: "ramsey/composer-install@v3"
+        uses: "ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda" # 4.0.0
         with:
           # Bust the cache at least once a month - output format: YYYY-MM.
           custom-cache-suffix: $(date -u "+%Y-%m")
 
       - name: Lint against parse errors
-        if: ${{ matrix.php != '8.5' }}
+        if: ${{ matrix.php != 'nightly' }}
         run: composer lint -- --checkstyle | cs2pr
 
-      - name: Lint against future parse errors (PHP 8.5)
-        if: ${{ matrix.php == '8.5' }}
+      - name: Lint against future parse errors (PHP nightly)
+        if: ${{ matrix.php == 'nightly' }}
         run: composer lint
 
   test:
     needs: ['coding-standard', 'lint']
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        php: ['5.6', '7.0', '7.1', '7.2', '7.3', '7.4', '8.0', '8.1', '8.2', '8.3']
+        php: ['5.6', '7.0', '7.1', '7.2', '7.3', '7.4', '8.0', '8.1', '8.2', '8.3', '8.4']
         extensions: ['optimal', 'minimal']
         coverage: [false]
         experimental: [false]
@@ -101,21 +111,21 @@ jobs:
             extensions: 'minimal'
             coverage: true
             experimental: false
-          - php: '8.4'
+          - php: '8.5'
             extensions: 'optimal'
             coverage: true
             experimental: false
-          - php: '8.4'
+          - php: '8.5'
             extensions: 'minimal'
             coverage: true
             experimental: false
 
           # Experimental builds. These are allowed to fail.
-          - php: '8.5'
+          - php: '8.6'
             extensions: 'optimal'
             coverage: false
             experimental: true
-          - php: '8.5'
+          - php: '8.6'
             extensions: 'minimal'
             coverage: false
             experimental: true
@@ -124,9 +134,14 @@ jobs:
 
     continue-on-error: ${{ matrix.experimental }}
 
+    permissions:
+      contents: read # to fetch code (actions/checkout)
+
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
         # About the "extensions":
         #
@@ -156,35 +171,35 @@ jobs:
           fi
 
       - name: Set up PHP
-        uses: shivammathur/setup-php@v2
+        uses: shivammathur/setup-php@accd6127cb78bee3e8082180cb391013d204ef9f # 2.37.0
         with:
           php-version: ${{ matrix.php }}
           coverage: ${{ matrix.coverage && 'xdebug' || 'none' }}
-          ini-values: sendmail_path=/usr/sbin/sendmail -t -i, error_reporting=E_ALL, display_errors=On
+          ini-values: sendmail_path=/usr/sbin/sendmail -t -i, error_reporting=-1, display_errors=On, display_startup_errors=On
           extensions: ${{ steps.set_extensions.outputs.EXT }}
 
       # Install dependencies and handle caching in one go.
       # @link https://github.com/marketplace/actions/install-php-dependencies-with-composer
       - name: Install PHP packages - normal
-        if: ${{ matrix.php != '8.5' }}
-        uses: "ramsey/composer-install@v3"
+        if: ${{ matrix.php != '8.6' }}
+        uses: "ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda" # 4.0.0
         with:
           composer-options: ${{ steps.set_extensions.outputs.COMPOSER_OPTIONS }}
           # Bust the cache at least once a month - output format: YYYY-MM.
           custom-cache-suffix: $(date -u "+%Y-%m")
 
       - name: Install PHP packages - ignore-platform-reqs
-        if: ${{ matrix.php == '8.5' }}
-        uses: "ramsey/composer-install@v3"
+        if: ${{ matrix.php == '8.6' }}
+        uses: "ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda" # 4.0.0
         with:
           composer-options: --ignore-platform-reqs ${{ steps.set_extensions.outputs.COMPOSER_OPTIONS }}
           # Bust the cache at least once a month - output format: YYYY-MM.
           custom-cache-suffix: $(date -u "+%Y-%m")
 
-      # Install postfix and automatically retry if the install failed, which happens reguarly.
+      # Install postfix and automatically retry if the install failed, which happens regularly.
       # @link https://github.com/marketplace/actions/retry-step
       - name: Install postfix
-        uses: nick-invision/retry@v3
+        uses: nick-invision/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
         with:
           timeout_minutes: 2
           max_attempts: 3
@@ -212,8 +227,8 @@ jobs:
         run: vendor/bin/phpunit
 
       - name: Send coverage report to Codecov
-        if: ${{ success() && matrix.coverage == true }}
-        uses: codecov/codecov-action@v4
+        if: ${{ success() && matrix.coverage == true && github.event.repository.fork == false }}
+        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         with:

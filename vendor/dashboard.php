@@ -917,11 +917,12 @@ try {
             </div>
         </div>
 
-        <div class="dashboard-card">
-            <h2 class="card-title">M-Pesa Event Fee</h2>
-            <p class="card-subtitle">Pay a small event selling fee via M-Pesa to keep your access active.</p>
-            <a href="pay_fee.php" class="save-btn" style="display:inline-block; text-decoration:none;">Pay Vendor Fee</a>
-        </div>
+        <?php if (!$isMarketOperator): ?>
+            <div class="dashboard-card">
+                <h2 class="card-title">Service Provider Payments</h2>
+                <p class="card-subtitle">You are paid by planners for confirmed bookings. No vendor fee is required.</p>
+            </div>
+        <?php endif; ?>
 
         <?php if ($isMarketOperator): ?>
             <div class="dashboard-card">

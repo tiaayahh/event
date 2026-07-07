@@ -1160,6 +1160,7 @@ if ($pendingBookings > 0) {
             <li><a href="browse_vendors.php"><span class="menu-label"><i class="fa-solid fa-shop"></i> Vendors</span></a></li>
             <li><a href="messages.php"><span class="menu-label"><i class="fa-solid fa-comments"></i> Messages</span><?php if ($unreadMessages > 0): ?><span class="badge-unread"><?php echo $unreadMessages; ?></span><?php endif; ?></a></li>
             <li><a href="mpesa_payments.php"><span class="menu-label"><i class="fa-solid fa-book-bookmark"></i> M-Pesa</span></a></li>
+            <li><a href="stall_payments.php"><span class="menu-label"><i class="fa-solid fa-store"></i> Stall Payments</span></a></li>
             <li><a href="profile.php"><span class="menu-label"><i class="fa-solid fa-user"></i> Profile</span></a></li>
         </ul>
     </aside>
@@ -1283,6 +1284,9 @@ if ($pendingBookings > 0) {
                         </a>
                         <a href="mpesa_payments.php" class="btn btn-secondary">
                             <i class="fa-solid fa-money-bill-wave"></i> Payment Reconciliation
+                        </a>
+                        <a href="stall_payments.php" class="btn btn-secondary">
+                            <i class="fa-solid fa-store"></i> Stall Payment Reconciliation
                         </a>
                     </div>
                 </div>
