@@ -297,18 +297,15 @@ try {
                                 u.full_name AS organizer_name,
                 COUNT(DISTINCT b.booking_id) AS booking_count,
                 SUM(CASE WHEN b.status = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_count
-             FROM bookings b
-             JOIN services s ON b.service_id = s.service_id
-             JOIN events e ON e.event_id = b.event_id
+                         FROM events e
                          JOIN users u ON u.user_id = e.planner_id
-             WHERE s.vendor_id = ?
-               AND e.archived_at IS NULL
+                         LEFT JOIN bookings b ON b.event_id = e.event_id AND b.status IN ('pending', 'confirmed')
+                         WHERE e.archived_at IS NULL
                AND e.event_date >= CURDATE()
-               AND b.status IN ('pending', 'confirmed')
-                             GROUP BY e.event_id, e.title, e.event_date, e.image_url, e.venue, e.city, e.category, e.ticket_price, u.full_name
+                         GROUP BY e.event_id, e.title, e.event_date, e.image_url, e.venue, e.city, e.category, e.ticket_price, u.full_name
              ORDER BY e.event_date ASC"
         );
-        $stmt->execute([$vendorId]);
+                $stmt->execute();
         $upcomingEvents = $stmt->fetchAll();
 
         if (!empty($upcomingEvents)) {
@@ -977,7 +974,7 @@ try {
             <h2 class="card-title">Upcoming Events</h2>
             <?php if (empty($upcomingEvents)): ?>
                 <div class="booking-item">
-                    <span>No upcoming events you're participating in yet.</span>
+                    <span>No upcoming planner events available right now.</span>
                 </div>
             <?php else: ?>
                 <div class="cards">

@@ -1,7 +1,7 @@
 <?php
-require_once '../config/db.php';
-require_once '../includes/audit.php';
-require_once '../includes/daraja.php';
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../includes/audit.php';
+require_once __DIR__ . '/../includes/daraja.php';
 
 header('Content-Type: application/json');
 
@@ -190,6 +190,50 @@ function ensure_vendor_fee_payments_callback_schema(PDO $pdo): void
     $ready = true;
 }
 
+function ensure_attendee_ticket_payments_callback_schema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS attendee_ticket_payments (
+            payment_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            event_id INT NOT NULL,
+            attendee_id INT NOT NULL,
+            ticket_type VARCHAR(32) NOT NULL DEFAULT 'regular',
+            checkout_request_id VARCHAR(120) DEFAULT NULL,
+            merchant_request_id VARCHAR(120) DEFAULT NULL,
+            phone_number VARCHAR(20) DEFAULT NULL,
+            mpesa_code VARCHAR(64) DEFAULT NULL,
+            amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+            status ENUM('requested', 'paid', 'failed') NOT NULL DEFAULT 'requested',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_attendee_ticket_payment (event_id, attendee_id),
+            INDEX idx_attendee_ticket_payment_event_status (event_id, status),
+            INDEX idx_attendee_ticket_payment_attendee (attendee_id),
+            INDEX idx_attendee_ticket_payment_checkout (checkout_request_id),
+            CONSTRAINT fk_attendee_ticket_payment_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
+            CONSTRAINT fk_attendee_ticket_payment_attendee FOREIGN KEY (attendee_id) REFERENCES attendees(attendee_id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    );
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM attendee_ticket_payments LIKE 'ticket_type'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE attendee_ticket_payments ADD COLUMN ticket_type VARCHAR(32) NOT NULL DEFAULT 'regular' AFTER attendee_id");
+    }
+
+    try {
+        $pdo->exec("CREATE INDEX idx_attendee_ticket_payment_checkout ON attendee_ticket_payments (checkout_request_id)");
+    } catch (Throwable $e) {
+        // Ignore if index already exists.
+    }
+
+    $ready = true;
+}
+
 try {
     if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
         callback_response(405, ['ok' => false, 'message' => 'Method not allowed']);
@@ -198,6 +242,7 @@ try {
     ensure_daraja_stk_requests_table($pdo);
     ensure_stall_rentals_callback_schema($pdo);
     ensure_vendor_fee_payments_callback_schema($pdo);
+    ensure_attendee_ticket_payments_callback_schema($pdo);
     ensure_callback_request_is_allowed($pdo);
 
     $rawBody = file_get_contents('php://input');
@@ -279,22 +324,155 @@ try {
             $vendorFeeRequest = $stmt->fetch();
 
             if (!$vendorFeeRequest) {
+                $stmt = $pdo->prepare(
+                    "SELECT atp.payment_id, atp.event_id, atp.attendee_id, atp.ticket_type, atp.amount, atp.status,
+                            e.planner_id
+                     FROM attendee_ticket_payments atp
+                     JOIN events e ON e.event_id = atp.event_id
+                     WHERE atp.checkout_request_id = ?
+                     LIMIT 1"
+                );
+                $stmt->execute([$checkoutRequestId]);
+                $attendeePaymentRequest = $stmt->fetch();
+
+                if (!$attendeePaymentRequest) {
+                    audit_log(
+                        $pdo,
+                        null,
+                        'system',
+                        'payment.callback_failed',
+                        'daraja',
+                        $checkoutRequestId,
+                        [
+                            'reason' => 'checkout_request_not_found',
+                            'merchant_request_id' => $merchantRequestId,
+                            'result_code' => $resultCode,
+                            'result_desc' => $resultDesc,
+                        ]
+                    );
+
+                    callback_response(404, ['ok' => false, 'message' => 'Unknown checkout request']);
+                }
+
+                $attendeePaymentId = (int)$attendeePaymentRequest['payment_id'];
+                $plannerUserId = isset($attendeePaymentRequest['planner_id']) ? (int)$attendeePaymentRequest['planner_id'] : null;
+                $existingStatus = strtolower((string)($attendeePaymentRequest['status'] ?? 'requested'));
+                $incomingStatus = $resultCode === 0 ? 'paid' : 'failed';
+
+                if (in_array($existingStatus, ['paid', 'failed'], true)) {
+                    if ($existingStatus === $incomingStatus) {
+                        callback_response(200, [
+                            'ok' => true,
+                            'message' => 'Duplicate callback ignored',
+                            'checkout_request_id' => $checkoutRequestId,
+                            'payment_status' => $existingStatus,
+                        ]);
+                    }
+
+                    audit_log(
+                        $pdo,
+                        $plannerUserId,
+                        'system',
+                        'payment.callback_failed',
+                        'attendee_ticket_payment',
+                        (string)$attendeePaymentId,
+                        [
+                            'reason' => 'conflicting_terminal_callback',
+                            'checkout_request_id' => $checkoutRequestId,
+                            'existing_status' => $existingStatus,
+                            'incoming_status' => $incomingStatus,
+                            'result_code' => $resultCode,
+                            'result_desc' => $resultDesc,
+                        ]
+                    );
+
+                    callback_response(200, [
+                        'ok' => true,
+                        'message' => 'Conflicting callback ignored',
+                        'checkout_request_id' => $checkoutRequestId,
+                        'payment_status' => $existingStatus,
+                    ]);
+                }
+
+                $eventId = (int)$attendeePaymentRequest['event_id'];
+                $attendeeId = (int)$attendeePaymentRequest['attendee_id'];
+                $ticketType = strtolower(trim((string)($attendeePaymentRequest['ticket_type'] ?? 'regular')));
+                if ($ticketType === '') {
+                    $ticketType = 'regular';
+                }
+                $ticketAmount = (float)($attendeePaymentRequest['amount'] ?? 0);
+
+                $pdo->beginTransaction();
+
+                $stmt = $pdo->prepare(
+                    "UPDATE attendee_ticket_payments
+                     SET merchant_request_id = ?,
+                         status = ?,
+                         mpesa_code = ?,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE payment_id = ?"
+                );
+                $stmt->execute([
+                    $merchantRequestId !== '' ? $merchantRequestId : null,
+                    $incomingStatus,
+                    $mpesaReceipt,
+                    $attendeePaymentId,
+                ]);
+
+                $registeredNow = false;
+                if ($incomingStatus === 'paid') {
+                    $stmt = $pdo->prepare("SELECT attendance_id FROM attendances WHERE event_id = ? AND attendee_id = ? LIMIT 1 FOR UPDATE");
+                    $stmt->execute([$eventId, $attendeeId]);
+                    $attendanceExists = (bool)$stmt->fetchColumn();
+
+                    if (!$attendanceExists) {
+                        $stmt = $pdo->prepare("INSERT INTO attendances (event_id, attendee_id) VALUES (?, ?)");
+                        $stmt->execute([$eventId, $attendeeId]);
+                        $registeredNow = true;
+
+                        $stmt = $pdo->prepare("UPDATE event_ticket_types SET tickets_remaining = GREATEST(0, tickets_remaining - 1) WHERE event_id = ? AND ticket_type = ? LIMIT 1");
+                        $stmt->execute([$eventId, $ticketType]);
+
+                        $stmt = $pdo->prepare("UPDATE events SET tickets_available = GREATEST(0, tickets_available - 1) WHERE event_id = ?");
+                        $stmt->execute([$eventId]);
+                    }
+
+                    if ($existingStatus !== 'paid' && $ticketAmount > 0) {
+                        $stmt = $pdo->prepare("UPDATE events SET ticket_revenue = ticket_revenue + ? WHERE event_id = ?");
+                        $stmt->execute([$ticketAmount, $eventId]);
+                    }
+                }
+
+                $pdo->commit();
+
                 audit_log(
                     $pdo,
-                    null,
+                    $plannerUserId,
                     'system',
-                    'payment.callback_failed',
-                    'daraja',
-                    $checkoutRequestId,
+                    'payment.callback_processed',
+                    'attendee_ticket_payment',
+                    (string)$attendeePaymentId,
                     [
-                        'reason' => 'checkout_request_not_found',
+                        'checkout_request_id' => $checkoutRequestId,
                         'merchant_request_id' => $merchantRequestId,
                         'result_code' => $resultCode,
                         'result_desc' => $resultDesc,
+                        'payment_status' => $incomingStatus,
+                        'mpesa_receipt' => $mpesaReceipt,
+                        'charged_amount' => $amountFromCallback,
+                        'ticket_amount' => $ticketAmount,
+                        'registered_now' => $registeredNow,
+                        'ticket_type' => $ticketType,
                     ]
                 );
 
-                callback_response(404, ['ok' => false, 'message' => 'Unknown checkout request']);
+                callback_response(200, [
+                    'ok' => true,
+                    'message' => 'Attendee ticket callback processed',
+                    'checkout_request_id' => $checkoutRequestId,
+                    'payment_id' => $attendeePaymentId,
+                    'payment_status' => $incomingStatus,
+                ]);
             }
 
             $vendorFeePaymentId = (int)$vendorFeeRequest['payment_id'];

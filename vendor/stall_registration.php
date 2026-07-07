@@ -89,6 +89,7 @@ $vendorType = 'service_provider';
 $error = '';
 $success = '';
 $events = [];
+$selectedEventId = isset($_GET['event_id']) ? (int)$_GET['event_id'] : 0;
 $darajaConfigured = daraja_is_configured();
 $darajaStkConfigured = daraja_is_stk_configured();
 $darajaMissingStkFields = daraja_missing_stk_fields();
@@ -118,6 +119,7 @@ try {
 
         $eventId = (int)($_POST['event_id'] ?? 0);
         $action = strtolower(trim((string)($_POST['action'] ?? '')));
+        $selectedEventId = $eventId;
 
         if ($eventId <= 0) {
             throw new RuntimeException('Invalid event selected.');
@@ -146,7 +148,7 @@ try {
 
         if ($action === 'stk_push') {
             if (!$darajaStkConfigured) {
-                throw new RuntimeException('STK push is unavailable. Missing: ' . implode(', ', $darajaMissingStkFields) . '.');
+                throw new RuntimeException('Mpesa prompt is unavailable. Missing: ' . implode(', ', $darajaMissingStkFields) . '.');
             }
 
             $phoneNumber = trim((string)($_POST['phone_number'] ?? ''));
@@ -155,15 +157,17 @@ try {
                 throw new RuntimeException('Stall label must be 80 characters or fewer.');
             }
 
+            $chargeAmount = daraja_effective_stk_amount($rentalAmount);
+
             $pushResult = daraja_stk_push(
                 $phoneNumber,
-                $rentalAmount,
+                $chargeAmount,
                 'STALL-' . $eventId . '-' . $vendorUserId,
                 'Planora market stall rental payment'
             );
 
             if (empty($pushResult['success'])) {
-                throw new RuntimeException((string)($pushResult['message'] ?? 'Unable to initiate M-Pesa STK push right now.'));
+                throw new RuntimeException((string)($pushResult['message'] ?? 'Unable to initiate Mpesa prompt right now.'));
             }
 
             $normalizedPhone = daraja_normalize_phone($phoneNumber);
@@ -202,11 +206,12 @@ try {
                 (string)$eventId,
                 [
                     'amount' => $rentalAmount,
+                    'charged_amount' => $chargeAmount,
                     'checkout_request_id' => (string)($pushResult['checkout_request_id'] ?? ''),
                 ]
             );
 
-            $success = 'M-Pesa STK push sent. Complete the prompt on your phone. Status will update automatically after callback.';
+            $success = 'Mpesa prompt sent. Complete the payment on your phone.';
         } elseif ($action === 'confirm_paid') {
             $mpesaCode = strtoupper(trim((string)($_POST['mpesa_code'] ?? '')));
             if (!preg_match('/^[A-Z0-9]{6,20}$/', $mpesaCode)) {
@@ -271,9 +276,9 @@ try {
          WHERE e.archived_at IS NULL
            AND e.event_date >= CURDATE()
            AND LOWER(COALESCE(e.category, '')) LIKE '%market%'
-         ORDER BY e.event_date ASC"
+                 ORDER BY CASE WHEN e.event_id = ? THEN 0 ELSE 1 END, e.event_date ASC"
     );
-    $stmt->execute([$vendorUserId]);
+        $stmt->execute([$vendorUserId, $selectedEventId]);
     $events = $stmt->fetchAll();
 } catch (Throwable $e) {
     $error = $e->getMessage();
@@ -302,6 +307,7 @@ try {
         .message.error { background: #ffecec; color: #9d2020; border: 1px solid #f6caca; }
         .message.success { background: #ecfff0; color: #1c7a36; border: 1px solid #c9f0d4; }
         .event-card { border: 1px solid #ececf5; border-radius: 10px; padding: 16px; margin-bottom: 14px; background: #fff; }
+        .event-card.target { border-color: #6C63FF; box-shadow: 0 0 0 2px rgba(108, 99, 255, 0.12); }
         .event-title { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
         .event-meta { font-size: 13px; color: #555; margin-bottom: 5px; }
         .status-badge { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .2px; margin-left: 6px; }
@@ -339,7 +345,7 @@ try {
 
     <div class="dashboard-card">
         <h2 class="card-title">Register for Vendor Markets</h2>
-        <p class="card-subtitle">Book your market stall and pay via M-Pesa STK push. Paid status updates automatically after callback.</p>
+        <p class="card-subtitle">Book your market stall and pay via Mpesa prompt. Paid status updates automatically after callback.</p>
 
         <?php if ($error !== ''): ?>
             <div class="message error"><?php echo htmlspecialchars($error); ?></div>
@@ -362,8 +368,9 @@ try {
                     $statusClass = in_array($rawStatus, ['paid', 'failed', 'cancelled'], true) ? $rawStatus : 'pending';
                     $statusLabel = ucfirst($statusClass);
                     $awaitingCallback = !empty($event['checkout_request_id']) && $statusClass === 'pending';
+                    $isTargetEvent = $selectedEventId > 0 && (int)$event['event_id'] === $selectedEventId;
                 ?>
-                <article class="event-card">
+                <article id="event-<?php echo (int)$event['event_id']; ?>" class="event-card <?php echo $isTargetEvent ? 'target' : ''; ?>">
                     <div class="event-title"><?php echo htmlspecialchars((string)$event['title']); ?></div>
                     <div class="event-meta">Date: <?php echo htmlspecialchars((string)$event['event_date']); ?></div>
                     <div class="event-meta">Location: <?php echo htmlspecialchars((string)(($event['venue'] ?? '') !== '' ? $event['venue'] : 'Venue TBA')); ?><?php if ((string)($event['city'] ?? '') !== ''): ?>, <?php echo htmlspecialchars((string)$event['city']); ?><?php endif; ?></div>
@@ -377,18 +384,18 @@ try {
                         <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
                         <input type="hidden" name="action" value="stk_push">
                         <div class="form-group">
-                            <label>Phone Number (for STK Push)</label>
+                            <label>Phone Number (for Mpesa prompt)</label>
                             <input type="text" name="phone_number" maxlength="20" placeholder="e.g. 0712345678" value="<?php echo htmlspecialchars((string)($event['phone_number'] ?? '')); ?>" required>
                         </div>
                         <div class="form-group">
                             <label>Stall Label (optional)</label>
                             <input type="text" name="stall_label" maxlength="80" placeholder="e.g. B-14" value="<?php echo htmlspecialchars((string)($event['stall_label'] ?? '')); ?>">
                         </div>
-                        <button type="submit" class="btn btn-primary">Pay via STK</button>
+                        <button type="submit" class="btn btn-primary">Pay via Mpesa prompt</button>
                     </form>
 
                     <?php if ($awaitingCallback): ?>
-                        <div class="note">STK request sent. Waiting for M-Pesa callback to update status automatically.</div>
+                        <div class="note">Mpesa prompt sent. Waiting for M-Pesa callback to update status automatically.</div>
                     <?php else: ?>
                         <form method="post" class="action-row">
                             <?php echo csrf_input(); ?>
@@ -399,7 +406,7 @@ try {
                         </form>
                     <?php endif; ?>
 
-                    <div class="note">If callback is configured, paid status is updated automatically after successful STK completion.</div>
+                    <div class="note">If callback is configured, paid status is updated automatically after successful Mpesa prompt completion.</div>
                 </article>
             <?php endforeach; ?>
         <?php endif; ?>

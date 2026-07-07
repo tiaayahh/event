@@ -75,6 +75,16 @@ $defaultFeeAmount = 100.00;
 $selectedEventId = 0;
 $darajaConfigured = daraja_is_configured();
 $isServiceProvider = true;
+$allowManualConfirm = strtolower(trim((string)(getenv('DARAJA_ALLOW_MANUAL_CONFIRM') ?: '1'))) !== '0';
+$darajaEnv = strtolower(trim((string)(getenv('DARAJA_ENV') ?: 'sandbox')));
+$sandboxTestAmount = null;
+$sandboxAmountRaw = trim((string)(getenv('DARAJA_SANDBOX_TEST_AMOUNT') ?: ''));
+if ($darajaEnv === 'sandbox' && is_numeric($sandboxAmountRaw)) {
+    $parsedSandboxAmount = (float)$sandboxAmountRaw;
+    if ($parsedSandboxAmount > 0) {
+        $sandboxTestAmount = $parsedSandboxAmount;
+    }
+}
 
 try {
     ensureVendorTypeSchema($pdo);
@@ -128,16 +138,17 @@ try {
             $stmt = $pdo->prepare('SELECT COALESCE(vendor_fee_amount, 100) FROM events WHERE event_id = ? AND archived_at IS NULL LIMIT 1');
             $stmt->execute([$eventId]);
             $feeAmount = (float)($stmt->fetchColumn() ?: $defaultFeeAmount);
+            $chargeAmount = daraja_effective_stk_amount($feeAmount);
 
             $pushResult = daraja_stk_push(
                 $phoneNumber,
-                $feeAmount,
+                $chargeAmount,
                 'VENDOR-FEE-' . $eventId . '-' . $vendorUserId,
                 'Planora vendor event fee payment'
             );
 
             if (empty($pushResult['success'])) {
-                throw new RuntimeException((string)($pushResult['message'] ?? 'Unable to initiate M-Pesa STK push right now.'));
+                throw new RuntimeException((string)($pushResult['message'] ?? 'Unable to initiate Mpesa prompt right now.'));
             }
 
             $stmt = $pdo->prepare(
@@ -170,12 +181,83 @@ try {
                 $eventId,
                 [
                     'amount' => $feeAmount,
+                    'charged_amount' => $chargeAmount,
                     'checkout_request_id' => (string)($pushResult['checkout_request_id'] ?? ''),
                 ]
             );
 
-            $success = 'M-Pesa STK push sent. Complete the prompt on your phone. Payment status will update automatically after callback.';
+            $success = 'Mpesa prompt sent. Complete the payment on your phone.';
+        } elseif ($action === 'sync_status') {
+            $stmt = $pdo->prepare(
+                "SELECT checkout_request_id, status
+                 FROM vendor_fee_payments
+                 WHERE event_id = ? AND vendor_user_id = ?
+                 LIMIT 1"
+            );
+            $stmt->execute([$eventId, $vendorUserId]);
+            $paymentRow = $stmt->fetch();
+
+            if (!$paymentRow) {
+                throw new RuntimeException('No payment request found for this event. Send Mpesa prompt first.');
+            }
+
+            $currentStatus = strtolower((string)($paymentRow['status'] ?? 'requested'));
+            if ($currentStatus === 'paid') {
+                $success = 'Payment is already marked as paid.';
+            } elseif ($currentStatus === 'failed') {
+                $error = 'Last payment attempt is marked as failed. Send a new Mpesa prompt to retry.';
+            } else {
+                $checkoutId = trim((string)($paymentRow['checkout_request_id'] ?? ''));
+                if ($checkoutId === '') {
+                    throw new RuntimeException('Missing checkout request id. Send Mpesa prompt again.');
+                }
+
+                $syncResult = daraja_stk_query($checkoutId);
+                if (empty($syncResult['success'])) {
+                    throw new RuntimeException((string)($syncResult['message'] ?? 'Unable to query STK status right now.'));
+                }
+
+                $queryStatus = strtolower((string)($syncResult['status'] ?? 'pending'));
+                if ($queryStatus === 'paid') {
+                    $stmt = $pdo->prepare(
+                        "UPDATE vendor_fee_payments
+                         SET status = 'paid', updated_at = CURRENT_TIMESTAMP
+                         WHERE event_id = ? AND vendor_user_id = ?"
+                    );
+                    $stmt->execute([$eventId, $vendorUserId]);
+                    $success = 'Payment confirmed from Daraja query and marked as paid.';
+                } elseif ($queryStatus === 'failed') {
+                    $stmt = $pdo->prepare(
+                        "UPDATE vendor_fee_payments
+                         SET status = 'failed', updated_at = CURRENT_TIMESTAMP
+                         WHERE event_id = ? AND vendor_user_id = ?"
+                    );
+                    $stmt->execute([$eventId, $vendorUserId]);
+                    $error = (string)($syncResult['result_desc'] ?? 'Payment failed.');
+                } else {
+                    $success = 'Payment is still processing. Please check again in a few seconds.';
+                }
+
+                audit_log(
+                    $pdo,
+                    $vendorUserId,
+                    'vendor',
+                    'vendor.fee_stk_status_queried',
+                    'event',
+                    $eventId,
+                    [
+                        'checkout_request_id' => $checkoutId,
+                        'query_status' => $queryStatus,
+                        'result_code' => (string)($syncResult['result_code'] ?? ''),
+                        'result_desc' => (string)($syncResult['result_desc'] ?? ''),
+                    ]
+                );
+            }
         } elseif ($action === 'confirm_paid') {
+            if (!$allowManualConfirm) {
+                throw new RuntimeException('Manual confirmation is disabled. Wait for automatic callback status update.');
+            }
+
             $mpesaCode = strtoupper(trim((string)($_POST['mpesa_code'] ?? '')));
             if (!preg_match('/^[A-Z0-9]{6,20}$/', $mpesaCode)) {
                 throw new RuntimeException('Enter a valid M-Pesa code (6-20 letters/numbers).');
@@ -605,13 +687,13 @@ try {
                         </div>
 
                         <div class="field" style="min-width: 0;">
-                            <label for="phone_number">Phone Number (for STK Push)</label>
+                            <label for="phone_number">Phone Number (for Mpesa prompt)</label>
                             <input id="phone_number" type="text" name="phone_number" maxlength="20" placeholder="e.g. 0712345678" required>
                         </div>
 
                         <button type="submit" class="btn-primary">
                             <i class="fa-solid fa-credit-card"></i>
-                            Send STK Push
+                                Send Mpesa prompt
                         </button>
                     </div>
                 </form>
@@ -645,6 +727,16 @@ try {
                         <?php if ($awaitingCallback): ?>
                             <div class="fee-meta" style="margin-top:10px; color:#2c4ea0;">
                                 STK request sent. Waiting for M-Pesa callback to update status automatically.
+                            </div>
+                            <form method="POST" class="fee-form" style="margin-top: 10px;">
+                                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars(generate_csrf_token()); ?>">
+                                <input type="hidden" name="action" value="sync_status">
+                                <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
+                                <button type="submit" class="btn-secondary"><i class="fa-solid fa-rotate"></i> Check Status Now</button>
+                            </form>
+                        <?php elseif (!$allowManualConfirm): ?>
+                            <div class="fee-meta" style="margin-top:10px; color:#2c4ea0;">
+                                Manual confirmation is disabled. Use Mpesa prompt and wait for callback status update.
                             </div>
                         <?php else: ?>
                             <form method="POST" class="fee-form" style="margin-top: 10px;">

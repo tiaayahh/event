@@ -6,6 +6,7 @@ requireRole('planner');
 $vendors = [];
 $events = [];
 $selectedEvent = null;
+$selectedEventId = filter_input(INPUT_GET, 'event_id', FILTER_VALIDATE_INT);
 $requiredVendorType = '';
 $flashSuccess = $_SESSION['flash_success'] ?? '';
 $flashError = $_SESSION['flash_error'] ?? '';
@@ -99,8 +100,6 @@ try {
         $flashError = 'Could not load vendors right now.';
     }
 }
-
-$selectedEventId = filter_input(INPUT_GET, 'event_id', FILTER_VALIDATE_INT);
 ?>
 <!DOCTYPE html>
 <html lang="en">

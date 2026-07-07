@@ -79,7 +79,7 @@ try {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="../assets/style.css">
-    <title>Planora - M-Pesa Payments</title>
+    <title>Planora - Booking Payments</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
@@ -138,7 +138,7 @@ try {
     <?php if ($flashError !== ''): ?><div class="message message-error"><?php echo htmlspecialchars($flashError); ?></div><?php endif; ?>
 
     <?php if (!$darajaStkConfigured): ?>
-        <div class="message message-info">STK push is unavailable (missing: <?php echo htmlspecialchars(implode(', ', $darajaMissingStkFields)); ?>). Manual payment updates and reconciliation are still active.</div>
+        <div class="message message-info">Mpesa prompt is unavailable (missing: <?php echo htmlspecialchars(implode(', ', $darajaMissingStkFields)); ?>). Manual payment updates and reconciliation are still active.</div>
     <?php elseif (!$darajaConfigured): ?>
         <div class="message message-error">Daraja is not fully configured. Missing: <?php echo htmlspecialchars(implode(', ', $darajaMissingFields)); ?>.</div>
     <?php endif; ?>
@@ -155,8 +155,8 @@ try {
     </section>
 
     <section class="card">
-        <h2 class="title">M-Pesa Payments</h2>
-        <div class="ops-note"><i class="fa-solid fa-circle-info"></i> Real M-Pesa flow: send STK push via Daraja, then reconcile callback/payment status to keep booking confirmations and budgets synchronized.</div>
+        <h2 class="title">Booking Payments</h2>
+        <div class="ops-note"><i class="fa-solid fa-circle-info"></i> Real M-Pesa flow: send Mpesa prompt via Daraja, then reconcile callback/payment status to keep booking confirmations and budgets synchronized.</div>
 
         <?php if (!empty($priorityRows)): ?>
             <div class="priority-list">
@@ -170,7 +170,7 @@ try {
                             | Payment: <?php echo htmlspecialchars(ucfirst((string)($row['payment_status'] ?? 'pending'))); ?>
                             | Amount: KES <?php echo number_format((float)$row['booked_price'], 2); ?>
                         </div>
-                        <a class="priority-link" href="initiate_payment.php?booking_id=<?php echo (int)$row['booking_id']; ?>">Open M-Pesa</a>
+                        <a class="priority-link" href="initiate_payment.php?booking_id=<?php echo (int)$row['booking_id']; ?>">Open Booking Payment</a>
                     </div>
                 <?php endforeach; ?>
             </div>
@@ -205,7 +205,7 @@ try {
                                 <td><span class="badge <?php echo strtolower((string)$row['booking_status']) === 'confirmed' ? 'badge-paid' : 'badge-pending'; ?>"><?php echo htmlspecialchars(ucfirst((string)$row['booking_status'])); ?></span></td>
                                 <td><span class="badge <?php echo $paymentClass; ?>"><?php echo htmlspecialchars(ucfirst($paymentStatus)); ?></span></td>
                                 <td><?php echo htmlspecialchars((string)($row['mpesa_code'] ?? '-')); ?></td>
-                                <td><a class="btn" href="initiate_payment.php?booking_id=<?php echo (int)$row['booking_id']; ?>">Open M-Pesa</a></td>
+                                <td><a class="btn" href="initiate_payment.php?booking_id=<?php echo (int)$row['booking_id']; ?>">Open Booking Payment</a></td>
                             </tr>
                         <?php endforeach; ?>
                     </tbody>

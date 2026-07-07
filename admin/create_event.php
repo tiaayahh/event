@@ -22,6 +22,12 @@ $ticketTypePrices = [
     'vip' => '0.00',
     'vvip' => '0.00',
 ];
+$ticketTypeRemaining = [
+    'early_bird' => '50',
+    'regular' => '50',
+    'vip' => '50',
+    'vvip' => '50',
+];
 $ticketTypeDescriptions = [
     'early_bird' => '',
     'regular' => '',
@@ -330,6 +336,11 @@ function ensureEventTicketTypesSchema(PDO $pdo): void
         $pdo->exec("ALTER TABLE event_ticket_types ADD COLUMN description VARCHAR(255) DEFAULT NULL AFTER price");
     }
 
+    $stmt = $pdo->query("SHOW COLUMNS FROM event_ticket_types LIKE 'tickets_remaining'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE event_ticket_types ADD COLUMN tickets_remaining INT NOT NULL DEFAULT 0 AFTER description");
+    }
+
     $ready = true;
 }
 
@@ -350,6 +361,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $imageUrl = trim($_POST['image_url'] ?? '');
         $budgetTotal = trim($_POST['budget_total'] ?? '');
         $formTicketTypePrices = $_POST['ticket_type_price'] ?? [];
+        $formTicketTypeRemaining = $_POST['ticket_type_remaining'] ?? [];
         $formTicketTypeDescriptions = $_POST['ticket_type_description'] ?? [];
         $ticketsAvailable = trim($_POST['tickets_available'] ?? '200');
         $expectedAttendees = trim($_POST['expected_attendees'] ?? '0');
@@ -367,6 +379,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!is_array($formTicketTypePrices)) {
             $formTicketTypePrices = [];
         }
+        if (!is_array($formTicketTypeRemaining)) {
+            $formTicketTypeRemaining = [];
+        }
         if (!is_array($formTicketTypeDescriptions)) {
             $formTicketTypeDescriptions = [];
         }
@@ -378,7 +393,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $flashError = 'Each ticket type price must be a valid non-negative amount.';
                 break;
             }
+
+            $rawRemaining = trim((string)($formTicketTypeRemaining[$ticketType] ?? '0'));
+            if ($rawRemaining === '' || !ctype_digit($rawRemaining)) {
+                $flashError = 'Each ticket type remaining value must be a valid non-negative whole number.';
+                break;
+            }
+
             $ticketTypePrices[$ticketType] = number_format((float)$rawPrice, 2, '.', '');
+            $ticketTypeRemaining[$ticketType] = (string)((int)$rawRemaining);
             $ticketTypeDescriptions[$ticketType] = trim((string)($formTicketTypeDescriptions[$ticketType] ?? ''));
         }
         $ticketPrice = (string)($ticketTypePrices['regular'] ?? '0.00');
@@ -469,7 +492,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $budgetTotalFloat = (float)$budgetTotal;
         $ticketPriceFloat = (float)$ticketPrice;
-        $ticketsAvailableInt = max(0, (int)$ticketsAvailable);
+        $ticketsAvailableInt = max(0, array_sum(array_map(static fn(string $v): int => (int)$v, $ticketTypeRemaining)));
         $expectedAttendeesInt = max(0, (int)$expectedAttendees);
         $vendorContributionTargetFloat = (float)$vendorContributionTarget;
         $stallPriceFloat = (float)$stallPrice;
@@ -518,7 +541,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 $ticketTypeStmt = $pdo->prepare(
-                    'INSERT INTO event_ticket_types (event_id, ticket_type, price, description) VALUES (?, ?, ?, ?)'
+                    'INSERT INTO event_ticket_types (event_id, ticket_type, price, description, tickets_remaining) VALUES (?, ?, ?, ?, ?)'
                 );
                 foreach ($allowedTicketTypes as $ticketType) {
                     $ticketTypeStmt->execute([
@@ -526,6 +549,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $ticketType,
                         (float)($ticketTypePrices[$ticketType] ?? 0),
                         $ticketTypeDescriptions[$ticketType] !== '' ? $ticketTypeDescriptions[$ticketType] : null,
+                        (int)($ticketTypeRemaining[$ticketType] ?? 0),
                     ]);
                 }
 
@@ -695,9 +719,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } elseif (isset($_POST['update_event_ticket_types'])) {
         $updateEventId = filter_input(INPUT_POST, 'event_id', FILTER_VALIDATE_INT);
         $formTicketTypePrices = $_POST['ticket_type_price'] ?? [];
+        $formTicketTypeRemaining = $_POST['ticket_type_remaining'] ?? [];
         $formTicketTypeDescriptions = $_POST['ticket_type_description'] ?? [];
         if (!is_array($formTicketTypePrices)) {
             $formTicketTypePrices = [];
+        }
+        if (!is_array($formTicketTypeRemaining)) {
+            $formTicketTypeRemaining = [];
         }
         if (!is_array($formTicketTypeDescriptions)) {
             $formTicketTypeDescriptions = [];
@@ -705,6 +733,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $allowedTicketTypes = ['early_bird', 'regular', 'vip', 'vvip'];
         $normalizedTicketTypes = [];
+        $normalizedTicketRemaining = [];
         $normalizedTicketTypeDescriptions = [];
 
         if (!$updateEventId) {
@@ -716,7 +745,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $flashError = 'Each ticket type price must be a valid non-negative amount.';
                     break;
                 }
+
+                $rawRemaining = trim((string)($formTicketTypeRemaining[$ticketType] ?? '0'));
+                if ($rawRemaining === '' || !ctype_digit($rawRemaining)) {
+                    $flashError = 'Each ticket type remaining value must be a valid non-negative whole number.';
+                    break;
+                }
+
                 $normalizedTicketTypes[$ticketType] = (float)$rawPrice;
+                $normalizedTicketRemaining[$ticketType] = (int)$rawRemaining;
                 $normalizedTicketTypeDescriptions[$ticketType] = trim((string)($formTicketTypeDescriptions[$ticketType] ?? ''));
             }
         }
@@ -733,16 +770,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $stmt = $pdo->prepare('UPDATE events SET ticket_price = ? WHERE event_id = ? AND planner_id = ? LIMIT 1');
                     $stmt->execute([$normalizedTicketTypes['regular'] ?? 0, $updateEventId, $_SESSION['user_id']]);
 
+                    $stmt = $pdo->prepare('UPDATE events SET tickets_available = ? WHERE event_id = ? AND planner_id = ? LIMIT 1');
+                    $stmt->execute([array_sum($normalizedTicketRemaining), $updateEventId, $_SESSION['user_id']]);
+
                     $stmt = $pdo->prepare('DELETE FROM event_ticket_types WHERE event_id = ?');
                     $stmt->execute([$updateEventId]);
 
-                    $typeStmt = $pdo->prepare('INSERT INTO event_ticket_types (event_id, ticket_type, price, description) VALUES (?, ?, ?, ?)');
+                    $typeStmt = $pdo->prepare('INSERT INTO event_ticket_types (event_id, ticket_type, price, description, tickets_remaining) VALUES (?, ?, ?, ?, ?)');
                     foreach ($allowedTicketTypes as $ticketType) {
                         $typeStmt->execute([
                             $updateEventId,
                             $ticketType,
                             $normalizedTicketTypes[$ticketType] ?? 0,
                             $normalizedTicketTypeDescriptions[$ticketType] !== '' ? $normalizedTicketTypeDescriptions[$ticketType] : null,
+                            $normalizedTicketRemaining[$ticketType] ?? 0,
                         ]);
                     }
 
@@ -1233,7 +1274,7 @@ try {
         }
 
         $stmt = $pdo->prepare(
-            "SELECT event_id, ticket_type, price, COALESCE(description, '') AS description
+            "SELECT event_id, ticket_type, price, COALESCE(description, '') AS description, COALESCE(tickets_remaining, 0) AS tickets_remaining
              FROM event_ticket_types
              WHERE event_id IN ($placeholders)"
         );
@@ -1242,10 +1283,10 @@ try {
             $eventId = (int)$row['event_id'];
             if (!isset($eventTicketTypesByEventId[$eventId])) {
                 $eventTicketTypesByEventId[$eventId] = [
-                    'early_bird' => ['price' => 0.0, 'description' => ''],
-                    'regular' => ['price' => 0.0, 'description' => ''],
-                    'vip' => ['price' => 0.0, 'description' => ''],
-                    'vvip' => ['price' => 0.0, 'description' => ''],
+                    'early_bird' => ['price' => 0.0, 'description' => '', 'remaining' => 0],
+                    'regular' => ['price' => 0.0, 'description' => '', 'remaining' => 0],
+                    'vip' => ['price' => 0.0, 'description' => '', 'remaining' => 0],
+                    'vvip' => ['price' => 0.0, 'description' => '', 'remaining' => 0],
                 ];
             }
             $typeKey = strtolower((string)$row['ticket_type']);
@@ -1253,6 +1294,7 @@ try {
                 $eventTicketTypesByEventId[$eventId][$typeKey] = [
                     'price' => (float)($row['price'] ?? 0),
                     'description' => (string)($row['description'] ?? ''),
+                    'remaining' => max(0, (int)($row['tickets_remaining'] ?? 0)),
                 ];
             }
         }
@@ -1515,6 +1557,16 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                 </div>
                 <div class="item-example-text">Attendee contribution preview uses the Regular ticket type.</div>
             </div>
+            <div class="form-group" style="grid-column: 1 / -1;">
+                <label>Ticket Remaining Per Type</label>
+                <div style="display:grid; grid-template-columns:repeat(4, minmax(140px, 1fr)); gap:10px;">
+                    <input type="number" step="1" min="0" name="ticket_type_remaining[early_bird]" class="form-input" placeholder="Early Bird Remaining" value="<?php echo htmlspecialchars((string)($ticketTypeRemaining['early_bird'] ?? '0')); ?>">
+                    <input type="number" step="1" min="0" name="ticket_type_remaining[regular]" class="form-input" placeholder="Regular Remaining" value="<?php echo htmlspecialchars((string)($ticketTypeRemaining['regular'] ?? '0')); ?>">
+                    <input type="number" step="1" min="0" name="ticket_type_remaining[vip]" class="form-input" placeholder="VIP Remaining" value="<?php echo htmlspecialchars((string)($ticketTypeRemaining['vip'] ?? '0')); ?>">
+                    <input type="number" step="1" min="0" name="ticket_type_remaining[vvip]" class="form-input" placeholder="VVIP Remaining" value="<?php echo htmlspecialchars((string)($ticketTypeRemaining['vvip'] ?? '0')); ?>">
+                </div>
+                <div class="item-example-text">Total event ticket capacity is auto-calculated from these per-type remaining values.</div>
+            </div>
             <div class="form-group">
                 <label for="tickets_available">Tickets Available</label>
                 <input type="number" step="1" min="0" id="tickets_available" name="tickets_available" class="form-input" placeholder="200" value="<?php echo htmlspecialchars($ticketsAvailable ?? '200'); ?>">
@@ -1630,11 +1682,15 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                             $itemSpentTotal += (float)($budgetItem['spent_amount'] ?? 0);
                         }
                         $ticketTypesForEvent = $eventTicketTypesByEventId[$eventId] ?? [
-                            'early_bird' => ['price' => 0.0, 'description' => ''],
-                            'regular' => ['price' => (float)($event['ticket_price'] ?? 0), 'description' => ''],
-                            'vip' => ['price' => 0.0, 'description' => ''],
-                            'vvip' => ['price' => 0.0, 'description' => ''],
+                            'early_bird' => ['price' => 0.0, 'description' => '', 'remaining' => 0],
+                            'regular' => ['price' => (float)($event['ticket_price'] ?? 0), 'description' => '', 'remaining' => (int)($event['tickets_available'] ?? 0)],
+                            'vip' => ['price' => 0.0, 'description' => '', 'remaining' => 0],
+                            'vvip' => ['price' => 0.0, 'description' => '', 'remaining' => 0],
                         ];
+                        $totalRemainingByType = (int)($ticketTypesForEvent['early_bird']['remaining'] ?? 0)
+                            + (int)($ticketTypesForEvent['regular']['remaining'] ?? 0)
+                            + (int)($ticketTypesForEvent['vip']['remaining'] ?? 0)
+                            + (int)($ticketTypesForEvent['vvip']['remaining'] ?? 0);
                         $sponsorshipReceived = (float)($event['sponsorship_received'] ?? 0);
                         $committedPaid = (float)($ops['paid_transactions_total'] ?? 0)
                             + $itemSpentTotal
@@ -1666,6 +1722,7 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                                 <div class="event-chips">
                                     <?php if ((string)($event['category'] ?? '') !== ''): ?><span class="chip chip-info"><?php echo htmlspecialchars((string)$event['category']); ?></span><?php endif; ?>
                                     <span class="chip chip-info"><?php echo ((string)($event['event_type'] ?? 'in_person') === 'online') ? 'Online' : 'In-person'; ?></span>
+                                    <span class="chip chip-info">Total Remaining: <?php echo (int)$totalRemainingByType; ?></span>
                                     <?php if ($isBudgetOverrun): ?><span class="chip chip-risk">Budget Overrun</span><?php endif; ?>
                                     <?php if ((int)$ops['failed_payments'] > 0): ?><span class="chip chip-risk">Failed Payments: <?php echo (int)$ops['failed_payments']; ?></span><?php endif; ?>
                                     <?php if ((int)$ops['pending_payments'] > 0): ?><span class="chip chip-warn">Pending Payments: <?php echo (int)$ops['pending_payments']; ?></span><?php endif; ?>
@@ -1691,9 +1748,13 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                                 <span><span class="detail-label">Type:</span> <?php echo ((string)($event['event_type'] ?? 'in_person') === 'online') ? 'Online' : 'In-person'; ?></span>
                                 <span><span class="detail-label">Stall Price:</span> KES <?php echo number_format((float)($event['stall_price'] ?? 0), 2); ?></span>
                                 <span><span class="detail-label">Ticket Type - Early Bird:</span> <?php echo ((float)$ticketTypesForEvent['early_bird']['price'] <= 0) ? 'Free' : ('KES ' . number_format((float)$ticketTypesForEvent['early_bird']['price'], 2)); ?></span>
+                                <span><span class="detail-label">Early Bird Remaining:</span> <?php echo (int)($ticketTypesForEvent['early_bird']['remaining'] ?? 0); ?></span>
                                 <span><span class="detail-label">Ticket Type - Regular:</span> <?php echo ((float)$ticketTypesForEvent['regular']['price'] <= 0) ? 'Free' : ('KES ' . number_format((float)$ticketTypesForEvent['regular']['price'], 2)); ?></span>
+                                <span><span class="detail-label">Regular Remaining:</span> <?php echo (int)($ticketTypesForEvent['regular']['remaining'] ?? 0); ?></span>
                                 <span><span class="detail-label">Ticket Type - VIP:</span> <?php echo ((float)$ticketTypesForEvent['vip']['price'] <= 0) ? 'Free' : ('KES ' . number_format((float)$ticketTypesForEvent['vip']['price'], 2)); ?></span>
+                                <span><span class="detail-label">VIP Remaining:</span> <?php echo (int)($ticketTypesForEvent['vip']['remaining'] ?? 0); ?></span>
                                 <span><span class="detail-label">Ticket Type - VVIP:</span> <?php echo ((float)$ticketTypesForEvent['vvip']['price'] <= 0) ? 'Free' : ('KES ' . number_format((float)$ticketTypesForEvent['vvip']['price'], 2)); ?></span>
+                                <span><span class="detail-label">VVIP Remaining:</span> <?php echo (int)($ticketTypesForEvent['vvip']['remaining'] ?? 0); ?></span>
                                 <span><span class="detail-label">Ticket Capacity:</span> <?php echo (int)$event['attendee_count']; ?> / <?php echo (int)$event['tickets_available']; ?></span>
                                 <span><span class="detail-label">Budget Plan:</span> KES <?php echo number_format($event['budget_total'], 2); ?></span>
                                 <span><span class="detail-label">Planned Spend:</span> KES <?php echo number_format($event['budget_committed'], 2); ?></span>
@@ -1742,6 +1803,10 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                                         <input type="number" step="0.01" min="0" name="ticket_type_price[regular]" class="form-input" placeholder="Regular" value="<?php echo htmlspecialchars(number_format((float)$ticketTypesForEvent['regular']['price'], 2, '.', '')); ?>">
                                         <input type="number" step="0.01" min="0" name="ticket_type_price[vip]" class="form-input" placeholder="VIP" value="<?php echo htmlspecialchars(number_format((float)$ticketTypesForEvent['vip']['price'], 2, '.', '')); ?>">
                                         <input type="number" step="0.01" min="0" name="ticket_type_price[vvip]" class="form-input" placeholder="VVIP" value="<?php echo htmlspecialchars(number_format((float)$ticketTypesForEvent['vvip']['price'], 2, '.', '')); ?>">
+                                        <input type="number" step="1" min="0" name="ticket_type_remaining[early_bird]" class="form-input" placeholder="Early Bird Remaining" value="<?php echo htmlspecialchars((string)((int)($ticketTypesForEvent['early_bird']['remaining'] ?? 0))); ?>">
+                                        <input type="number" step="1" min="0" name="ticket_type_remaining[regular]" class="form-input" placeholder="Regular Remaining" value="<?php echo htmlspecialchars((string)((int)($ticketTypesForEvent['regular']['remaining'] ?? 0))); ?>">
+                                        <input type="number" step="1" min="0" name="ticket_type_remaining[vip]" class="form-input" placeholder="VIP Remaining" value="<?php echo htmlspecialchars((string)((int)($ticketTypesForEvent['vip']['remaining'] ?? 0))); ?>">
+                                        <input type="number" step="1" min="0" name="ticket_type_remaining[vvip]" class="form-input" placeholder="VVIP Remaining" value="<?php echo htmlspecialchars((string)((int)($ticketTypesForEvent['vvip']['remaining'] ?? 0))); ?>">
                                         <input type="text" name="ticket_type_description[vip]" class="form-input" placeholder="VIP description" value="<?php echo htmlspecialchars((string)$ticketTypesForEvent['vip']['description']); ?>">
                                         <input type="text" name="ticket_type_description[vvip]" class="form-input" placeholder="VVIP description" value="<?php echo htmlspecialchars((string)$ticketTypesForEvent['vvip']['description']); ?>">
                                         <button type="submit" class="btn btn-outline"><i class="fa-solid fa-ticket"></i> Save Ticket Types</button>

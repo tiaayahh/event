@@ -82,6 +82,26 @@ if (!function_exists('daraja_is_stk_configured')) {
     }
 }
 
+if (!function_exists('daraja_effective_stk_amount')) {
+    function daraja_effective_stk_amount(float $intendedAmount): float
+    {
+        $cfg = daraja_config();
+        if (($cfg['env'] ?? 'sandbox') !== 'sandbox') {
+            return $intendedAmount;
+        }
+
+        $raw = trim((string)(getenv('DARAJA_SANDBOX_TEST_AMOUNT') ?: ''));
+        if ($raw !== '' && is_numeric($raw)) {
+            $parsed = (float)$raw;
+            if ($parsed > 0) {
+                return $parsed;
+            }
+        }
+
+        return $intendedAmount;
+    }
+}
+
 if (!function_exists('daraja_normalize_phone')) {
     function daraja_normalize_phone(string $raw): string
     {
@@ -103,6 +123,26 @@ if (!function_exists('daraja_normalize_phone')) {
     }
 }
 
+if (!function_exists('daraja_apply_curl_network_options')) {
+    function daraja_apply_curl_network_options($ch): void
+    {
+        // Prefer OS-native certificate trust when available (notably on Windows).
+        if (defined('CURLOPT_SSL_OPTIONS') && defined('CURLSSLOPT_NATIVE_CA')) {
+            curl_setopt($ch, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+        }
+
+        $caBundle = trim((string)(getenv('DARAJA_CURL_CA_BUNDLE') ?: getenv('SSL_CERT_FILE') ?: ''));
+        if ($caBundle !== '' && is_file($caBundle)) {
+            curl_setopt($ch, CURLOPT_CAINFO, $caBundle);
+        }
+
+        $proxy = trim((string)(getenv('HTTPS_PROXY') ?: getenv('HTTP_PROXY') ?: ''));
+        if ($proxy !== '') {
+            curl_setopt($ch, CURLOPT_PROXY, $proxy);
+        }
+    }
+}
+
 if (!function_exists('daraja_get_access_token')) {
     function daraja_get_access_token(array $cfg): array
     {
@@ -114,6 +154,7 @@ if (!function_exists('daraja_get_access_token')) {
         curl_setopt($ch, CURLOPT_HTTPHEADER, [
             'Authorization: Basic ' . $auth,
         ]);
+        daraja_apply_curl_network_options($ch);
 
         $raw = curl_exec($ch);
         $err = curl_error($ch);
@@ -121,7 +162,11 @@ if (!function_exists('daraja_get_access_token')) {
         curl_close($ch);
 
         if ($raw === false || $err !== '') {
-            return ['success' => false, 'message' => 'Failed to connect to Daraja token endpoint.'];
+            $message = 'Failed to connect to Daraja token endpoint.';
+            if ($err !== '') {
+                $message .= ' ' . $err;
+            }
+            return ['success' => false, 'message' => $message];
         }
 
         $payload = json_decode((string)$raw, true);
@@ -186,6 +231,7 @@ if (!function_exists('daraja_stk_push')) {
             'Content-Type: application/json',
             'Authorization: Bearer ' . $tokenResult['token'],
         ]);
+        daraja_apply_curl_network_options($ch);
 
         $raw = curl_exec($ch);
         $err = curl_error($ch);
@@ -193,7 +239,11 @@ if (!function_exists('daraja_stk_push')) {
         curl_close($ch);
 
         if ($raw === false || $err !== '') {
-            return ['success' => false, 'message' => 'Failed to reach Daraja STK endpoint.'];
+            $message = 'Failed to reach Daraja STK endpoint.';
+            if ($err !== '') {
+                $message .= ' ' . $err;
+            }
+            return ['success' => false, 'message' => $message];
         }
 
         $payload = json_decode((string)$raw, true);
@@ -209,9 +259,93 @@ if (!function_exists('daraja_stk_push')) {
 
         return [
             'success' => true,
-            'message' => (string)($payload['ResponseDescription'] ?? 'STK push sent.'),
+            'message' => (string)($payload['ResponseDescription'] ?? 'Mpesa prompt sent.'),
             'checkout_request_id' => (string)($payload['CheckoutRequestID'] ?? ''),
             'merchant_request_id' => (string)($payload['MerchantRequestID'] ?? ''),
+            'payload' => $payload,
+        ];
+    }
+}
+
+if (!function_exists('daraja_stk_query')) {
+    function daraja_stk_query(string $checkoutRequestId): array
+    {
+        $cfg = daraja_config();
+        if (!daraja_is_configured()) {
+            return ['success' => false, 'message' => 'Daraja is not configured. Set DARAJA_* environment variables.'];
+        }
+
+        $checkoutRequestId = trim($checkoutRequestId);
+        if ($checkoutRequestId === '') {
+            return ['success' => false, 'message' => 'CheckoutRequestID is required for STK status query.'];
+        }
+
+        $tokenResult = daraja_get_access_token($cfg);
+        if (empty($tokenResult['success'])) {
+            return $tokenResult;
+        }
+
+        $timestamp = gmdate('YmdHis');
+        $password = base64_encode($cfg['shortcode'] . $cfg['passkey'] . $timestamp);
+        $queryUrl = $cfg['env'] === 'live'
+            ? 'https://api.safaricom.co.ke/mpesa/stkpushquery/v1/query'
+            : 'https://sandbox.safaricom.co.ke/mpesa/stkpushquery/v1/query';
+
+        $requestBody = [
+            'BusinessShortCode' => $cfg['shortcode'],
+            'Password' => $password,
+            'Timestamp' => $timestamp,
+            'CheckoutRequestID' => $checkoutRequestId,
+        ];
+
+        $ch = curl_init($queryUrl);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($requestBody));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, [
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . $tokenResult['token'],
+        ]);
+        daraja_apply_curl_network_options($ch);
+
+        $raw = curl_exec($ch);
+        $err = curl_error($ch);
+        $httpCode = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+
+        if ($raw === false || $err !== '') {
+            $message = 'Failed to reach Daraja STK query endpoint.';
+            if ($err !== '') {
+                $message .= ' ' . $err;
+            }
+            return ['success' => false, 'message' => $message];
+        }
+
+        $payload = json_decode((string)$raw, true);
+        if (!is_array($payload)) {
+            return ['success' => false, 'message' => 'Invalid response from Daraja STK query endpoint.'];
+        }
+
+        if ($httpCode >= 400) {
+            $faultString = (string)($payload['fault']['faultstring'] ?? 'Daraja STK query failed.');
+            return ['success' => false, 'message' => $faultString, 'payload' => $payload];
+        }
+
+        $resultCode = (string)($payload['ResultCode'] ?? '');
+        $resultDesc = (string)($payload['ResultDesc'] ?? '');
+        $status = 'pending';
+        if ($resultCode === '0') {
+            $status = 'paid';
+        } elseif ($resultCode !== '') {
+            $status = 'failed';
+        }
+
+        return [
+            'success' => true,
+            'status' => $status,
+            'result_code' => $resultCode,
+            'result_desc' => $resultDesc,
             'payload' => $payload,
         ];
     }

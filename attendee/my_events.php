@@ -96,6 +96,21 @@ function ensureAttendeeTicketPaymentsTable(PDO $pdo): void
     $ready = true;
 }
 
+function ensureEventTicketTypesSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM event_ticket_types LIKE 'tickets_remaining'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE event_ticket_types ADD COLUMN tickets_remaining INT NOT NULL DEFAULT 0 AFTER description");
+    }
+
+    $ready = true;
+}
+
 function attendeeTicketTypeLabel(string $ticketType): string
 {
     $labels = [
@@ -131,6 +146,7 @@ try {
     ensureAttendeeDiscoverySchema($pdo);
     ensureAttendeeWishlistSchema($pdo);
     ensureAttendeeTicketPaymentsTable($pdo);
+    ensureEventTicketTypesSchema($pdo);
 
     $stmt = $pdo->prepare('SELECT attendee_id FROM attendees WHERE user_id = ? LIMIT 1');
     $stmt->execute([$_SESSION['user_id']]);
@@ -143,17 +159,51 @@ try {
         csrf_require_valid_post_token();
         $cancelEventId = filter_input(INPUT_POST, 'cancel_event_id', FILTER_VALIDATE_INT);
         if ($cancelEventId) {
-            $stmt = $pdo->prepare(
-                "UPDATE attendances a
-                 JOIN events e ON e.event_id = a.event_id
-                 SET a.status = 'cancelled'
-                 WHERE a.attendee_id = ? AND a.event_id = ? AND a.status = 'registered' AND e.event_date >= CURDATE()"
-            );
-            $stmt->execute([$attendeeId, $cancelEventId]);
-            if ($stmt->rowCount() > 0) {
-                $_SESSION['flash_success'] = 'Registration cancelled.';
-            } else {
-                $_SESSION['flash_error'] = 'Cancellation is not allowed for this event.';
+            $pdo->beginTransaction();
+            try {
+                $stmt = $pdo->prepare(
+                    "SELECT COALESCE(p.ticket_type, 'regular') AS ticket_type
+                     FROM attendances a
+                     LEFT JOIN attendee_ticket_payments p ON p.event_id = a.event_id AND p.attendee_id = a.attendee_id
+                     JOIN events e ON e.event_id = a.event_id
+                     WHERE a.attendee_id = ? AND a.event_id = ? AND a.status = 'registered' AND e.event_date >= CURDATE()
+                     LIMIT 1"
+                );
+                $stmt->execute([$attendeeId, $cancelEventId]);
+                $row = $stmt->fetch();
+
+                if ($row) {
+                    $ticketType = strtolower(trim((string)($row['ticket_type'] ?? 'regular')));
+
+                    $stmt = $pdo->prepare(
+                        "UPDATE attendances a
+                         JOIN events e ON e.event_id = a.event_id
+                         SET a.status = 'cancelled'
+                         WHERE a.attendee_id = ? AND a.event_id = ? AND a.status = 'registered' AND e.event_date >= CURDATE()"
+                    );
+                    $stmt->execute([$attendeeId, $cancelEventId]);
+
+                    if ($stmt->rowCount() > 0) {
+                        $stmt = $pdo->prepare("UPDATE event_ticket_types SET tickets_remaining = tickets_remaining + 1 WHERE event_id = ? AND ticket_type = ? LIMIT 1");
+                        $stmt->execute([$cancelEventId, $ticketType]);
+
+                        $stmt = $pdo->prepare("UPDATE events SET tickets_available = tickets_available + 1 WHERE event_id = ?");
+                        $stmt->execute([$cancelEventId]);
+
+                        $_SESSION['flash_success'] = 'Registration cancelled.';
+                    } else {
+                        $_SESSION['flash_error'] = 'Cancellation is not allowed for this event.';
+                    }
+                } else {
+                    $_SESSION['flash_error'] = 'Cancellation is not allowed for this event.';
+                }
+
+                $pdo->commit();
+            } catch (Throwable $e) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                $_SESSION['flash_error'] = 'Unable to cancel registration right now.';
             }
         }
         header('Location: my_events.php');
@@ -383,12 +433,17 @@ function attendeePaymentLabel(string $status): string
                     <?php $tierType = attendeeTicketTypeLabel((string)($event['attendee_ticket_type'] ?? 'regular')); ?>
                     <?php $ticketCategory = trim((string)($event['category'] ?? '')); ?>
                     <?php $ticketAmount = (float)($event['ticket_amount'] ?? 0); ?>
+                    <?php $isPaidTicket = strtolower(trim((string)($event['payment_status'] ?? ''))) === 'paid'; ?>
                     <div class="ticket">
                         <div><strong><?php echo htmlspecialchars((string)$event['title']); ?></strong></div>
                         <div style="font-size:12px; opacity:.85; margin-top:4px;">Access: <?php echo htmlspecialchars($accessType); ?></div>
-                        <div style="font-size:12px; opacity:.85;">Ticket Tier: <?php echo htmlspecialchars($tierType); ?></div>
+                        <?php if ($isPaidTicket): ?>
+                            <div style="font-size:12px; opacity:.85;">Ticket Tier: <?php echo htmlspecialchars($tierType); ?></div>
+                        <?php endif; ?>
                         <div style="font-size:12px; opacity:.85;">Category: <?php echo htmlspecialchars($ticketCategory !== '' ? $ticketCategory : 'General'); ?></div>
-                        <div style="font-size:12px; opacity:.85;">Amount: <?php echo $ticketAmount > 0 ? 'KES ' . number_format($ticketAmount, 2) : 'Free'; ?></div>
+                        <?php if ($isPaidTicket): ?>
+                            <div style="font-size:12px; opacity:.85;">Amount Paid: <?php echo $ticketAmount > 0 ? 'KES ' . number_format($ticketAmount, 2) : 'Free'; ?></div>
+                        <?php endif; ?>
                         <div style="font-size:12px; opacity:.85;">Payment: <?php echo htmlspecialchars(attendeePaymentLabel((string)$event['payment_status'])); ?></div>
                         <div class="qr-box">QR: <?php echo htmlspecialchars($ticketCode); ?></div>
                         <div style="font-size:12px; opacity:.9;">Valid on <?php echo htmlspecialchars((string)$event['event_date']); ?></div>

@@ -16,7 +16,6 @@ $heroEvents = [];
 $trendingEvents = [];
 $recommendedEvents = [];
 $upcomingEvents = [];
-$dynamicCategories = [];
 $notificationsPreview = [];
 $categoryTiles = [];
 $registeredEventIds = [];
@@ -107,7 +106,27 @@ function inferCategory(string $title, ?string $dbCategory): string
 {
     $dbCategory = trim((string)$dbCategory);
     if ($dbCategory !== '') {
-        return ucwords(strtolower($dbCategory));
+        return ucfirst(strtolower($dbCategory));
+    }
+
+    $text = strtolower($title);
+    $map = [
+        'Music' => ['music', 'concert', 'jazz', 'festival', 'dj'],
+        'Business' => ['business', 'summit', 'startup', 'expo', 'conference'],
+        'Education' => ['education', 'workshop', 'training', 'class', 'bootcamp'],
+        'Sports' => ['sport', 'marathon', 'run', 'fitness', 'football'],
+        'Arts' => ['art', 'culture', 'gallery', 'creative'],
+        'Food' => ['food', 'chef', 'culinary', 'dining'],
+        'Family' => ['family', 'kids', 'children'],
+        'Charity' => ['charity', 'fundraiser', 'donation', 'cause'],
+    ];
+
+    foreach ($map as $category => $keywords) {
+        foreach ($keywords as $keyword) {
+            if (strpos($text, $keyword) !== false) {
+                return $category;
+            }
+        }
     }
 
     return 'General';
@@ -216,18 +235,6 @@ try {
     $heroEvents = $stmt->fetchAll();
 
     $trendingEvents = $heroEvents;
-
-    $stmt = $pdo->query(
-        "SELECT TRIM(COALESCE(e.category, '')) AS category_name, COUNT(*) AS events_count
-         FROM events e
-         WHERE e.archived_at IS NULL
-           AND e.event_date >= CURDATE()
-           AND TRIM(COALESCE(e.category, '')) <> ''
-         GROUP BY TRIM(COALESCE(e.category, ''))
-         ORDER BY events_count DESC, category_name ASC
-         LIMIT 8"
-    );
-    $dynamicCategories = $stmt->fetchAll();
 
     $upcomingSql =
         "SELECT e.event_id, e.title, e.event_date, e.ticket_price, COALESCE(e.venue, '') AS venue,
@@ -438,41 +445,29 @@ try {
     <?php if ($flashError !== ''): ?><div class="notice err"><?php echo htmlspecialchars($flashError); ?></div><?php endif; ?>
     <?php if ($errorMessage !== ''): ?><div class="notice err"><?php echo htmlspecialchars($errorMessage); ?></div><?php endif; ?>
 
+    <?php
+    $featuredHeroEvent = !empty($heroEvents) ? $heroEvents[0] : ['title' => 'Discover More Events', 'event_date' => date('Y-m-d'), 'venue' => 'Multiple locations', 'event_id' => 0, 'image_url' => ''];
+    $featuredHeroImage = resolveEventImageUrl((string)($featuredHeroEvent['image_url'] ?? ''));
+    $featuredHeroHref = ((int)($featuredHeroEvent['event_id'] ?? 0) > 0)
+        ? ('register_event.php?event_id=' . (int)$featuredHeroEvent['event_id'])
+        : 'explore.php';
+    ?>
     <section class="hero-wrap">
-        <?php if (!empty($heroEvents)): ?>
-            <?php
-                $featuredHeroEvent = $heroEvents[0];
-                $featuredHeroImage = resolveEventImageUrl((string)($featuredHeroEvent['image_url'] ?? ''));
-                $featuredHeroHref = 'register_event.php?event_id=' . (int)$featuredHeroEvent['event_id'];
-            ?>
-            <a class="hero-banner-link" href="<?php echo htmlspecialchars($featuredHeroHref); ?>">
-                <div class="hero-banner">
-                    <?php if ($featuredHeroImage !== ''): ?>
-                        <img src="<?php echo htmlspecialchars($featuredHeroImage); ?>" alt="Featured event banner">
-                    <?php endif; ?>
+        <a class="hero-banner-link" href="<?php echo htmlspecialchars($featuredHeroHref); ?>">
+            <div class="hero-banner">
+                <?php if ($featuredHeroImage !== ''): ?>
+                    <img src="<?php echo htmlspecialchars($featuredHeroImage); ?>" alt="Featured event banner">
+                <?php endif; ?>
+            </div>
+            <div class="hero-caption">
+                <div class="hero-caption-main">
+                    <div class="hero-sub">Featured Event Banner</div>
+                    <div class="hero-title"><?php echo htmlspecialchars((string)$featuredHeroEvent['title']); ?></div>
+                    <div class="hero-meta"><?php echo htmlspecialchars((string)$featuredHeroEvent['event_date']); ?><?php if ((string)($featuredHeroEvent['venue'] ?? '') !== ''): ?> &middot; <?php echo htmlspecialchars((string)$featuredHeroEvent['venue']); ?><?php endif; ?></div>
                 </div>
-                <div class="hero-caption">
-                    <div class="hero-caption-main">
-                        <div class="hero-sub">Featured Event</div>
-                        <div class="hero-title"><?php echo htmlspecialchars((string)$featuredHeroEvent['title']); ?></div>
-                        <div class="hero-meta"><?php echo htmlspecialchars((string)$featuredHeroEvent['event_date']); ?><?php if ((string)($featuredHeroEvent['venue'] ?? '') !== ''): ?> &middot; <?php echo htmlspecialchars((string)$featuredHeroEvent['venue']); ?><?php endif; ?></div>
-                    </div>
-                    <span class="hero-btn">View Event</span>
-                </div>
-            </a>
-        <?php else: ?>
-            <a class="hero-banner-link" href="explore.php">
-                <div class="hero-banner"></div>
-                <div class="hero-caption">
-                    <div class="hero-caption-main">
-                        <div class="hero-sub">Upcoming Events</div>
-                        <div class="hero-title">No upcoming events are published yet</div>
-                        <div class="hero-meta">Check Explore when organizers publish events.</div>
-                    </div>
-                    <span class="hero-btn">Explore</span>
-                </div>
-            </a>
-        <?php endif; ?>
+                <span class="hero-btn">View Event</span>
+            </div>
+        </a>
     </section>
 
     <form class="search-form" method="GET">

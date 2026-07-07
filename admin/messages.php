@@ -339,7 +339,7 @@ try {
     <div class="top-links">
         <a class="top-link" href="dashboard.php"><i class="fa-solid fa-house"></i> Dashboard</a>
         <a class="top-link" href="browse_vendors.php"><i class="fa-solid fa-shop"></i> Browse Vendors</a>
-        <a class="top-link" href="mpesa_payments.php"><i class="fa-solid fa-money-check-dollar"></i> M-Pesa Payments</a>
+        <a class="top-link" href="mpesa_payments.php"><i class="fa-solid fa-money-check-dollar"></i> Booking Payments</a>
     </div>
 
     <?php if ($flashError !== ''): ?>
@@ -386,7 +386,7 @@ try {
                     <span class="ops-chip">Pending Payments: <?php echo (int)$vendorOpsSnapshot['pending_payments']; ?></span>
                     <span class="ops-chip">Failed Payments: <?php echo (int)$vendorOpsSnapshot['failed_payments']; ?></span>
                     <span class="ops-chip">Pending Bookings: <?php echo (int)$vendorOpsSnapshot['pending_bookings']; ?></span>
-                    <a class="top-link" href="mpesa_payments.php" style="padding:5px 10px; font-size:12px;"><i class="fa-solid fa-arrow-up-right-from-square"></i> Open M-Pesa</a>
+                    <a class="top-link" href="mpesa_payments.php" style="padding:5px 10px; font-size:12px;"><i class="fa-solid fa-arrow-up-right-from-square"></i> Open Booking Payments</a>
                 </div>
 
                 <div class="messages">

@@ -48,3 +48,31 @@ if (!function_exists('csrf_require_valid_post_token')) {
         }
     }
 }
+
+// Backward-compatible aliases used by older pages.
+if (!function_exists('generate_csrf_token')) {
+    function generate_csrf_token(): string
+    {
+        return csrf_token();
+    }
+}
+
+if (!function_exists('validate_csrf_token')) {
+    function validate_csrf_token(?string $token = null): bool
+    {
+        $submittedToken = $token;
+        if ($submittedToken === null) {
+            $submittedToken = isset($_POST['csrf_token']) && is_string($_POST['csrf_token'])
+                ? $_POST['csrf_token']
+                : '';
+        }
+
+        $sessionToken = isset($_SESSION['_csrf_token']) && is_string($_SESSION['_csrf_token'])
+            ? $_SESSION['_csrf_token']
+            : '';
+
+        return $submittedToken !== ''
+            && $sessionToken !== ''
+            && hash_equals($sessionToken, $submittedToken);
+    }
+}

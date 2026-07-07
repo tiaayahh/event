@@ -13,6 +13,8 @@ $statusFilter = strtolower(trim((string)($_GET['status'] ?? 'all')));
 if (!in_array($statusFilter, ['all', 'pending', 'confirmed', 'cancelled'], true)) {
     $statusFilter = 'all';
 }
+$isMarketOperator = false;
+$marketEvents = [];
 
 function ensureBookingDisplaySchema(PDO $pdo): void
 {
@@ -34,6 +36,21 @@ function ensureBookingDisplaySchema(PDO $pdo): void
     $ready = true;
 }
 
+function ensureVendorTypeSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM vendors LIKE 'vendor_type'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE vendors ADD COLUMN vendor_type ENUM('service_provider','market_operator') NOT NULL DEFAULT 'service_provider' AFTER service_type");
+    }
+
+    $ready = true;
+}
+
 function resolveEventImageUrl(?string $rawUrl): string
 {
     $url = trim((string)$rawUrl);
@@ -49,16 +66,19 @@ function resolveEventImageUrl(?string $rawUrl): string
 }
 
 try {
-    $stmt = $pdo->prepare("SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1");
+    ensureVendorTypeSchema($pdo);
+
+    $stmt = $pdo->prepare("SELECT vendor_id, COALESCE(vendor_type, 'service_provider') AS vendor_type FROM vendors WHERE user_id = ? LIMIT 1");
     $stmt->execute([$_SESSION['user_id']]);
     $vendor = $stmt->fetch();
 
     if ($vendor) {
         $vendorId = (int)$vendor['vendor_id'];
+        $isMarketOperator = ((string)($vendor['vendor_type'] ?? 'service_provider')) === 'market_operator';
 
         ensureBookingDisplaySchema($pdo);
 
-        if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['booking_action'], $_POST['booking_id'])) {
+        if (!$isMarketOperator && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['booking_action'], $_POST['booking_id'])) {
             csrf_require_valid_post_token();
 
             $bookingId = filter_input(INPUT_POST, 'booking_id', FILTER_VALIDATE_INT);
@@ -187,28 +207,61 @@ try {
         $stmt->execute([$vendorId]);
         $newPendingCount = (int)$stmt->fetchColumn();
 
-        $sql = "SELECT b.booking_id, b.status AS booking_status, b.booked_price, b.platform_fee, b.booth_number,
-                    COALESCE(e.image_url, '') AS image_url,
-                    e.title AS event_title, e.event_date, COALESCE(e.venue, '') AS event_venue, s.name AS service_name,
-                    t.mpesa_code, COALESCE(t.status, 'pending') AS payment_status, COALESCE(t.amount, 0) AS paid_amount
-                FROM bookings b
-                JOIN events e ON b.event_id = e.event_id
-                JOIN services s ON b.service_id = s.service_id
-                LEFT JOIN transactions t ON b.booking_id = t.booking_id
-                WHERE s.vendor_id = ?";
-        $params = [$vendorId];
-
-        if ($statusFilter === 'pending' || $statusFilter === 'confirmed' || $statusFilter === 'cancelled') {
-            $sql .= " AND b.status = ?";
-            $params[] = $statusFilter;
+        if ($isMarketOperator) {
+            $stmt = $pdo->prepare(
+                "SELECT
+                    e.event_id,
+                    e.title,
+                    e.event_date,
+                    COALESCE(e.venue, '') AS event_venue,
+                    COALESCE(e.city, '') AS event_city,
+                    COALESCE(e.stall_price, 0) AS event_fee,
+                    COALESCE(sr.payment_status,
+                        CASE LOWER(COALESCE(sr.status, 'requested'))
+                            WHEN 'paid' THEN 'paid'
+                            WHEN 'failed' THEN 'failed'
+                            WHEN 'cancelled' THEN 'cancelled'
+                            ELSE 'pending'
+                        END
+                    ) AS booking_status,
+                    COALESCE(sr.checkout_request_id, '') AS checkout_request_id,
+                    COALESCE(sr.mpesa_code, '') AS mpesa_code,
+                    sr.updated_at
+                 FROM events e
+                 LEFT JOIN stall_rentals sr
+                    ON sr.event_id = e.event_id
+                   AND sr.vendor_user_id = ?
+                 WHERE e.archived_at IS NULL
+                   AND e.event_date >= CURDATE()
+                   AND LOWER(COALESCE(e.category, '')) LIKE '%market%'
+                 ORDER BY e.event_date ASC"
+            );
+            $stmt->execute([(int)$_SESSION['user_id']]);
+            $marketEvents = $stmt->fetchAll();
         } else {
-            $sql .= " AND b.status IN ('pending', 'confirmed', 'cancelled')";
-        }
+            $sql = "SELECT b.booking_id, b.status AS booking_status, b.booked_price, b.platform_fee, b.booth_number,
+                        COALESCE(e.image_url, '') AS image_url,
+                        e.title AS event_title, e.event_date, COALESCE(e.venue, '') AS event_venue, s.name AS service_name,
+                        t.mpesa_code, COALESCE(t.status, 'pending') AS payment_status, COALESCE(t.amount, 0) AS paid_amount
+                    FROM bookings b
+                    JOIN events e ON b.event_id = e.event_id
+                    JOIN services s ON b.service_id = s.service_id
+                    LEFT JOIN transactions t ON b.booking_id = t.booking_id
+                    WHERE s.vendor_id = ?";
+            $params = [$vendorId];
 
-        $sql .= " ORDER BY e.event_date ASC";
-        $stmt = $pdo->prepare($sql);
-        $stmt->execute($params);
-        $bookings = $stmt->fetchAll();
+            if ($statusFilter === 'pending' || $statusFilter === 'confirmed' || $statusFilter === 'cancelled') {
+                $sql .= " AND b.status = ?";
+                $params[] = $statusFilter;
+            } else {
+                $sql .= " AND b.status IN ('pending', 'confirmed', 'cancelled')";
+            }
+
+            $sql .= " ORDER BY e.event_date ASC";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute($params);
+            $bookings = $stmt->fetchAll();
+        }
     }
 } catch (Throwable $e) {
     error_log('vendor/bookings.php error: ' . $e->getMessage());
@@ -393,87 +446,124 @@ try {
             <h2 class="card-title">Bookings</h2>
             <?php if ($flashSuccess !== ''): ?><div class="message message-success"><?php echo htmlspecialchars($flashSuccess); ?></div><?php endif; ?>
             <?php if ($flashError !== ''): ?><div class="message message-error"><?php echo htmlspecialchars($flashError); ?></div><?php endif; ?>
-            <div class="action-row">
-                <a class="action-link" href="pay_fee.php">Pay Vendor Selling Fee</a>
-            </div>
-            <div class="filter-row">
-                <a class="filter-link <?php echo $statusFilter === 'all' ? 'active' : ''; ?>" href="bookings.php?status=all">All</a>
-                <a class="filter-link <?php echo $statusFilter === 'pending' ? 'active' : ''; ?>" href="bookings.php?status=pending">Pending</a>
-                <a class="filter-link <?php echo $statusFilter === 'confirmed' ? 'active' : ''; ?>" href="bookings.php?status=confirmed">Confirmed</a>
-                <a class="filter-link <?php echo $statusFilter === 'cancelled' ? 'active' : ''; ?>" href="bookings.php?status=cancelled">Cancelled</a>
-            </div>
-            <?php if (empty($bookings)): ?>
-                <?php if ($statusFilter === 'pending'): ?>
-                    <p>No pending bookings yet.</p>
-                <?php elseif ($statusFilter === 'confirmed'): ?>
-                    <p>No confirmed bookings yet.</p>
-                <?php elseif ($statusFilter === 'cancelled'): ?>
-                    <p>No cancelled bookings yet.</p>
+            <?php if ($isMarketOperator): ?>
+                <div class="action-row">
+                    <a class="action-link" href="stall_registration.php">Book Event &amp; Pay Fee</a>
+                </div>
+
+                <?php if (empty($marketEvents)): ?>
+                    <p>No upcoming market events available right now.</p>
                 <?php else: ?>
-                    <p>No bookings yet.</p>
+                    <?php foreach ($marketEvents as $event): ?>
+                        <?php
+                            $status = strtolower((string)($event['booking_status'] ?? 'pending'));
+                            if (!in_array($status, ['paid', 'failed', 'cancelled', 'pending'], true)) {
+                                $status = 'pending';
+                            }
+                        ?>
+                        <div class="booking-row">
+                            <div class="booking-main">
+                                <strong><?php echo htmlspecialchars((string)$event['title']); ?></strong>
+                                <div class="booking-meta">Date: <?php echo htmlspecialchars((string)$event['event_date']); ?></div>
+                                <div class="booking-meta">Venue: <?php echo htmlspecialchars((string)(($event['event_venue'] ?? '') !== '' ? $event['event_venue'] : 'Not specified')); ?><?php if ((string)($event['event_city'] ?? '') !== ''): ?>, <?php echo htmlspecialchars((string)$event['event_city']); ?><?php endif; ?></div>
+                                <div class="booking-meta">Event Fee: KES <?php echo number_format((float)($event['event_fee'] ?? 0), 2); ?></div>
+                                <div class="booking-actions">
+                                    <a class="action-btn neutral-btn" href="stall_registration.php?event_id=<?php echo (int)$event['event_id']; ?>#event-<?php echo (int)$event['event_id']; ?>">Open Booking &amp; Payment</a>
+                                    <?php if ((string)($event['checkout_request_id'] ?? '') !== ''): ?>
+                                        <span class="booking-meta">Checkout ID: <?php echo htmlspecialchars((string)$event['checkout_request_id']); ?></span>
+                                    <?php endif; ?>
+                                </div>
+                            </div>
+                            <div>
+                                <span class="status-booking <?php echo htmlspecialchars($status); ?>"><?php echo htmlspecialchars(ucfirst($status)); ?></span>
+                                <br><small style="color:#777;">Receipt: <?php echo htmlspecialchars((string)((($event['mpesa_code'] ?? '') !== '') ? $event['mpesa_code'] : 'Not provided')); ?></small>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
                 <?php endif; ?>
             <?php else: ?>
-                <?php foreach ($bookings as $b): ?>
-                    <?php $bookingImage = resolveEventImageUrl((string)($b['image_url'] ?? '')); ?>
-                    <div class="booking-row">
-                        <div class="booking-main">
-                            <div class="booking-main-row">
-                                <div class="booking-thumb"<?php if ($bookingImage !== ''): ?> style="background-image:url('<?php echo htmlspecialchars($bookingImage); ?>');"<?php endif; ?>></div>
-                                <div>
-                                    <strong><?php echo htmlspecialchars($b['service_name']); ?></strong> &mdash;
-                                    <?php echo htmlspecialchars($b['event_title']); ?> (<?php echo $b['event_date']; ?>)
-                                    <span class="status-booking <?php echo htmlspecialchars((string)$b['booking_status']); ?>"><?php echo htmlspecialchars(ucfirst((string)$b['booking_status'])); ?></span>
-                                    <div class="booking-meta">Venue: <?php echo htmlspecialchars((string)($b['event_venue'] !== '' ? $b['event_venue'] : 'Not specified')); ?></div>
-                                    <div class="booking-meta">Booth Number: <?php echo htmlspecialchars((string)(($b['booth_number'] ?? '') !== '' ? $b['booth_number'] : 'Not assigned')); ?></div>
-                                    <div class="booking-actions">
-                                        <?php if (strtolower((string)$b['booking_status']) === 'pending'): ?>
-                                            <form method="POST" class="action-form">
-                                                <?php echo csrf_input(); ?>
-                                                <input type="hidden" name="booking_action" value="accept">
-                                                <input type="hidden" name="booking_id" value="<?php echo (int)$b['booking_id']; ?>">
-                                                <button class="action-btn accept-btn" type="submit">Accept Booking</button>
-                                            </form>
-                                        <?php endif; ?>
-                                        <?php if (in_array(strtolower((string)$b['booking_status']), ['pending', 'confirmed'], true)): ?>
-                                            <form method="POST" class="action-form" onsubmit="return confirm('Decline this booking?');">
-                                                <?php echo csrf_input(); ?>
-                                                <input type="hidden" name="booking_action" value="decline">
-                                                <input type="hidden" name="booking_id" value="<?php echo (int)$b['booking_id']; ?>">
-                                                <button class="action-btn decline-btn" type="submit">Decline Booking</button>
-                                            </form>
-                                        <?php endif; ?>
-                                        <a class="action-btn neutral-btn" href="event_details.php?booking_id=<?php echo (int)$b['booking_id']; ?>">View Event Details</a>
-                                        <a class="action-btn neutral-btn" href="download_agreement.php?booking_id=<?php echo (int)$b['booking_id']; ?>">Download Agreement</a>
+                <div class="action-row">
+                    <a class="action-link" href="pay_fee.php">Pay Vendor Selling Fee</a>
+                </div>
+                <div class="filter-row">
+                    <a class="filter-link <?php echo $statusFilter === 'all' ? 'active' : ''; ?>" href="bookings.php?status=all">All</a>
+                    <a class="filter-link <?php echo $statusFilter === 'pending' ? 'active' : ''; ?>" href="bookings.php?status=pending">Pending</a>
+                    <a class="filter-link <?php echo $statusFilter === 'confirmed' ? 'active' : ''; ?>" href="bookings.php?status=confirmed">Confirmed</a>
+                    <a class="filter-link <?php echo $statusFilter === 'cancelled' ? 'active' : ''; ?>" href="bookings.php?status=cancelled">Cancelled</a>
+                </div>
+                <?php if (empty($bookings)): ?>
+                    <?php if ($statusFilter === 'pending'): ?>
+                        <p>No pending bookings yet.</p>
+                    <?php elseif ($statusFilter === 'confirmed'): ?>
+                        <p>No confirmed bookings yet.</p>
+                    <?php elseif ($statusFilter === 'cancelled'): ?>
+                        <p>No cancelled bookings yet.</p>
+                    <?php else: ?>
+                        <p>No bookings yet.</p>
+                    <?php endif; ?>
+                <?php else: ?>
+                    <?php foreach ($bookings as $b): ?>
+                        <?php $bookingImage = resolveEventImageUrl((string)($b['image_url'] ?? '')); ?>
+                        <div class="booking-row">
+                            <div class="booking-main">
+                                <div class="booking-main-row">
+                                    <div class="booking-thumb"<?php if ($bookingImage !== ''): ?> style="background-image:url('<?php echo htmlspecialchars($bookingImage); ?>');"<?php endif; ?>></div>
+                                    <div>
+                                        <strong><?php echo htmlspecialchars($b['service_name']); ?></strong> &mdash;
+                                        <?php echo htmlspecialchars($b['event_title']); ?> (<?php echo $b['event_date']; ?>)
+                                        <span class="status-booking <?php echo htmlspecialchars((string)$b['booking_status']); ?>"><?php echo htmlspecialchars(ucfirst((string)$b['booking_status'])); ?></span>
+                                        <div class="booking-meta">Venue: <?php echo htmlspecialchars((string)($b['event_venue'] !== '' ? $b['event_venue'] : 'Not specified')); ?></div>
+                                        <div class="booking-meta">Booth Number: <?php echo htmlspecialchars((string)(($b['booth_number'] ?? '') !== '' ? $b['booth_number'] : 'Not assigned')); ?></div>
+                                        <div class="booking-actions">
+                                            <?php if (strtolower((string)$b['booking_status']) === 'pending'): ?>
+                                                <form method="POST" class="action-form">
+                                                    <?php echo csrf_input(); ?>
+                                                    <input type="hidden" name="booking_action" value="accept">
+                                                    <input type="hidden" name="booking_id" value="<?php echo (int)$b['booking_id']; ?>">
+                                                    <button class="action-btn accept-btn" type="submit">Accept Booking</button>
+                                                </form>
+                                            <?php endif; ?>
+                                            <?php if (in_array(strtolower((string)$b['booking_status']), ['pending', 'confirmed'], true)): ?>
+                                                <form method="POST" class="action-form" onsubmit="return confirm('Decline this booking?');">
+                                                    <?php echo csrf_input(); ?>
+                                                    <input type="hidden" name="booking_action" value="decline">
+                                                    <input type="hidden" name="booking_id" value="<?php echo (int)$b['booking_id']; ?>">
+                                                    <button class="action-btn decline-btn" type="submit">Decline Booking</button>
+                                                </form>
+                                            <?php endif; ?>
+                                            <a class="action-btn neutral-btn" href="event_details.php?booking_id=<?php echo (int)$b['booking_id']; ?>">View Event Details</a>
+                                            <a class="action-btn neutral-btn" href="download_agreement.php?booking_id=<?php echo (int)$b['booking_id']; ?>">Download Agreement</a>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
+                            <div>
+                                <?php
+                                $gross = (float)$b['booked_price'];
+                                $fee = (float)($b['platform_fee'] ?? 0);
+                                $net = $gross - $fee;
+                                $rawPaymentStatus = strtolower((string)($b['payment_status'] ?? 'pending'));
+                                $paidAmount = (float)($b['paid_amount'] ?? 0);
+                                $displayPaymentStatus = 'Pending';
+                                $paymentClass = 'status-pending';
+                                if ($rawPaymentStatus === 'paid' && $paidAmount > 0 && $paidAmount < $gross) {
+                                    $displayPaymentStatus = 'Partially Paid';
+                                    $paymentClass = 'status-partial';
+                                } elseif ($rawPaymentStatus === 'paid') {
+                                    $displayPaymentStatus = 'Paid';
+                                    $paymentClass = 'status-paid';
+                                } elseif ($rawPaymentStatus === 'failed') {
+                                    $displayPaymentStatus = 'Failed';
+                                    $paymentClass = 'status-failed';
+                                }
+                                ?>
+                                <span>KES <?php echo number_format($net, 2); ?> (amount payable)</span>
+                                <br><small style="color:#777;">Fee: KES <?php echo number_format($fee, 2); ?></small>
+                                <br><small class="<?php echo $paymentClass; ?>">Payment: <?php echo htmlspecialchars($displayPaymentStatus); ?></small>
+                            </div>
                         </div>
-                        <div>
-                            <?php
-                            $gross = (float)$b['booked_price'];
-                            $fee = (float)($b['platform_fee'] ?? 0);
-                            $net = $gross - $fee;
-                            $rawPaymentStatus = strtolower((string)($b['payment_status'] ?? 'pending'));
-                            $paidAmount = (float)($b['paid_amount'] ?? 0);
-                            $displayPaymentStatus = 'Pending';
-                            $paymentClass = 'status-pending';
-                            if ($rawPaymentStatus === 'paid' && $paidAmount > 0 && $paidAmount < $gross) {
-                                $displayPaymentStatus = 'Partially Paid';
-                                $paymentClass = 'status-partial';
-                            } elseif ($rawPaymentStatus === 'paid') {
-                                $displayPaymentStatus = 'Paid';
-                                $paymentClass = 'status-paid';
-                            } elseif ($rawPaymentStatus === 'failed') {
-                                $displayPaymentStatus = 'Failed';
-                                $paymentClass = 'status-failed';
-                            }
-                            ?>
-                            <span>KES <?php echo number_format($net, 2); ?> (amount payable)</span>
-                            <br><small style="color:#777;">Fee: KES <?php echo number_format($fee, 2); ?></small>
-                            <br><small class="<?php echo $paymentClass; ?>">Payment: <?php echo htmlspecialchars($displayPaymentStatus); ?></small>
-                        </div>
-                    </div>
-                <?php endforeach; ?>
+                    <?php endforeach; ?>
+                <?php endif; ?>
             <?php endif; ?>
         </div>
     </div>

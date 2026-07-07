@@ -87,12 +87,13 @@ try {
 
 		if ($action === 'stk_push') {
 			if (!$darajaStkConfigured) {
-				$flashError = 'STK push is unavailable. Missing: ' . implode(', ', $darajaMissingStkFields) . '. You can still save payment manually using M-Pesa code and status.';
+				$flashError = 'Mpesa prompt is unavailable. Missing: ' . implode(', ', $darajaMissingStkFields) . '. You can still save payment manually using M-Pesa code and status.';
 			} else {
 			$phoneNumber = trim((string)($_POST['phone_number'] ?? ''));
+			$chargeAmount = daraja_effective_stk_amount($bookedPrice);
 			$pushResult = daraja_stk_push(
 				$phoneNumber,
-				$bookedPrice,
+				$chargeAmount,
 				'BOOKING-' . $bookingId,
 				'Planora booking payment'
 			);
@@ -100,7 +101,7 @@ try {
 			if (!empty($pushResult['success'])) {
 				$checkoutRequestId = (string)($pushResult['checkout_request_id'] ?? '');
 				$merchantRequestId = (string)($pushResult['merchant_request_id'] ?? '');
-				$flashSuccess = 'Daraja STK push initiated successfully. Confirm payment on the customer phone.';
+				$flashSuccess = 'Daraja Mpesa prompt initiated successfully. Confirm payment on the customer phone.';
 
 				if ($checkoutRequestId !== '') {
 					$stmt = $pdo->prepare(
@@ -137,10 +138,12 @@ try {
 					[
 						'checkout_request_id' => $checkoutRequestId,
 						'amount' => $bookedPrice,
+						'charged_amount' => $chargeAmount,
 					]
 				);
+				$flashSuccess = 'Daraja Mpesa prompt initiated. Confirm payment on the customer phone.';
 			} else {
-				$flashError = (string)($pushResult['message'] ?? 'Unable to initiate Daraja STK push right now.');
+				$flashError = (string)($pushResult['message'] ?? 'Unable to initiate Daraja Mpesa prompt right now.');
 				audit_log(
 					$pdo,
 					(int)$_SESSION['user_id'],
@@ -248,7 +251,7 @@ try {
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="../assets/style.css">
-	<title>Planora - M-Pesa Reconciliation</title>
+	<title>Planora - Payment Reconciliation</title>
 	<style>
 		* { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
 		body { background: #f4f5fb; color: #2D2D2D; min-height: 100vh; }
@@ -288,10 +291,10 @@ try {
 </header>
 
 <div class="container">
-	<a class="link-btn" href="mpesa_payments.php">Back to M-Pesa Payments</a>
+	<a class="link-btn" href="mpesa_payments.php">Back to Booking Payments</a>
 
 	<section class="card">
-		<h2 class="title">M-Pesa Reconciliation</h2>
+		<h2 class="title">Payment Reconciliation</h2>
 
 		<?php if ($flashError !== ''): ?>
 			<div class="message-error"><?php echo htmlspecialchars($flashError); ?></div>
@@ -302,7 +305,7 @@ try {
 		<?php endif; ?>
 
 		<?php if (!$darajaStkConfigured): ?>
-			<div class="message-info">STK push is unavailable (missing: <?php echo htmlspecialchars(implode(', ', $darajaMissingStkFields)); ?>). Manual payment reconciliation remains available below.</div>
+			<div class="message-info">Mpesa prompt is unavailable (missing: <?php echo htmlspecialchars(implode(', ', $darajaMissingStkFields)); ?>). Manual payment reconciliation remains available below.</div>
 		<?php elseif (!$darajaConfigured): ?>
 			<div class="message-error">Daraja is not fully configured. Missing: <?php echo htmlspecialchars(implode(', ', $darajaMissingFields)); ?>.</div>
 		<?php endif; ?>
@@ -317,12 +320,12 @@ try {
 		<form method="POST">
 			<?php echo csrf_input(); ?>
 			<div class="field">
-				<label for="phone_number">Customer Phone Number (for STK Push)</label>
+				<label for="phone_number">Customer Phone Number (for Mpesa prompt)</label>
 				<input class="input" type="text" id="phone_number" name="phone_number" placeholder="e.g. 0712345678">
 			</div>
 
 			<?php if ($darajaStkConfigured): ?>
-				<button class="btn" type="submit" name="action" value="stk_push">Send STK Push (Daraja)</button>
+				<button class="btn" type="submit" name="action" value="stk_push">Send Mpesa prompt (Daraja)</button>
 			<?php endif; ?>
 
 			<div style="height: 10px;"></div>
