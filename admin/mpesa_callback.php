@@ -49,7 +49,7 @@ function ensure_callback_request_is_allowed(PDO $pdo): void
         }
     }
 
-    $allowedIpsRaw = trim((string)(getenv('DARAJA_CALLBACK_ALLOWED_IPS') ?: ''));
+    $allowedIpsRaw = trim((string)(getenv('DARAJA_CALLBACK_ALLOWED_IPS') ?: getenv('DARAJA_ALLOWED_IPS') ?: ''));
     if ($allowedIpsRaw !== '') {
         $allowedIps = array_filter(array_map('trim', explode(',', $allowedIpsRaw)));
         $clientIp = get_client_ip_address();

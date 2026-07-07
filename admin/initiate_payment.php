@@ -31,6 +31,9 @@ $flashError = '';
 $flashSuccess = '';
 $paymentTimeline = [];
 $darajaConfigured = daraja_is_configured();
+$darajaMissingFields = daraja_missing_required_fields();
+$darajaStkConfigured = daraja_is_stk_configured();
+$darajaMissingStkFields = daraja_missing_stk_fields();
 
 try {
 	ensureEventVendorFeeSchema($pdo);
@@ -83,6 +86,9 @@ try {
 		$mpesaCodeDb = $mpesaCode === '' ? null : $mpesaCode;
 
 		if ($action === 'stk_push') {
+			if (!$darajaStkConfigured) {
+				$flashError = 'STK push is unavailable. Missing: ' . implode(', ', $darajaMissingStkFields) . '. You can still save payment manually using M-Pesa code and status.';
+			} else {
 			$phoneNumber = trim((string)($_POST['phone_number'] ?? ''));
 			$pushResult = daraja_stk_push(
 				$phoneNumber,
@@ -144,6 +150,7 @@ try {
 					(string)$bookingId,
 					['reason' => $flashError]
 				);
+			}
 			}
 		} elseif (!in_array($paymentStatus, ['pending', 'paid', 'failed'], true)) {
 			$flashError = 'Invalid payment status selected.';
@@ -244,20 +251,22 @@ try {
 	<title>Planora - M-Pesa Reconciliation</title>
 	<style>
 		* { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-		body { background: #F5F5F5; color: #2D2D2D; min-height: 100vh; }
+		body { background: #f4f5fb; color: #2D2D2D; min-height: 100vh; }
 		.header { background: #6C63FF; color: #fff; padding: 14px 24px; display: flex; justify-content: space-between; align-items: center; }
 		.brand { font-size: 22px; font-weight: 700; }
 		.logout-btn { background: rgba(255,255,255,0.22); color: #fff; text-decoration: none; border-radius: 6px; padding: 7px 14px; font-size: 13px; }
 		.container { max-width: 760px; margin: 0 auto; padding: 20px; }
-		.link-btn { text-decoration: none; background: #ece9ff; color: #3b3496; border-radius: 6px; padding: 8px 12px; font-size: 13px; display: inline-block; margin-bottom: 14px; }
-		.card { background: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+		.link-btn { text-decoration: none; background: #ece9ff; color: #3b3496; border-radius: 10px; padding: 8px 12px; font-size: 13px; display: inline-block; margin-bottom: 14px; border: 1px solid #d8d4ff; }
+		.card { background: #fff; border-radius: 12px; border: 1px solid #ece9ff; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
 		.title { font-size: 18px; font-weight: 700; margin-bottom: 14px; }
 		.meta { color: #666; font-size: 14px; margin-bottom: 8px; }
 		.field { margin-bottom: 12px; }
 		label { display: block; font-size: 13px; margin-bottom: 6px; color: #555; font-weight: 600; }
-		.input, .select { width: 100%; border: 1px solid #d6d6d6; border-radius: 6px; padding: 10px; font-size: 14px; }
+		.input, .select { width: 100%; border: 1px solid #d8d4ff; border-radius: 10px; padding: 10px; font-size: 14px; }
 		.message-error { background: #ffecec; color: #9d2020; border: 1px solid #f6caca; border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; font-size: 13px; }
-		.btn { background: #6C63FF; color: #fff; border: none; border-radius: 6px; padding: 10px 14px; font-size: 13px; cursor: pointer; }
+		.message-info { background: #eef3ff; color: #2c4ea0; border: 1px solid #d9e4ff; border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; font-size: 13px; }
+		.message-success { background: #ecfff0; color: #1c7a36; border: 1px solid #c9f0d4; border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; font-size: 13px; }
+		.btn { background: #6C63FF; color: #fff; border: none; border-radius: 10px; padding: 10px 14px; font-size: 13px; cursor: pointer; }
 		.timeline { margin-top: 18px; border-top: 1px solid #efefef; padding-top: 14px; }
 		.timeline-title { font-size: 15px; font-weight: 700; margin-bottom: 10px; }
 		.timeline-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
@@ -289,14 +298,16 @@ try {
 		<?php endif; ?>
 
 		<?php if ($flashSuccess !== ''): ?>
-			<div class="message-error" style="background: #ecfff0; color: #1c7a36; border-color: #c9f0d4;"><?php echo htmlspecialchars($flashSuccess); ?></div>
+			<div class="message-success"><?php echo htmlspecialchars($flashSuccess); ?></div>
 		<?php endif; ?>
 
-		<?php if (!$darajaConfigured): ?>
-			<div class="message-error">Daraja is not configured yet. Set DARAJA_CONSUMER_KEY, DARAJA_CONSUMER_SECRET, DARAJA_SHORTCODE, DARAJA_PASSKEY, and DARAJA_CALLBACK_URL (for example: https://your-domain/admin/mpesa_callback.php).</div>
+		<?php if (!$darajaStkConfigured): ?>
+			<div class="message-info">STK push is unavailable (missing: <?php echo htmlspecialchars(implode(', ', $darajaMissingStkFields)); ?>). Manual payment reconciliation remains available below.</div>
+		<?php elseif (!$darajaConfigured): ?>
+			<div class="message-error">Daraja is not fully configured. Missing: <?php echo htmlspecialchars(implode(', ', $darajaMissingFields)); ?>.</div>
 		<?php endif; ?>
 
-		<div class="message-error" style="background: #eef3ff; color: #2c4ea0; border-color: #d9e4ff;">Optional callback hardening: set DARAJA_CALLBACK_TOKEN and DARAJA_CALLBACK_ALLOWED_IPS to verify callback authenticity and source.</div>
+		<div class="message-info">Optional callback hardening: set DARAJA_CALLBACK_TOKEN and DARAJA_CALLBACK_ALLOWED_IPS to verify callback authenticity and source.</div>
 
 		<p class="meta"><strong>Event:</strong> <?php echo htmlspecialchars((string)$booking['event_title']); ?> (<?php echo htmlspecialchars((string)$booking['event_date']); ?>)</p>
 		<p class="meta"><strong>Vendor/Service:</strong> <?php echo htmlspecialchars((string)$booking['business_name']); ?> - <?php echo htmlspecialchars((string)$booking['service_name']); ?></p>
@@ -310,7 +321,9 @@ try {
 				<input class="input" type="text" id="phone_number" name="phone_number" placeholder="e.g. 0712345678">
 			</div>
 
-			<button class="btn" type="submit" name="action" value="stk_push">Send STK Push (Daraja)</button>
+			<?php if ($darajaStkConfigured): ?>
+				<button class="btn" type="submit" name="action" value="stk_push">Send STK Push (Daraja)</button>
+			<?php endif; ?>
 
 			<div style="height: 10px;"></div>
 

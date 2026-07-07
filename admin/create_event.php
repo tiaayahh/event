@@ -10,8 +10,13 @@ unset($_SESSION['flash_success'], $_SESSION['flash_error']);
 $title = '';
 $eventDate = '';
 $venue = '';
+$category = '';
+$city = '';
+$eventType = 'in_person';
+$imageUrl = '';
 $budgetTotal = '';
 $ticketPrice = '0.00';
+$ticketsAvailable = '200';
 $expectedAttendees = '0';
 $vendorContributionTarget = '0.00';
 $budgetItemNames = ['', '', ''];
@@ -48,6 +53,31 @@ function ensureEventBudgetPlanningSchema(PDO $pdo): void
         $pdo->exec("ALTER TABLE events ADD COLUMN venue VARCHAR(190) DEFAULT NULL AFTER event_date");
     }
 
+    $stmt = $pdo->query("SHOW COLUMNS FROM events LIKE 'category'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE events ADD COLUMN category VARCHAR(64) DEFAULT NULL AFTER title");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM events LIKE 'city'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE events ADD COLUMN city VARCHAR(120) DEFAULT NULL AFTER venue");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM events LIKE 'event_type'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE events ADD COLUMN event_type ENUM('in_person','online') NOT NULL DEFAULT 'in_person' AFTER city");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM events LIKE 'image_url'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE events ADD COLUMN image_url VARCHAR(500) DEFAULT NULL AFTER event_type");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM events LIKE 'tickets_available'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE events ADD COLUMN tickets_available INT NOT NULL DEFAULT 200 AFTER ticket_price");
+    }
+
     $pdo->exec(
         "CREATE TABLE IF NOT EXISTS event_budget_items (
             item_id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -68,6 +98,93 @@ function ensureEventBudgetPlanningSchema(PDO $pdo): void
     }
 
     $ready = true;
+}
+
+function storeEventBannerUpload(array $file, string &$errorMessage): ?string
+{
+    $uploadError = (int)($file['error'] ?? UPLOAD_ERR_NO_FILE);
+    if ($uploadError === UPLOAD_ERR_NO_FILE) {
+        return null;
+    }
+
+    if ($uploadError !== UPLOAD_ERR_OK) {
+        $errorMessage = 'Banner upload failed. Please try again.';
+        return null;
+    }
+
+    $originalName = (string)($file['name'] ?? '');
+    $tmpPath = (string)($file['tmp_name'] ?? '');
+    $size = (int)($file['size'] ?? 0);
+    $ext = strtolower(pathinfo($originalName, PATHINFO_EXTENSION));
+    $allowedExt = ['jpg', 'jpeg', 'png', 'webp', 'gif'];
+
+    if ($size <= 0 || $size > 5 * 1024 * 1024) {
+        $errorMessage = 'Banner must be between 1 byte and 5MB.';
+        return null;
+    }
+
+    if (!in_array($ext, $allowedExt, true)) {
+        $errorMessage = 'Banner file type not allowed. Use JPG, PNG, WEBP, or GIF.';
+        return null;
+    }
+
+    $uploadDir = dirname(__DIR__) . '/uploads/event_banners';
+    if (!is_dir($uploadDir)) {
+        mkdir($uploadDir, 0775, true);
+    }
+
+    try {
+        $randomPart = bin2hex(random_bytes(6));
+    } catch (Throwable $e) {
+        $randomPart = uniqid('', true);
+    }
+
+    $safeFile = 'event_banner_' . time() . '_' . str_replace('.', '', $randomPart) . '.' . $ext;
+    $targetPath = $uploadDir . '/' . $safeFile;
+    if (!move_uploaded_file($tmpPath, $targetPath)) {
+        $errorMessage = 'Could not save banner file.';
+        return null;
+    }
+
+    return 'uploads/event_banners/' . $safeFile;
+}
+
+function resolveEventBannerUrl(?string $rawUrl): string
+{
+    $url = trim((string)$rawUrl);
+    if ($url === '') {
+        return '';
+    }
+
+    if (preg_match('/^(https?:)?\/\//i', $url) === 1 || stripos($url, 'data:') === 0) {
+        return $url;
+    }
+
+    return '../' . ltrim($url, '/');
+}
+
+function normalizeBannerInputUrl(string $value): ?string
+{
+    $url = trim($value);
+    if ($url === '') {
+        return null;
+    }
+
+    $url = str_replace('\\', '/', $url);
+
+    if (preg_match('/^www\./i', $url) === 1) {
+        $url = 'https://' . $url;
+    }
+
+    if (filter_var($url, FILTER_VALIDATE_URL)) {
+        return $url;
+    }
+
+    if (preg_match('#^(\.\./)?/?uploads/#i', $url) === 1) {
+        return preg_replace('#^(\.\./)?/?#', '', $url);
+    }
+
+    return null;
 }
 
 function ensureEventFinancialAdjustmentsSchema(PDO $pdo): void
@@ -128,8 +245,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $title = trim($_POST['title'] ?? '');
         $eventDate = trim($_POST['event_date'] ?? '');
         $venue = trim($_POST['venue'] ?? '');
+        $category = trim($_POST['category'] ?? '');
+        $city = trim($_POST['city'] ?? '');
+        $eventType = strtolower(trim((string)($_POST['event_type'] ?? 'in_person')));
+        $imageUrl = trim($_POST['image_url'] ?? '');
         $budgetTotal = trim($_POST['budget_total'] ?? '');
         $ticketPrice = trim($_POST['ticket_price'] ?? '0.00');
+        $ticketsAvailable = trim($_POST['tickets_available'] ?? '200');
         $expectedAttendees = trim($_POST['expected_attendees'] ?? '0');
         $vendorContributionTarget = trim($_POST['vendor_contribution_target'] ?? '0.00');
         $budgetItemNames = $_POST['budget_item_name'] ?? [];
@@ -179,6 +301,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $flashError = 'Ticket price must be a valid non-negative amount.';
         }
 
+        if ($flashError === '' && !in_array($eventType, ['in_person', 'online'], true)) {
+            $flashError = 'Choose a valid event type.';
+        }
+
+        if ($flashError === '' && strlen($category) > 64) {
+            $flashError = 'Category must be 64 characters or fewer.';
+        }
+
+        if ($flashError === '' && strlen($city) > 120) {
+            $flashError = 'City must be 120 characters or fewer.';
+        }
+
+        if ($flashError === '' && ($ticketsAvailable === '' || !ctype_digit($ticketsAvailable) || (int)$ticketsAvailable < 0)) {
+            $flashError = 'Tickets available must be a valid non-negative whole number.';
+        }
+
         if ($flashError === '' && ($expectedAttendees === '' || !is_numeric($expectedAttendees) || (int)$expectedAttendees < 0)) {
             $flashError = 'Expected attendees must be a valid non-negative whole number.';
         }
@@ -187,30 +325,53 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $flashError = 'Vendor contribution target must be a valid non-negative amount.';
         }
 
+        if ($flashError === '' && $imageUrl !== '') {
+            $normalized = normalizeBannerInputUrl($imageUrl);
+            if ($normalized === null) {
+                $flashError = 'Banner URL must be a valid URL or an uploads path.';
+            } else {
+                $imageUrl = $normalized;
+            }
+        }
+
+        $uploadedBannerPath = null;
+        if ($flashError === '' && isset($_FILES['banner_file']) && is_array($_FILES['banner_file'])) {
+            $uploadedBannerPath = storeEventBannerUpload($_FILES['banner_file'], $flashError);
+        }
+
         $budgetTotalFloat = (float)$budgetTotal;
         $ticketPriceFloat = (float)$ticketPrice;
+        $ticketsAvailableInt = max(0, (int)$ticketsAvailable);
         $expectedAttendeesInt = max(0, (int)$expectedAttendees);
         $vendorContributionTargetFloat = (float)$vendorContributionTarget;
         $attendeeContributionTarget = $ticketPriceFloat * $expectedAttendeesInt;
+        $finalImageUrl = $uploadedBannerPath ?? ($imageUrl !== '' ? $imageUrl : null);
 
         if ($flashError === '' && $plannedCommitted > $budgetTotalFloat) {
             $flashError = 'Planned budget items exceed the total budget. Reduce item amounts or increase budget.';
-        } else {
+        }
+
+        if ($flashError === '') {
             try {
                 $pdo->beginTransaction();
 
                 $stmt = $pdo->prepare(
-                    'INSERT INTO events (planner_id, title, event_date, venue, budget_total, budget_committed, ticket_price, ticket_revenue, attendee_contribution_target, vendor_contribution_target)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)'
+                    'INSERT INTO events (planner_id, title, category, event_date, venue, city, event_type, image_url, budget_total, budget_committed, ticket_price, tickets_available, ticket_revenue, attendee_contribution_target, vendor_contribution_target)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)'
                 );
                 $stmt->execute([
                     $_SESSION['user_id'],
                     $title,
+                    $category !== '' ? $category : null,
                     $eventDate,
                     $venue !== '' ? $venue : null,
+                    $city !== '' ? $city : null,
+                    $eventType,
+                    $finalImageUrl,
                     $budgetTotalFloat,
                     $plannedCommitted,
                     $ticketPriceFloat,
+                    $ticketsAvailableInt,
                     $attendeeContributionTarget,
                     $vendorContributionTargetFloat,
                 ]);
@@ -239,8 +400,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'title' => $title,
                         'event_date' => $eventDate,
                         'venue' => $venue,
+                        'category' => $category,
+                        'city' => $city,
+                        'event_type' => $eventType,
+                        'image_url' => $finalImageUrl,
                         'budget_total' => $budgetTotalFloat,
                         'budget_committed' => $plannedCommitted,
+                        'tickets_available' => $ticketsAvailableInt,
                         'planned_item_count' => count($plannedItems),
                         'attendee_contribution_target' => $attendeeContributionTarget,
                         'vendor_contribution_target' => $vendorContributionTargetFloat,
@@ -264,6 +430,58 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $pdo->rollBack();
                 }
                 $flashError = 'Could not create event right now. Please try again.';
+            }
+        }
+    } elseif (isset($_POST['update_event_banner'])) {
+        $updateEventId = filter_input(INPUT_POST, 'event_id', FILTER_VALIDATE_INT);
+        $newBannerUrl = trim((string)($_POST['image_url'] ?? ''));
+
+        if (!$updateEventId) {
+            $flashError = 'Invalid event selected for banner update.';
+        } else {
+            try {
+                $uploadedBannerPath = null;
+                if (isset($_FILES['banner_file']) && is_array($_FILES['banner_file'])) {
+                    $uploadedBannerPath = storeEventBannerUpload($_FILES['banner_file'], $flashError);
+                }
+
+                if ($flashError === '' && $newBannerUrl !== '') {
+                    $normalized = normalizeBannerInputUrl($newBannerUrl);
+                    if ($normalized === null) {
+                        $flashError = 'Banner URL must be a valid URL or an uploads path.';
+                    } else {
+                        $newBannerUrl = $normalized;
+                    }
+                }
+
+                if ($flashError === '' && $uploadedBannerPath === null && $newBannerUrl === '') {
+                    $flashError = 'Provide a banner URL or upload a banner file.';
+                }
+
+                if ($flashError === '') {
+                    $finalBanner = $uploadedBannerPath ?? $newBannerUrl;
+                    $stmt = $pdo->prepare('UPDATE events SET image_url = ? WHERE event_id = ? AND planner_id = ? LIMIT 1');
+                    $stmt->execute([$finalBanner, $updateEventId, $_SESSION['user_id']]);
+
+                    if ($stmt->rowCount() > 0) {
+                        audit_log(
+                            $pdo,
+                            (int)$_SESSION['user_id'],
+                            (string)$_SESSION['role'],
+                            'event.banner_update',
+                            'event',
+                            (string)$updateEventId,
+                            ['image_url' => $finalBanner]
+                        );
+                        $_SESSION['flash_success'] = 'Event banner updated successfully.';
+                        header('Location: create_event.php?event_view=' . urlencode($eventView) . '#event-views-anchor');
+                        exit;
+                    }
+
+                    $flashError = 'Event not found or you do not have permission to update banner.';
+                }
+            } catch (Throwable $e) {
+                $flashError = 'Could not update event banner right now. Please try again.';
             }
         }
     } elseif (isset($_POST['delete_event'])) {
@@ -594,9 +812,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 try {
     $stmt = $pdo->prepare(
         "SELECT e.event_id, e.title, e.event_date, e.budget_total, e.budget_committed, e.ticket_revenue,
+            e.ticket_price, COALESCE(e.tickets_available, 200) AS tickets_available,
+            COALESCE(e.category, '') AS category,
+            COALESCE(e.venue, '') AS venue,
+            COALESCE(e.city, '') AS city,
+            COALESCE(e.event_type, 'in_person') AS event_type,
+            COALESCE(e.image_url, '') AS image_url,
+                COUNT(DISTINCT a.attendance_id) AS attendee_count,
                 COALESCE(adj_cash.total_cash_available, 0) AS manual_cash_available,
                 COALESCE(adj_sponsor.total_sponsorship_received, 0) AS sponsorship_received
          FROM events e
+         LEFT JOIN attendances a ON a.event_id = e.event_id AND a.status IN ('registered', 'attended')
          LEFT JOIN (
              SELECT event_id, SUM(amount) AS total_cash_available
              FROM event_financial_adjustments
@@ -609,12 +835,13 @@ try {
              GROUP BY event_id
          ) adj_sponsor ON adj_sponsor.event_id = e.event_id
          WHERE e.planner_id = ? AND e.archived_at IS NULL
+         GROUP BY e.event_id, e.title, e.event_date, e.budget_total, e.budget_committed, e.ticket_revenue, e.ticket_price, e.tickets_available, e.category, e.venue, e.city, e.event_type, e.image_url, adj_cash.total_cash_available, adj_sponsor.total_sponsorship_received
          ORDER BY e.event_date DESC"
     );
     $stmt->execute([$_SESSION['user_id']]);
     $events = $stmt->fetchAll();
 
-    $stmt = $pdo->prepare('SELECT event_id, title, event_date, budget_total, archived_at FROM events WHERE planner_id = ? AND archived_at IS NOT NULL ORDER BY archived_at DESC');
+    $stmt = $pdo->prepare('SELECT event_id, title, event_date, budget_total, COALESCE(category, "") AS category, COALESCE(venue, "") AS venue, COALESCE(city, "") AS city, COALESCE(event_type, "in_person") AS event_type, COALESCE(tickets_available, 200) AS tickets_available, COALESCE(image_url, "") AS image_url, archived_at FROM events WHERE planner_id = ? AND archived_at IS NOT NULL ORDER BY archived_at DESC');
     $stmt->execute([$_SESSION['user_id']]);
     $archivedEvents = $stmt->fetchAll();
 
@@ -786,7 +1013,7 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
         .form-group { display: flex; flex-direction: column; gap: 6px; }
         .form-group label { font-size: 0.85rem; font-weight: 600; color: #4B5563; }
         .form-input, .form-select { width: 100%; border: 1.5px solid #E0E0E0; border-radius: 10px; padding: 12px 14px; font-size: 0.95rem; transition: 0.2s; background: #FAFAFA; }
-        .form-input:focus { outline: none; border-color: #6C63FF; background: #fff; }
+        .form-input:focus, .form-select:focus { outline: none; border-color: #6C63FF; background: #fff; }
         .btn { background: #6C63FF; color: #fff; border: none; border-radius: 10px; padding: 12px 24px; font-size: 0.95rem; font-weight: 600; cursor: pointer; transition: 0.2s; display: inline-flex; align-items: center; gap: 8px; }
         .btn:hover { background: #5A52E0; }
         .btn-outline { background: transparent; color: #6C63FF; border: 2px solid #6C63FF; }
@@ -909,7 +1136,7 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
     <!-- Create Event Form -->
     <section class="card">
         <h2 class="card-title"><i class="fa-solid fa-plus-circle" style="color:#6C63FF;"></i> Create New Event</h2>
-        <form method="POST" class="form-grid">
+        <form method="POST" class="form-grid" enctype="multipart/form-data">
             <?php echo csrf_input(); ?>
             <input type="hidden" name="create_event" value="1">
             <div class="form-group">
@@ -925,12 +1152,39 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                 <input type="text" id="venue" name="venue" class="form-input" placeholder="e.g., Sarit Expo Centre" value="<?php echo htmlspecialchars($venue); ?>">
             </div>
             <div class="form-group">
+                <label for="category">Category</label>
+                <input type="text" id="category" name="category" class="form-input" maxlength="64" placeholder="e.g., Conference, Wedding, Music" value="<?php echo htmlspecialchars($category); ?>">
+            </div>
+            <div class="form-group">
+                <label for="city">City</label>
+                <input type="text" id="city" name="city" class="form-input" maxlength="120" placeholder="e.g., Nairobi" value="<?php echo htmlspecialchars($city); ?>">
+            </div>
+            <div class="form-group">
+                <label for="event_type">Event Type</label>
+                <select id="event_type" name="event_type" class="form-select">
+                    <option value="in_person" <?php echo $eventType === 'in_person' ? 'selected' : ''; ?>>In-person</option>
+                    <option value="online" <?php echo $eventType === 'online' ? 'selected' : ''; ?>>Online</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="image_url">Banner Image URL</label>
+                <input type="url" id="image_url" name="image_url" class="form-input" placeholder="https://example.com/banner.jpg" value="<?php echo htmlspecialchars($imageUrl); ?>">
+            </div>
+            <div class="form-group">
+                <label for="banner_file">Or Upload Banner</label>
+                <input type="file" id="banner_file" name="banner_file" class="form-input" accept=".jpg,.jpeg,.png,.webp,.gif">
+            </div>
+            <div class="form-group">
                 <label for="budget_total">Budget (KES)</label>
                 <input type="number" id="budget_total" name="budget_total" step="0.01" min="0" class="form-input" placeholder="15000" value="<?php echo htmlspecialchars($budgetTotal); ?>" required>
             </div>
             <div class="form-group">
                 <label for="ticket_price">Ticket Price (KES) <small>(per attendee)</small></label>
                 <input type="number" step="0.01" min="0" id="ticket_price" name="ticket_price" class="form-input" placeholder="0.00" value="<?php echo htmlspecialchars($ticketPrice ?? '0.00'); ?>">
+            </div>
+            <div class="form-group">
+                <label for="tickets_available">Tickets Available</label>
+                <input type="number" step="1" min="0" id="tickets_available" name="tickets_available" class="form-input" placeholder="200" value="<?php echo htmlspecialchars($ticketsAvailable ?? '200'); ?>">
             </div>
             <div class="form-group">
                 <label for="expected_attendees">Expected Attendees</label>
@@ -1055,8 +1309,18 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                         <div class="event-header" onclick="this.parentElement.classList.toggle('open')">
                             <div>
                                 <div class="event-title"><?php echo htmlspecialchars($event['title']); ?></div>
-                                <div class="event-date"><?php echo htmlspecialchars($event['event_date']); ?></div>
+                                <div class="event-date">
+                                    <?php echo htmlspecialchars($event['event_date']); ?>
+                                    <?php if ((string)($event['venue'] ?? '') !== ''): ?>
+                                        &middot; <?php echo htmlspecialchars((string)$event['venue']); ?>
+                                    <?php endif; ?>
+                                    <?php if ((string)($event['city'] ?? '') !== ''): ?>
+                                        &middot; <?php echo htmlspecialchars((string)$event['city']); ?>
+                                    <?php endif; ?>
+                                </div>
                                 <div class="event-chips">
+                                    <?php if ((string)($event['category'] ?? '') !== ''): ?><span class="chip chip-info"><?php echo htmlspecialchars((string)$event['category']); ?></span><?php endif; ?>
+                                    <span class="chip chip-info"><?php echo ((string)($event['event_type'] ?? 'in_person') === 'online') ? 'Online' : 'In-person'; ?></span>
                                     <?php if ($isBudgetOverrun): ?><span class="chip chip-risk">Budget Overrun</span><?php endif; ?>
                                     <?php if ((int)$ops['failed_payments'] > 0): ?><span class="chip chip-risk">Failed Payments: <?php echo (int)$ops['failed_payments']; ?></span><?php endif; ?>
                                     <?php if ((int)$ops['pending_payments'] > 0): ?><span class="chip chip-warn">Pending Payments: <?php echo (int)$ops['pending_payments']; ?></span><?php endif; ?>
@@ -1072,6 +1336,16 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                         </div>
                         <div class="event-details">
                             <div class="detail-row">
+                                <?php $eventBannerUrl = resolveEventBannerUrl((string)($event['image_url'] ?? '')); ?>
+                                <?php if ($eventBannerUrl !== ''): ?>
+                                    <span style="grid-column: 1 / -1;"><img src="<?php echo htmlspecialchars($eventBannerUrl); ?>" alt="Event banner" style="max-width: 100%; max-height: 160px; border-radius: 8px; object-fit: cover;"></span>
+                                <?php endif; ?>
+                                <span><span class="detail-label">Category:</span> <?php echo htmlspecialchars((string)(($event['category'] ?? '') !== '' ? $event['category'] : 'Uncategorized')); ?></span>
+                                <span><span class="detail-label">Venue:</span> <?php echo htmlspecialchars((string)(($event['venue'] ?? '') !== '' ? $event['venue'] : 'Not specified')); ?></span>
+                                <span><span class="detail-label">City:</span> <?php echo htmlspecialchars((string)(($event['city'] ?? '') !== '' ? $event['city'] : 'Not specified')); ?></span>
+                                <span><span class="detail-label">Type:</span> <?php echo ((string)($event['event_type'] ?? 'in_person') === 'online') ? 'Online' : 'In-person'; ?></span>
+                                <span><span class="detail-label">Ticket Price:</span> <?php echo ((float)$event['ticket_price'] <= 0) ? 'Free' : ('KES ' . number_format((float)$event['ticket_price'], 2)); ?></span>
+                                <span><span class="detail-label">Ticket Capacity:</span> <?php echo (int)$event['attendee_count']; ?> / <?php echo (int)$event['tickets_available']; ?></span>
                                 <span><span class="detail-label">Budget Plan:</span> KES <?php echo number_format($event['budget_total'], 2); ?></span>
                                 <span><span class="detail-label">Planned Spend:</span> KES <?php echo number_format($event['budget_committed'], 2); ?></span>
                                 <span><span class="detail-label">Money Spent:</span> KES <?php echo number_format($committedPaid, 2); ?></span>
@@ -1085,6 +1359,17 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                                 <span><span class="detail-label">Pending Payments:</span> <?php echo (int)$ops['pending_payments']; ?></span>
                             </div>
                             <div class="event-actions-grid">
+                                <div class="event-action-row">
+                                    <form method="POST" enctype="multipart/form-data" class="event-action-row" style="width:100%;">
+                                        <?php echo csrf_input(); ?>
+                                        <input type="hidden" name="update_event_banner" value="1">
+                                        <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
+                                        <input type="url" name="image_url" class="form-input" placeholder="Banner URL" value="<?php echo htmlspecialchars((string)($event['image_url'] ?? '')); ?>">
+                                        <input type="file" name="banner_file" class="form-input" accept=".jpg,.jpeg,.png,.webp,.gif">
+                                        <button type="submit" class="btn btn-outline"><i class="fa-regular fa-image"></i> Save Banner</button>
+                                    </form>
+                                </div>
+
                                 <div class="event-action-row">
                                     <a href="browse_vendors.php?event_id=<?php echo $event['event_id']; ?>" class="btn btn-outline">
                                         <i class="fa-solid fa-magnifying-glass"></i> Browse Vendors for This Event
@@ -1181,8 +1466,17 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                 <?php foreach ($archivedEvents as $event): ?>
                     <div class="event-item" style="padding: 14px 0;">
                         <div class="detail-row">
+                            <?php $eventBannerUrl = resolveEventBannerUrl((string)($event['image_url'] ?? '')); ?>
+                            <?php if ($eventBannerUrl !== ''): ?>
+                                <span style="grid-column: 1 / -1;"><img src="<?php echo htmlspecialchars($eventBannerUrl); ?>" alt="Event banner" style="max-width: 100%; max-height: 160px; border-radius: 8px; object-fit: cover;"></span>
+                            <?php endif; ?>
                             <span><span class="detail-label">Title:</span> <?php echo htmlspecialchars((string)$event['title']); ?></span>
                             <span><span class="detail-label">Date:</span> <?php echo htmlspecialchars((string)$event['event_date']); ?></span>
+                            <span><span class="detail-label">Category:</span> <?php echo htmlspecialchars((string)(($event['category'] ?? '') !== '' ? $event['category'] : 'Uncategorized')); ?></span>
+                            <span><span class="detail-label">Venue:</span> <?php echo htmlspecialchars((string)(($event['venue'] ?? '') !== '' ? $event['venue'] : 'Not specified')); ?></span>
+                            <span><span class="detail-label">City:</span> <?php echo htmlspecialchars((string)(($event['city'] ?? '') !== '' ? $event['city'] : 'Not specified')); ?></span>
+                            <span><span class="detail-label">Type:</span> <?php echo ((string)($event['event_type'] ?? 'in_person') === 'online') ? 'Online' : 'In-person'; ?></span>
+                            <span><span class="detail-label">Ticket Capacity:</span> <?php echo (int)$event['tickets_available']; ?></span>
                             <span><span class="detail-label">Budget:</span> KES <?php echo number_format((float)$event['budget_total'], 2); ?></span>
                             <span><span class="detail-label">Archived At:</span> <?php echo htmlspecialchars((string)$event['archived_at']); ?></span>
                         </div>

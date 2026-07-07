@@ -20,6 +20,9 @@ $stats = [
 ];
 $priorityRows = [];
 $darajaConfigured = daraja_is_configured();
+$darajaMissingFields = daraja_missing_required_fields();
+$darajaStkConfigured = daraja_is_stk_configured();
+$darajaMissingStkFields = daraja_missing_stk_fields();
 
 try {
     $stmt = $pdo->prepare(
@@ -80,22 +83,23 @@ try {
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-        body { background: #F5F5F5; color: #2D2D2D; min-height: 100vh; }
+        body { background: #f4f5fb; color: #2D2D2D; min-height: 100vh; }
         .header { background: #6C63FF; color: #fff; padding: 14px 24px; display: flex; justify-content: space-between; align-items: center; }
         .brand { font-size: 22px; font-weight: 700; }
         .logout-btn { background: rgba(255,255,255,0.22); color: #fff; text-decoration: none; border-radius: 6px; padding: 7px 14px; font-size: 13px; }
         .container { max-width: 1150px; margin: 0 auto; padding: 20px; }
         .links { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
-        .link-btn { text-decoration: none; background: #ece9ff; color: #3b3496; border-radius: 6px; padding: 8px 12px; font-size: 13px; }
+        .link-btn { text-decoration: none; background: #ece9ff; color: #3b3496; border-radius: 10px; border: 1px solid #d8d4ff; padding: 8px 12px; font-size: 13px; }
         .message { border-radius: 6px; padding: 10px 12px; margin-bottom: 14px; font-size: 13px; }
         .message-success { background: #ecfff0; color: #1c7a36; border: 1px solid #c9f0d4; }
         .message-error { background: #ffecec; color: #9d2020; border: 1px solid #f6caca; }
+        .message-info { background:#eef3ff; color:#2c4ea0; border:1px solid #d9e4ff; }
         .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 18px; }
-        .stat { background: #fff; border-radius: 10px; border: 1px solid #ededed; padding: 14px; }
+        .stat { background: #fff; border-radius: 12px; border: 1px solid #ece9ff; padding: 14px; }
         .stat-value { font-size: 23px; font-weight: 700; color: #6C63FF; }
         .stat-label { font-size: 12px; color: #777; margin-top: 4px; }
         .ops-note { background: #eef3ff; color: #2c4ea0; border: 1px solid #d9e4ff; border-radius: 8px; padding: 10px 12px; font-size: 13px; margin-bottom: 14px; }
-        .card { background: #fff; border-radius: 8px; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
+        .card { background: #fff; border-radius: 12px; border: 1px solid #ece9ff; padding: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
         .title { font-size: 18px; font-weight: 700; margin-bottom: 12px; }
         .priority-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
         .priority-item { border: 1px solid #ececec; border-radius: 8px; padding: 10px; background: #fafafa; }
@@ -110,7 +114,7 @@ try {
         .badge-paid { background: #e8f9ef; color: #1c7a36; }
         .badge-pending { background: #fff4df; color: #a36500; }
         .badge-failed { background: #ffe8e8; color: #a22b2b; }
-        .btn { text-decoration: none; background: #6C63FF; color: #fff; border-radius: 6px; padding: 7px 10px; font-size: 12px; display: inline-block; }
+        .btn { text-decoration: none; background: #6C63FF; color: #fff; border-radius: 10px; padding: 7px 10px; font-size: 12px; display: inline-block; }
         .empty { color: #777; font-size: 14px; padding: 10px 0; }
         @media (max-width: 960px) { .stats { grid-template-columns: 1fr 1fr; } }
         @media (max-width: 560px) { .stats { grid-template-columns: 1fr; } }
@@ -133,8 +137,10 @@ try {
     <?php if ($flashSuccess !== ''): ?><div class="message message-success"><?php echo htmlspecialchars($flashSuccess); ?></div><?php endif; ?>
     <?php if ($flashError !== ''): ?><div class="message message-error"><?php echo htmlspecialchars($flashError); ?></div><?php endif; ?>
 
-    <?php if (!$darajaConfigured): ?>
-        <div class="message message-error">Daraja is not configured yet. Set DARAJA_CONSUMER_KEY, DARAJA_CONSUMER_SECRET, DARAJA_SHORTCODE, DARAJA_PASSKEY, and DARAJA_CALLBACK_URL (for example: https://your-domain/admin/mpesa_callback.php).</div>
+    <?php if (!$darajaStkConfigured): ?>
+        <div class="message message-info">STK push is unavailable (missing: <?php echo htmlspecialchars(implode(', ', $darajaMissingStkFields)); ?>). Manual payment updates and reconciliation are still active.</div>
+    <?php elseif (!$darajaConfigured): ?>
+        <div class="message message-error">Daraja is not fully configured. Missing: <?php echo htmlspecialchars(implode(', ', $darajaMissingFields)); ?>.</div>
     <?php endif; ?>
 
     <div class="ops-note"><i class="fa-solid fa-shield-halved"></i> Security hardening options: set DARAJA_CALLBACK_TOKEN and include it in callback URL/query or X-Daraja-Callback-Token header, and optionally restrict callback origins with DARAJA_CALLBACK_ALLOWED_IPS.</div>

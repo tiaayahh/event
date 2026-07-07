@@ -41,17 +41,24 @@ CREATE TABLE IF NOT EXISTS events (
     event_id INT AUTO_INCREMENT PRIMARY KEY,
     planner_id INT NOT NULL,
     title VARCHAR(190) NOT NULL,
+    category VARCHAR(64) DEFAULT NULL,
     event_date DATE NOT NULL,
     venue VARCHAR(190) DEFAULT NULL,
+    city VARCHAR(120) DEFAULT NULL,
+    event_type ENUM('in_person','online') NOT NULL DEFAULT 'in_person',
+    image_url VARCHAR(500) DEFAULT NULL,
     budget_total DECIMAL(12,2) NOT NULL DEFAULT 0.00,
     budget_committed DECIMAL(12,2) NOT NULL DEFAULT 0.00,
     ticket_price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    tickets_available INT NOT NULL DEFAULT 200,
     ticket_revenue DECIMAL(10,2) NOT NULL DEFAULT 0.00,
     attendee_contribution_target DECIMAL(12,2) NOT NULL DEFAULT 0.00,
     vendor_contribution_target DECIMAL(12,2) NOT NULL DEFAULT 0.00,
     vendor_fee_amount DECIMAL(10,2) NOT NULL DEFAULT 100.00,
+    archived_at DATETIME NULL DEFAULT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_events_planner_date (planner_id, event_date),
+    INDEX idx_events_archived_at (archived_at),
     CONSTRAINT fk_events_planner FOREIGN KEY (planner_id) REFERENCES users(user_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -164,6 +171,55 @@ CREATE TABLE IF NOT EXISTS messages (
     INDEX idx_conversation (planner_user_id, vendor_user_id, created_at),
     CONSTRAINT fk_messages_planner FOREIGN KEY (planner_user_id) REFERENCES users(user_id) ON DELETE CASCADE,
     CONSTRAINT fk_messages_vendor_user FOREIGN KEY (vendor_user_id) REFERENCES users(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS attendee_messages (
+    message_id INT AUTO_INCREMENT PRIMARY KEY,
+    planner_user_id INT NOT NULL,
+    attendee_user_id INT NOT NULL,
+    sender_role ENUM('planner','attendee') NOT NULL,
+    message_text TEXT NOT NULL,
+    message_kind ENUM('direct','announcement') NOT NULL DEFAULT 'direct',
+    attachment_name VARCHAR(255) DEFAULT NULL,
+    attachment_path VARCHAR(500) DEFAULT NULL,
+    is_read TINYINT(1) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_attendee_conversation (planner_user_id, attendee_user_id, created_at),
+    INDEX idx_attendee_recipient_unread (attendee_user_id, is_read, sender_role),
+    INDEX idx_attendee_planner_recipient (planner_user_id, attendee_user_id),
+    CONSTRAINT fk_attendee_messages_planner FOREIGN KEY (planner_user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    CONSTRAINT fk_attendee_messages_attendee_user FOREIGN KEY (attendee_user_id) REFERENCES users(user_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS attendee_ticket_payments (
+    payment_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_id INT NOT NULL,
+    attendee_id INT NOT NULL,
+    checkout_request_id VARCHAR(120) DEFAULT NULL,
+    merchant_request_id VARCHAR(120) DEFAULT NULL,
+    phone_number VARCHAR(20) DEFAULT NULL,
+    mpesa_code VARCHAR(64) DEFAULT NULL,
+    amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    status ENUM('requested', 'paid', 'failed') NOT NULL DEFAULT 'requested',
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_attendee_ticket_payment (event_id, attendee_id),
+    INDEX idx_attendee_ticket_payment_event_status (event_id, status),
+    INDEX idx_attendee_ticket_payment_attendee (attendee_id),
+    CONSTRAINT fk_attendee_ticket_payment_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
+    CONSTRAINT fk_attendee_ticket_payment_attendee FOREIGN KEY (attendee_id) REFERENCES attendees(attendee_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS attendee_saved_events (
+    save_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    attendee_id INT NOT NULL,
+    event_id INT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_attendee_saved_event (attendee_id, event_id),
+    INDEX idx_attendee_saved_events_attendee (attendee_id),
+    INDEX idx_attendee_saved_events_event (event_id),
+    CONSTRAINT fk_attendee_saved_events_attendee FOREIGN KEY (attendee_id) REFERENCES attendees(attendee_id) ON DELETE CASCADE,
+    CONSTRAINT fk_attendee_saved_events_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS vendor_notification_state (

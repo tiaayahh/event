@@ -5,11 +5,13 @@ if (!function_exists('daraja_config')) {
     {
         $env = strtolower((string)(getenv('DARAJA_ENV') ?: 'sandbox'));
         $isLive = $env === 'live';
+        $consumerKey = trim((string)(getenv('DARAJA_CONSUMER_KEY') ?: getenv('DARAJA_CUSTOMER_KEY') ?: ''));
+        $consumerSecret = trim((string)(getenv('DARAJA_CONSUMER_SECRET') ?: getenv('DARAJA_CUSTOMER_SECRET') ?: ''));
 
         return [
             'env' => $env,
-            'consumer_key' => trim((string)(getenv('DARAJA_CONSUMER_KEY') ?: '')),
-            'consumer_secret' => trim((string)(getenv('DARAJA_CONSUMER_SECRET') ?: '')),
+            'consumer_key' => $consumerKey,
+            'consumer_secret' => $consumerSecret,
             'shortcode' => trim((string)(getenv('DARAJA_SHORTCODE') ?: '')),
             'passkey' => trim((string)(getenv('DARAJA_PASSKEY') ?: '')),
             'callback_url' => trim((string)(getenv('DARAJA_CALLBACK_URL') ?: '')),
@@ -26,13 +28,57 @@ if (!function_exists('daraja_config')) {
 if (!function_exists('daraja_is_configured')) {
     function daraja_is_configured(): bool
     {
-        $cfg = daraja_config();
+        return count(daraja_missing_required_fields()) === 0;
+    }
+}
 
-        return $cfg['consumer_key'] !== ''
-            && $cfg['consumer_secret'] !== ''
-            && $cfg['shortcode'] !== ''
-            && $cfg['passkey'] !== ''
-            && $cfg['callback_url'] !== '';
+if (!function_exists('daraja_missing_required_fields')) {
+    function daraja_missing_required_fields(): array
+    {
+        $cfg = daraja_config();
+        $required = [
+            'consumer_key' => 'DARAJA_CONSUMER_KEY',
+            'consumer_secret' => 'DARAJA_CONSUMER_SECRET',
+            'shortcode' => 'DARAJA_SHORTCODE',
+            'passkey' => 'DARAJA_PASSKEY',
+            'callback_url' => 'DARAJA_CALLBACK_URL',
+        ];
+
+        $missing = [];
+        foreach ($required as $key => $envName) {
+            if (trim((string)($cfg[$key] ?? '')) === '') {
+                $missing[] = $envName;
+            }
+        }
+
+        return $missing;
+    }
+}
+
+if (!function_exists('daraja_missing_stk_fields')) {
+    function daraja_missing_stk_fields(): array
+    {
+        $cfg = daraja_config();
+        $required = [
+            'shortcode' => 'DARAJA_SHORTCODE',
+            'passkey' => 'DARAJA_PASSKEY',
+        ];
+
+        $missing = [];
+        foreach ($required as $key => $envName) {
+            if (trim((string)($cfg[$key] ?? '')) === '') {
+                $missing[] = $envName;
+            }
+        }
+
+        return $missing;
+    }
+}
+
+if (!function_exists('daraja_is_stk_configured')) {
+    function daraja_is_stk_configured(): bool
+    {
+        return count(daraja_missing_stk_fields()) === 0;
     }
 }
 

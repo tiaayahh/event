@@ -23,6 +23,20 @@ $flashSuccess = $_SESSION['flash_success'] ?? '';
 $flashError = $_SESSION['flash_error'] ?? '';
 unset($_SESSION['flash_success'], $_SESSION['flash_error']);
 
+function resolveEventImageUrl(?string $rawUrl): string
+{
+    $url = trim((string)$rawUrl);
+    if ($url === '') {
+        return '';
+    }
+
+    if (preg_match('/^(https?:)?\/\//i', $url) === 1 || stripos($url, 'data:') === 0) {
+        return $url;
+    }
+
+    return '../' . ltrim($url, '/');
+}
+
 try {
     $stmt = $pdo->prepare('SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1');
     $stmt->execute([$_SESSION['user_id']]);
@@ -117,7 +131,7 @@ try {
         $services = $stmt->fetchAll();
 
         $stmt = $pdo->prepare(
-            "SELECT b.booking_id, e.title AS event_title, e.event_date, s.name AS service_name, b.status, b.created_at
+            "SELECT b.booking_id, e.title AS event_title, e.event_date, COALESCE(e.image_url, '') AS image_url, s.name AS service_name, b.status, b.created_at
             FROM bookings b
             JOIN events e ON b.event_id = e.event_id
             JOIN services s ON b.service_id = s.service_id
@@ -190,6 +204,7 @@ try {
                 e.event_id,
                 e.title,
                 e.event_date,
+                COALESCE(e.image_url, '') AS image_url,
                 COUNT(DISTINCT b.booking_id) AS booking_count,
                 SUM(CASE WHEN b.status = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_count
              FROM bookings b
@@ -199,7 +214,7 @@ try {
                AND e.archived_at IS NULL
                AND e.event_date >= CURDATE()
                AND b.status IN ('pending', 'confirmed')
-             GROUP BY e.event_id, e.title, e.event_date
+               GROUP BY e.event_id, e.title, e.event_date, e.image_url
              ORDER BY e.event_date ASC"
         );
         $stmt->execute([$vendorId]);
@@ -604,6 +619,22 @@ try {
             color: #666;
             margin-top: 3px;
         }
+
+        .event-item-main {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .event-thumb {
+            width: 56px;
+            height: 56px;
+            border-radius: 8px;
+            background: linear-gradient(135deg, #ece9ff, #d6d0ff);
+            background-size: cover;
+            background-position: center;
+            flex-shrink: 0;
+        }
     </style>
 </head>
 <body>
@@ -737,10 +768,14 @@ try {
                 </div>
             <?php else: ?>
                 <?php foreach ($upcomingEvents as $upcoming): ?>
+                    <?php $upcomingImage = resolveEventImageUrl((string)($upcoming['image_url'] ?? '')); ?>
                     <div class="event-list-item">
-                        <div>
-                            <div class="service-name"><?php echo htmlspecialchars((string)$upcoming['title']); ?></div>
-                            <div class="event-meta-small"><?php echo htmlspecialchars((string)$upcoming['event_date']); ?> &middot; Bookings: <?php echo (int)$upcoming['booking_count']; ?> &middot; Confirmed: <?php echo (int)$upcoming['confirmed_count']; ?></div>
+                        <div class="event-item-main">
+                            <div class="event-thumb"<?php if ($upcomingImage !== ''): ?> style="background-image:url('<?php echo htmlspecialchars($upcomingImage); ?>');"<?php endif; ?>></div>
+                            <div>
+                                <div class="service-name"><?php echo htmlspecialchars((string)$upcoming['title']); ?></div>
+                                <div class="event-meta-small"><?php echo htmlspecialchars((string)$upcoming['event_date']); ?> &middot; Bookings: <?php echo (int)$upcoming['booking_count']; ?> &middot; Confirmed: <?php echo (int)$upcoming['confirmed_count']; ?></div>
+                            </div>
                         </div>
                         <i class="fa-regular fa-calendar-check status-icon"></i>
                     </div>
@@ -757,15 +792,19 @@ try {
                 </div>
             <?php else: ?>
                 <?php foreach ($pendingBookings as $booking): ?>
+                    <?php $pendingImage = resolveEventImageUrl((string)($booking['image_url'] ?? '')); ?>
                     <div class="booking-item">
-                        <span>
-                            <?php
-                            echo htmlspecialchars($booking['event_title']) . ', ' .
-                                 htmlspecialchars($booking['service_name']) . ', ' .
-                                 htmlspecialchars($booking['event_date']) . ', ' .
-                                 htmlspecialchars(ucfirst($booking['status']));
-                            ?>
-                        </span>
+                        <div class="event-item-main">
+                            <div class="event-thumb"<?php if ($pendingImage !== ''): ?> style="background-image:url('<?php echo htmlspecialchars($pendingImage); ?>');"<?php endif; ?>></div>
+                            <span>
+                                <?php
+                                echo htmlspecialchars($booking['event_title']) . ', ' .
+                                     htmlspecialchars($booking['service_name']) . ', ' .
+                                     htmlspecialchars($booking['event_date']) . ', ' .
+                                     htmlspecialchars(ucfirst($booking['status']));
+                                ?>
+                            </span>
+                        </div>
                         <i class="fa-regular fa-hourglass-half status-icon"></i>
                     </div>
                 <?php endforeach; ?>

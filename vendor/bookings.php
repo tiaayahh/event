@@ -34,6 +34,20 @@ function ensureBookingDisplaySchema(PDO $pdo): void
     $ready = true;
 }
 
+function resolveEventImageUrl(?string $rawUrl): string
+{
+    $url = trim((string)$rawUrl);
+    if ($url === '') {
+        return '';
+    }
+
+    if (preg_match('/^(https?:)?\/\//i', $url) === 1 || stripos($url, 'data:') === 0) {
+        return $url;
+    }
+
+    return '../' . ltrim($url, '/');
+}
+
 try {
     $stmt = $pdo->prepare("SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1");
     $stmt->execute([$_SESSION['user_id']]);
@@ -174,6 +188,7 @@ try {
         $newPendingCount = (int)$stmt->fetchColumn();
 
         $sql = "SELECT b.booking_id, b.status AS booking_status, b.booked_price, b.platform_fee, b.booth_number,
+                    COALESCE(e.image_url, '') AS image_url,
                     e.title AS event_title, e.event_date, COALESCE(e.venue, '') AS event_venue, s.name AS service_name,
                     t.mpesa_code, COALESCE(t.status, 'pending') AS payment_status, COALESCE(t.amount, 0) AS paid_amount
                 FROM bookings b
@@ -277,10 +292,25 @@ try {
         .status-paid { color: #2ecc71; }
         .status-pending { color: #f39c12; }
         .status-partial { color: #d18a00; }
+        .status-failed { color: #e74c3c; }
         .message { border-radius: 6px; padding: 10px 12px; margin-bottom: 14px; font-size: 13px; }
         .message-success { background: #ecfff0; color: #1c7a36; border: 1px solid #c9f0d4; }
         .message-error { background: #ffecec; color: #9d2020; border: 1px solid #f6caca; }
         .booking-main { flex: 1; }
+        .booking-main-row {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+        }
+        .booking-thumb {
+            width: 62px;
+            height: 62px;
+            border-radius: 8px;
+            background: linear-gradient(135deg, #ece9ff, #d6d0ff);
+            background-size: cover;
+            background-position: center;
+            flex-shrink: 0;
+        }
         .booking-meta { color: #666; font-size: 12px; margin-top: 4px; }
         .booking-actions { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
         .action-btn { border: none; border-radius: 4px; padding: 6px 9px; font-size: 12px; cursor: pointer; text-decoration: none; display: inline-block; }
@@ -384,32 +414,38 @@ try {
                 <?php endif; ?>
             <?php else: ?>
                 <?php foreach ($bookings as $b): ?>
+                    <?php $bookingImage = resolveEventImageUrl((string)($b['image_url'] ?? '')); ?>
                     <div class="booking-row">
                         <div class="booking-main">
-                            <strong><?php echo htmlspecialchars($b['service_name']); ?></strong> &mdash;
-                            <?php echo htmlspecialchars($b['event_title']); ?> (<?php echo $b['event_date']; ?>)
-                            <span class="status-booking <?php echo htmlspecialchars((string)$b['booking_status']); ?>"><?php echo htmlspecialchars(ucfirst((string)$b['booking_status'])); ?></span>
-                            <div class="booking-meta">Venue: <?php echo htmlspecialchars((string)($b['event_venue'] !== '' ? $b['event_venue'] : 'Not specified')); ?></div>
-                            <div class="booking-meta">Booth Number: <?php echo htmlspecialchars((string)(($b['booth_number'] ?? '') !== '' ? $b['booth_number'] : 'Not assigned')); ?></div>
-                            <div class="booking-actions">
-                                <?php if (strtolower((string)$b['booking_status']) === 'pending'): ?>
-                                    <form method="POST" class="action-form">
-                                        <?php echo csrf_input(); ?>
-                                        <input type="hidden" name="booking_action" value="accept">
-                                        <input type="hidden" name="booking_id" value="<?php echo (int)$b['booking_id']; ?>">
-                                        <button class="action-btn accept-btn" type="submit">Accept Booking</button>
-                                    </form>
-                                <?php endif; ?>
-                                <?php if (in_array(strtolower((string)$b['booking_status']), ['pending', 'confirmed'], true)): ?>
-                                    <form method="POST" class="action-form" onsubmit="return confirm('Decline this booking?');">
-                                        <?php echo csrf_input(); ?>
-                                        <input type="hidden" name="booking_action" value="decline">
-                                        <input type="hidden" name="booking_id" value="<?php echo (int)$b['booking_id']; ?>">
-                                        <button class="action-btn decline-btn" type="submit">Decline Booking</button>
-                                    </form>
-                                <?php endif; ?>
-                                <a class="action-btn neutral-btn" href="event_details.php?booking_id=<?php echo (int)$b['booking_id']; ?>">View Event Details</a>
-                                <a class="action-btn neutral-btn" href="download_agreement.php?booking_id=<?php echo (int)$b['booking_id']; ?>">Download Agreement</a>
+                            <div class="booking-main-row">
+                                <div class="booking-thumb"<?php if ($bookingImage !== ''): ?> style="background-image:url('<?php echo htmlspecialchars($bookingImage); ?>');"<?php endif; ?>></div>
+                                <div>
+                                    <strong><?php echo htmlspecialchars($b['service_name']); ?></strong> &mdash;
+                                    <?php echo htmlspecialchars($b['event_title']); ?> (<?php echo $b['event_date']; ?>)
+                                    <span class="status-booking <?php echo htmlspecialchars((string)$b['booking_status']); ?>"><?php echo htmlspecialchars(ucfirst((string)$b['booking_status'])); ?></span>
+                                    <div class="booking-meta">Venue: <?php echo htmlspecialchars((string)($b['event_venue'] !== '' ? $b['event_venue'] : 'Not specified')); ?></div>
+                                    <div class="booking-meta">Booth Number: <?php echo htmlspecialchars((string)(($b['booth_number'] ?? '') !== '' ? $b['booth_number'] : 'Not assigned')); ?></div>
+                                    <div class="booking-actions">
+                                        <?php if (strtolower((string)$b['booking_status']) === 'pending'): ?>
+                                            <form method="POST" class="action-form">
+                                                <?php echo csrf_input(); ?>
+                                                <input type="hidden" name="booking_action" value="accept">
+                                                <input type="hidden" name="booking_id" value="<?php echo (int)$b['booking_id']; ?>">
+                                                <button class="action-btn accept-btn" type="submit">Accept Booking</button>
+                                            </form>
+                                        <?php endif; ?>
+                                        <?php if (in_array(strtolower((string)$b['booking_status']), ['pending', 'confirmed'], true)): ?>
+                                            <form method="POST" class="action-form" onsubmit="return confirm('Decline this booking?');">
+                                                <?php echo csrf_input(); ?>
+                                                <input type="hidden" name="booking_action" value="decline">
+                                                <input type="hidden" name="booking_id" value="<?php echo (int)$b['booking_id']; ?>">
+                                                <button class="action-btn decline-btn" type="submit">Decline Booking</button>
+                                            </form>
+                                        <?php endif; ?>
+                                        <a class="action-btn neutral-btn" href="event_details.php?booking_id=<?php echo (int)$b['booking_id']; ?>">View Event Details</a>
+                                        <a class="action-btn neutral-btn" href="download_agreement.php?booking_id=<?php echo (int)$b['booking_id']; ?>">Download Agreement</a>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                         <div>
@@ -429,7 +465,7 @@ try {
                                 $paymentClass = 'status-paid';
                             } elseif ($rawPaymentStatus === 'failed') {
                                 $displayPaymentStatus = 'Failed';
-                                $paymentClass = 'status-pending';
+                                $paymentClass = 'status-failed';
                             }
                             ?>
                             <span>KES <?php echo number_format($net, 2); ?> (amount payable)</span>
