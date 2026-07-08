@@ -160,7 +160,14 @@ function send_platform_email(string $to, string $toName, string $subject, string
 
         return ['success' => true, 'message' => 'Email sent successfully.'];
     } catch (Exception $e) {
-        error_log('Mailer error: ' . $e->getMessage());
-        return ['success' => false, 'message' => 'Unable to send email right now. Check SMTP settings and credentials.'];
+        $errorMessage = $e->getMessage();
+        error_log('Mailer error: ' . $errorMessage);
+
+        $userMessage = 'Unable to send email right now. Check SMTP settings and credentials.';
+        if (stripos($errorMessage, 'authenticate') !== false) {
+            $userMessage = 'SMTP authentication failed. If you use Gmail, set MAIL_PASSWORD to a Gmail App Password (16 characters), not your normal Gmail password.';
+        }
+
+        return ['success' => false, 'message' => $userMessage];
     }
 }

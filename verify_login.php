@@ -1,7 +1,44 @@
 <?php
 session_start();
+require_once 'config/db.php';
 require_once 'includes/csrf.php';
-require_once 'two_factor_setup.php';
+require_once 'includes/audit.php';
+require_once 'includes/mailer.php';
+require_once 'includes/two_step.php';
+
+function sendLoginNotificationEmail(string $to, string $name): void
+{
+    if ($to === '' || !filter_var($to, FILTER_VALIDATE_EMAIL)) {
+        return;
+    }
+
+    $appName = 'Planora';
+    $loginTime = date('Y-m-d H:i:s');
+    $ipAddress = (string)($_SERVER['REMOTE_ADDR'] ?? 'Unknown');
+    $userAgent = (string)($_SERVER['HTTP_USER_AGENT'] ?? 'Unknown');
+
+    $subject = $appName . ' login alert';
+    $html = '<p>Hello ' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . ',</p>'
+        . '<p>A login to your ' . htmlspecialchars($appName, ENT_QUOTES, 'UTF-8') . ' account was detected.</p>'
+        . '<p><strong>Time:</strong> ' . htmlspecialchars($loginTime, ENT_QUOTES, 'UTF-8') . '<br>'
+        . '<strong>IP:</strong> ' . htmlspecialchars($ipAddress, ENT_QUOTES, 'UTF-8') . '<br>'
+        . '<strong>Device:</strong> ' . htmlspecialchars($userAgent, ENT_QUOTES, 'UTF-8') . '</p>'
+        . '<p>If this was not you, reset your password immediately.</p>'
+        . '<p>- ' . htmlspecialchars($appName, ENT_QUOTES, 'UTF-8') . ' Security</p>';
+
+    $text = "Hello " . $name . ",\n\n"
+        . "A login to your " . $appName . " account was detected.\n\n"
+        . "Time: " . $loginTime . "\n"
+        . "IP: " . $ipAddress . "\n"
+        . "Device: " . $userAgent . "\n\n"
+        . "If this was not you, reset your password immediately.\n\n"
+        . "- " . $appName . " Security";
+
+    $result = send_platform_email($to, $name, $subject, $html, $text);
+    if (empty($result['success'])) {
+        error_log('verify_login.php mail warning: failed to send login notification to ' . $to);
+    }
+}
 
 $pending = two_step_pending_login();
 
@@ -19,11 +56,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? 'verify';
 
     if ($action === 'resend') {
-        $delivery = two_step_start_pending($pending, !empty($pending['password_needs_update']));
+        $delivery = two_step_start_pending($pending, !empty($pending['password_needs_update']), true);
 
         if (!$delivery['email_sent']) {
             two_step_clear_pending();
-            $error = 'We could not send a new verification code. Please log in again later.';
+            $error = (string)($delivery['error_message'] ?? 'We could not send a new verification code. Please log in again.');
         } else {
             header('Location: verify_login.php');
             exit;
@@ -34,6 +71,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (strlen($code) !== 6) {
             $error = 'Enter the 6-digit verification code.';
         } elseif (two_step_verify_code($code)) {
+            $_SESSION['last_activity_at'] = time();
+
+            if (!empty($pending['email'])) {
+                $clearAttempts = $pdo->prepare('DELETE FROM login_attempts WHERE email = ?');
+                $clearAttempts->execute([(string)$pending['email']]);
+            }
+
+            audit_log(
+                $pdo,
+                (int)($_SESSION['user_id'] ?? 0),
+                (string)($_SESSION['role'] ?? ''),
+                'auth.login_success'
+            );
+
+            sendLoginNotificationEmail(
+                (string)($pending['email'] ?? ''),
+                (string)($_SESSION['full_name'] ?? 'User')
+            );
+
             if (!empty($_SESSION['force_password_change'])) {
                 header('Location: change_password.php');
                 exit;

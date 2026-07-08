@@ -15,14 +15,12 @@ session_start();
 require_once 'config/db.php';
 require_once 'includes/csrf.php';
 require_once 'includes/audit.php';
-require_once 'two_factor_setup.php';
+require_once 'includes/two_step.php';
 require_once 'includes/password_policy.php';
 require_once 'includes/mailer.php';
-require_once 'includes/totp.php';
 
 const LOGIN_MAX_ATTEMPTS = 5;
 const LOGIN_WINDOW_MINUTES = 15;
-const LOGIN_TOTP_MAX_ATTEMPTS = 5;
 
 function loginEnsureVendorTypeSchema(PDO $pdo): void
 {
@@ -107,18 +105,6 @@ function sendLoginNotificationEmail(array $user): void
     }
 }
 
-function getPendingOtpContext(): array
-{
-    return [
-        'user_id' => (int)($_SESSION['otp_user_id'] ?? 0),
-        'email' => (string)($_SESSION['otp_email'] ?? ''),
-        'role' => (string)($_SESSION['otp_role'] ?? ''),
-        'full_name' => (string)($_SESSION['otp_full_name'] ?? ''),
-        'method' => (string)($_SESSION['otp_method'] ?? 'email'),
-        'totp_attempts_remaining' => (int)($_SESSION['otp_totp_attempts_remaining'] ?? LOGIN_TOTP_MAX_ATTEMPTS),
-    ];
-}
-
 function clearPendingOtpContext(): void
 {
     unset(
@@ -129,19 +115,6 @@ function clearPendingOtpContext(): void
         $_SESSION['otp_method'],
         $_SESSION['otp_totp_attempts_remaining']
     );
-}
-
-function getUserTotpSettings(PDO $pdo, int $userId): ?array
-{
-    totp_ensure_table($pdo);
-
-    $stmt = $pdo->prepare(
-        'SELECT user_id, secret_key, is_enabled, verified_at FROM user_totp_auth WHERE user_id = ? LIMIT 1'
-    );
-    $stmt->execute([$userId]);
-    $row = $stmt->fetch();
-
-    return $row ?: null;
 }
 
 function completeLoginAndRedirect(array $user, PDO $pdo): void
@@ -189,15 +162,6 @@ function completeLoginAndRedirect(array $user, PDO $pdo): void
 $error = '';
 $email = '';
 $info = '';
-$otpStep = isset($_SESSION['otp_user_id']);
-$otpMethod = (string)($_SESSION['otp_method'] ?? 'email');
-
-if ($otpStep && $otpMethod !== 'totp') {
-    clearPendingOtpContext();
-    $otpStep = false;
-    $otpMethod = 'email';
-}
-
 if (isset($_SESSION['login_error'])) {
     $error = (string)$_SESSION['login_error'];
     unset($_SESSION['login_error']);
@@ -223,157 +187,98 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
-    $formStep = strtolower(trim((string)($_POST['step'] ?? 'credentials')));
+    $email = strtolower(trim((string)($_POST['email'] ?? '')));
+    $password = (string)($_POST['password'] ?? '');
 
-    if ($formStep === 'verify_otp') {
-        $otpCode = trim((string)($_POST['otp_code'] ?? ''));
-        $otpContext = getPendingOtpContext();
-        $pendingMethod = (string)($otpContext['method'] ?? 'email');
-
-        if ($otpContext['user_id'] <= 0 || $otpContext['email'] === '') {
-            $error = 'Verification session expired. Please log in again.';
-            clearPendingOtpContext();
-        } elseif (!preg_match('/^[0-9]{6}$/', $otpCode)) {
-            $error = 'Enter the 6-digit verification code.';
-            $otpStep = true;
-            $otpMethod = $pendingMethod;
-            $email = $otpContext['email'];
-        } else {
-            $totp = getUserTotpSettings($pdo, (int)$otpContext['user_id']);
-            if (!$totp || empty($totp['is_enabled']) || empty($totp['secret_key'])) {
-                $error = 'Authenticator app is not enabled for this account. Please log in again.';
-                clearPendingOtpContext();
-            } else {
-                $verified = totp_verify_code((string)$totp['secret_key'], $otpCode, 1, 30, 6);
-
-                if (!$verified) {
-                    $remaining = max(0, ((int)$otpContext['totp_attempts_remaining']) - 1);
-                    $_SESSION['otp_totp_attempts_remaining'] = $remaining;
-
-                    audit_log(
-                        $pdo,
-                        (int)$otpContext['user_id'],
-                        (string)$otpContext['role'],
-                        'auth.totp_failed',
-                        'user',
-                        (string)$otpContext['email'],
-                        ['attempts_remaining' => $remaining]
-                    );
-
-                    if ($remaining <= 0) {
-                        $error = 'Too many invalid authenticator codes. Please log in again.';
-                        clearPendingOtpContext();
-                    } else {
-                        $error = 'Invalid authenticator code. Attempts left: ' . $remaining . '.';
-                        $otpStep = true;
-                        $otpMethod = 'totp';
-                        $email = $otpContext['email'];
-                    }
-                } else {
-                    $userStmt = $pdo->prepare('SELECT * FROM users WHERE user_id = ? LIMIT 1');
-                    $userStmt->execute([$otpContext['user_id']]);
-                    $user = $userStmt->fetch();
-
-                    if (!$user) {
-                        $error = 'Account not found. Please log in again.';
-                        clearPendingOtpContext();
-                    } else {
-                        audit_log(
-                            $pdo,
-                            (int)$otpContext['user_id'],
-                            (string)$otpContext['role'],
-                            'auth.totp_verified',
-                            'user',
-                            (string)$otpContext['email']
-                        );
-                        completeLoginAndRedirect($user, $pdo);
-                    }
-                }
-            }
-        }
+    if (empty($email) || empty($password)) {
+        $error = 'Please fill in all fields.';
+    } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $error = 'Please enter a valid email address.';
     } else {
-        $email = strtolower(trim((string)($_POST['email'] ?? '')));
-        $password = (string)($_POST['password'] ?? '');
+        ensureLoginAttemptsTable($pdo);
 
-        if (empty($email) || empty($password)) {
-            $error = 'Please fill in all fields.';
-        } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-            $error = 'Please enter a valid email address.';
-        } else {
-            ensureLoginAttemptsTable($pdo);
+        $attemptCheck = $pdo->prepare(
+            "SELECT COUNT(*) AS failed_attempts
+             FROM login_attempts
+             WHERE email = ?
+               AND attempted_at >= (NOW() - INTERVAL " . LOGIN_WINDOW_MINUTES . " MINUTE)"
+        );
+        $attemptCheck->execute([$email]);
+        $failedAttempts = (int)($attemptCheck->fetch()['failed_attempts'] ?? 0);
 
-            $attemptCheck = $pdo->prepare(
-                "SELECT COUNT(*) AS failed_attempts
-                 FROM login_attempts
-                 WHERE email = ?
-                   AND attempted_at >= (NOW() - INTERVAL " . LOGIN_WINDOW_MINUTES . " MINUTE)"
+        if ($failedAttempts >= LOGIN_MAX_ATTEMPTS) {
+            audit_log(
+                $pdo,
+                null,
+                null,
+                'auth.login_blocked',
+                'user',
+                $email,
+                ['window_minutes' => LOGIN_WINDOW_MINUTES]
             );
-            $attemptCheck->execute([$email]);
-            $failedAttempts = (int)($attemptCheck->fetch()['failed_attempts'] ?? 0);
+            $error = 'Too many failed attempts. Please wait 15 minutes and try again.';
+        } else {
+            $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
+            $stmt->execute([$email]);
+            $user = $stmt->fetch();
 
-            if ($failedAttempts >= LOGIN_MAX_ATTEMPTS) {
-                audit_log(
-                    $pdo,
-                    null,
-                    null,
-                    'auth.login_blocked',
-                    'user',
-                    $email,
-                    ['window_minutes' => LOGIN_WINDOW_MINUTES]
+            if ($user && password_verify($password, (string)$user['password_hash'])) {
+                $passwordNeedsUpdate = !password_policy_is_strong(
+                    $password,
+                    (string)$user['email'],
+                    (string)$user['full_name']
                 );
-                $error = 'Too many failed attempts. Please wait 15 minutes and try again.';
-            } else {
-                $stmt = $pdo->prepare("SELECT * FROM users WHERE email = ?");
-                $stmt->execute([$email]);
-                $user = $stmt->fetch();
 
-                if ($user && password_verify($password, (string)$user['password_hash'])) {
-                    $totp = getUserTotpSettings($pdo, (int)$user['user_id']);
-                    $totpEnabled = $totp && !empty($totp['is_enabled']) && !empty($totp['secret_key']);
+                $email2faEnabled = two_step_email_otp_is_enabled($pdo, (int)$user['user_id']);
 
-                    if ($totpEnabled) {
-                        $_SESSION['otp_user_id'] = (int)$user['user_id'];
-                        $_SESSION['otp_email'] = (string)$user['email'];
-                        $_SESSION['otp_role'] = (string)$user['role'];
-                        $_SESSION['otp_full_name'] = (string)$user['full_name'];
-                        $_SESSION['otp_method'] = 'totp';
-                        $_SESSION['otp_totp_attempts_remaining'] = LOGIN_TOTP_MAX_ATTEMPTS;
+                if (!$email2faEnabled) {
+                    completeLoginAndRedirect($user, $pdo);
+                } else {
+                    $delivery = two_step_start_pending($user, $passwordNeedsUpdate);
 
+                    if (empty($delivery['email_sent'])) {
                         audit_log(
                             $pdo,
                             (int)$user['user_id'],
                             (string)$user['role'],
-                            'auth.totp_challenge_started',
+                            'auth.email_otp_send_failed',
+                            'user',
+                            $email
+                        );
+                        $error = (string)($delivery['error_message'] ?? 'We could not send your login code by email. Please try again.');
+                    } else {
+                        audit_log(
+                            $pdo,
+                            (int)$user['user_id'],
+                            (string)$user['role'],
+                            'auth.email_otp_challenge_started',
                             'user',
                             $email
                         );
 
-                        $info = 'Enter the code from your authenticator app to continue.';
-                        $otpStep = true;
-                        $otpMethod = 'totp';
-                    } else {
-                        completeLoginAndRedirect($user, $pdo);
+                        header('Location: verify_login.php', true, 303);
+                        exit;
                     }
-                } else {
-                    $storeAttempt = $pdo->prepare('INSERT INTO login_attempts (email) VALUES (?)');
-                    $storeAttempt->execute([$email]);
-
-                    audit_log(
-                        $pdo,
-                        null,
-                        null,
-                        'auth.login_failed',
-                        'user',
-                        $email,
-                        ['reason' => 'invalid_credentials']
-                    );
-                    $error = 'Invalid email or password.';
                 }
+            } else {
+                $storeAttempt = $pdo->prepare('INSERT INTO login_attempts (email) VALUES (?)');
+                $storeAttempt->execute([$email]);
+
+                audit_log(
+                    $pdo,
+                    null,
+                    null,
+                    'auth.login_failed',
+                    'user',
+                    $email,
+                    ['reason' => 'invalid_credentials']
+                );
+                $error = 'Invalid email or password.';
             }
         }
     }
 
-    if ($error !== '' && !$otpStep) {
+    if ($error !== '') {
         $_SESSION['login_error'] = $error;
         $_SESSION['login_email'] = $email;
         header('Location: login.php', true, 303);
@@ -535,49 +440,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <div class="info-msg"><?php echo htmlspecialchars($info); ?></div>
         <?php endif; ?>
 
-        <?php if ($otpStep): ?>
-            <form action="<?php echo htmlspecialchars($_SERVER['PHP_SELF']); ?>" method="POST">
-                <?php echo csrf_input(); ?>
-                <input type="hidden" name="step" value="verify_otp">
-
-                <div class="form-group">
-                    <label for="otp_code">Authenticator Code</label>
-                    <input type="text" id="otp_code" name="otp_code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="Enter 6-digit code" required>
-                </div>
-
-                <button type="submit" class="login-btn">Verify &amp; Continue</button>
-            </form>
-
-            <div class="register-text" style="margin-top: 10px;">
-                Open your authenticator app and enter the current 6-digit code.
+        <form action="<?php echo htmlspecialchars($_SERVER['PHP_SELF']); ?>" method="POST">
+            <?php echo csrf_input(); ?>
+            <input type="hidden" name="step" value="credentials">
+            <div class="form-group">
+                <label for="email">Email</label>
+                <input type="email" id="email" name="email" value="<?php echo htmlspecialchars($email); ?>" required>
             </div>
-            <div class="register-text" style="margin-top: 6px;">
-                <a href="login.php">Start over</a>
+
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required>
             </div>
-        <?php else: ?>
-            <form action="<?php echo htmlspecialchars($_SERVER['PHP_SELF']); ?>" method="POST">
-                <?php echo csrf_input(); ?>
-                <input type="hidden" name="step" value="credentials">
-                <div class="form-group">
-                    <label for="email">Email</label>
-                    <input type="email" id="email" name="email" value="<?php echo htmlspecialchars($email); ?>" required>
-                </div>
 
-                <div class="form-group">
-                    <label for="password">Password</label>
-                    <input type="password" id="password" name="password" required>
-                </div>
-
-                <button type="submit" class="login-btn">Login</button>
-            </form>
-        <?php endif; ?>
+            <button type="submit" class="login-btn">Login</button>
+        </form>
 
         <div class="register-text" style="margin-top: 10px;">
             <a href="forgot_password.php">Forgot password?</a>
-        </div>
-
-        <div class="register-text" style="margin-top: 8px;">
-            After login, set up Authenticator 2FA at <a href="two_factor_setup.php">2FA Setup</a>
         </div>
 
         <div class="register-text">
