@@ -16,6 +16,33 @@ if (!in_array($statusFilter, ['all', 'pending', 'confirmed', 'cancelled'], true)
 $isMarketOperator = false;
 $marketEvents = [];
 
+function ensureServiceRatingsTable(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS service_ratings (
+            rating_id INT AUTO_INCREMENT PRIMARY KEY,
+            attendee_id INT NOT NULL,
+            service_id INT NOT NULL,
+            vendor_id INT NOT NULL,
+            rating TINYINT NOT NULL,
+            feedback VARCHAR(500) DEFAULT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_attendee_service_rating (attendee_id, service_id),
+            INDEX idx_service_ratings_service (service_id),
+            INDEX idx_service_ratings_vendor (vendor_id),
+            INDEX idx_service_ratings_attendee (attendee_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+    );
+
+    $ready = true;
+}
+
 function ensureBookingDisplaySchema(PDO $pdo): void
 {
     static $ready = false;
@@ -77,6 +104,7 @@ try {
         $isMarketOperator = ((string)($vendor['vendor_type'] ?? 'service_provider')) === 'market_operator';
 
         ensureBookingDisplaySchema($pdo);
+        ensureServiceRatingsTable($pdo);
 
         if (!$isMarketOperator && $_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['booking_action'], $_POST['booking_id'])) {
             csrf_require_valid_post_token();
@@ -242,10 +270,24 @@ try {
             $sql = "SELECT b.booking_id, b.status AS booking_status, b.booked_price, b.platform_fee, b.booth_number,
                         COALESCE(e.image_url, '') AS image_url,
                         e.title AS event_title, e.event_date, COALESCE(e.venue, '') AS event_venue, s.name AS service_name,
+                        COALESCE(sr_latest.rating, 0) AS service_rating,
+                        COALESCE(sr_latest.feedback, '') AS service_feedback,
+                        sr_latest.created_at AS rating_created_at,
                         t.mpesa_code, COALESCE(t.status, 'pending') AS payment_status, COALESCE(t.amount, 0) AS paid_amount
                     FROM bookings b
                     JOIN events e ON b.event_id = e.event_id
                     JOIN services s ON b.service_id = s.service_id
+                    LEFT JOIN (
+                        SELECT sr.service_id, ea.event_id, sr.rating, sr.feedback, sr.created_at
+                        FROM service_ratings sr
+                        JOIN attendances ea ON ea.attendee_id = sr.attendee_id
+                        WHERE sr.rating_id IN (
+                            SELECT MAX(sr2.rating_id)
+                            FROM service_ratings sr2
+                            JOIN attendances ea2 ON ea2.attendee_id = sr2.attendee_id
+                            GROUP BY sr2.service_id, ea2.event_id
+                        )
+                    ) sr_latest ON sr_latest.service_id = s.service_id AND sr_latest.event_id = b.event_id
                     LEFT JOIN transactions t ON b.booking_id = t.booking_id
                     WHERE s.vendor_id = ?";
             $params = [$vendorId];
@@ -483,7 +525,8 @@ try {
                 <?php endif; ?>
             <?php else: ?>
                 <div class="action-row">
-                    <a class="action-link" href="pay_fee.php">Pay Vendor Selling Fee</a>
+                    <a class="action-link" href="booking_history.php">View Booking History</a>
+                    <a class="action-link" href="payment_history.php">View Payment History</a>
                 </div>
                 <div class="filter-row">
                     <a class="filter-link <?php echo $statusFilter === 'all' ? 'active' : ''; ?>" href="bookings.php?status=all">All</a>
@@ -514,6 +557,17 @@ try {
                                         <span class="status-booking <?php echo htmlspecialchars((string)$b['booking_status']); ?>"><?php echo htmlspecialchars(ucfirst((string)$b['booking_status'])); ?></span>
                                         <div class="booking-meta">Venue: <?php echo htmlspecialchars((string)($b['event_venue'] !== '' ? $b['event_venue'] : 'Not specified')); ?></div>
                                         <div class="booking-meta">Booth Number: <?php echo htmlspecialchars((string)(($b['booth_number'] ?? '') !== '' ? $b['booth_number'] : 'Not assigned')); ?></div>
+                                        <?php if ((int)($b['service_rating'] ?? 0) > 0): ?>
+                                            <div class="booking-meta">Rating: <?php echo number_format((float)$b['service_rating'], 1); ?> / 5</div>
+                                            <?php if (trim((string)($b['service_feedback'] ?? '')) !== ''): ?>
+                                                <div class="booking-meta">Review: <?php echo htmlspecialchars((string)$b['service_feedback']); ?></div>
+                                            <?php endif; ?>
+                                            <?php if (!empty($b['rating_created_at'])): ?>
+                                                <div class="booking-meta">Rated on: <?php echo htmlspecialchars((string)$b['rating_created_at']); ?></div>
+                                            <?php endif; ?>
+                                        <?php else: ?>
+                                            <div class="booking-meta">Rating: No review yet for this service booking.</div>
+                                        <?php endif; ?>
                                         <div class="booking-actions">
                                             <?php if (strtolower((string)$b['booking_status']) === 'pending'): ?>
                                                 <form method="POST" class="action-form">
@@ -572,7 +626,13 @@ try {
         <a href="dashboard.php" class="nav-link"><i class="fa-solid fa-house"></i><span>Home</span></a>
         <a href="services.php" class="nav-link"><i class="fa-solid fa-bell-concierge"></i><span>Services</span></a>
         <a href="bookings.php" class="nav-link active"><i class="fa-solid fa-book-open"></i><span>Bookings</span><?php if ($newPendingCount > 0): ?><span class="badge-unread"><?php echo $newPendingCount; ?></span><?php endif; ?></a>
-        <a href="schedule.php" class="nav-link"><i class="fa-solid fa-calendar-days"></i><span>Schedule</span></a>
+        <?php if ($isMarketOperator): ?>
+            <a href="pay_fee.php" class="nav-link"><i class="fa-solid fa-wallet"></i><span>Fees</span></a>
+            <a href="schedule.php" class="nav-link"><i class="fa-solid fa-calendar-days"></i><span>Schedule</span></a>
+        <?php else: ?>
+            <a href="booking_history.php" class="nav-link"><i class="fa-solid fa-clock-rotate-left"></i><span>History</span></a>
+            <a href="payment_history.php" class="nav-link"><i class="fa-solid fa-money-bill-wave"></i><span>Payments</span></a>
+        <?php endif; ?>
         <a href="profile.php" class="nav-link"><i class="fa-solid fa-user"></i><span>Profile</span></a>
     </nav>
 </body>

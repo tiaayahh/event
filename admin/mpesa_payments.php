@@ -9,6 +9,8 @@ $flashError = $_SESSION['flash_error'] ?? '';
 unset($_SESSION['flash_success'], $_SESSION['flash_error']);
 
 $rows = [];
+$attendeeRows = [];
+$pendingSources = [];
 $stats = [
     'total_bookings' => 0,
     'paid_count' => 0,
@@ -17,6 +19,11 @@ $stats = [
     'needs_action_count' => 0,
     'total_committed' => 0.0,
     'total_paid' => 0.0,
+    'attendee_total' => 0,
+    'attendee_paid_count' => 0,
+    'attendee_failed_count' => 0,
+    'attendee_pending_count' => 0,
+    'attendee_total_paid' => 0.0,
 ];
 $priorityRows = [];
 $darajaConfigured = daraja_is_configured();
@@ -52,21 +59,91 @@ try {
         $amount = (float)$row['booked_price'];
         $stats['total_committed'] += $amount;
 
-        if (($row['payment_status'] ?? '') === 'paid') {
+        $bookingPaymentStatus = strtolower((string)($row['payment_status'] ?? 'pending'));
+
+        if ($bookingPaymentStatus === 'paid') {
             $stats['paid_count']++;
             $stats['total_paid'] += $amount;
-        } elseif (($row['payment_status'] ?? '') === 'failed') {
+        } elseif ($bookingPaymentStatus === 'failed') {
             $stats['failed_count']++;
             $stats['needs_action_count']++;
         } else {
             $stats['pending_count']++;
             $stats['needs_action_count']++;
+            $pendingSources[] = [
+                'source_type' => 'Booking vendor payment',
+                'event_title' => (string)($row['event_title'] ?? ''),
+                'source_name' => (string)($row['business_name'] ?? ''),
+                'extra' => (string)($row['service_name'] ?? ''),
+                'amount' => $amount,
+                'status' => $bookingPaymentStatus,
+                'created_at' => (string)($row['created_at'] ?? ''),
+                'action_url' => 'initiate_payment.php?booking_id=' . (int)$row['booking_id'],
+                'action_label' => 'Open Booking Payment',
+            ];
         }
 
         if ((($row['payment_status'] ?? 'pending') !== 'paid') || (($row['booking_status'] ?? 'pending') !== 'confirmed')) {
             $priorityRows[] = $row;
         }
     }
+
+    $stmt = $pdo->prepare(
+        "SELECT atp.payment_id,
+                atp.ticket_type,
+                atp.amount,
+                atp.status,
+                atp.phone_number,
+                atp.checkout_request_id,
+                atp.created_at,
+                atp.updated_at,
+                e.event_id,
+                e.title AS event_title,
+                e.event_date,
+                u.full_name AS attendee_name,
+                u.email AS attendee_email
+         FROM attendee_ticket_payments atp
+         JOIN events e ON atp.event_id = e.event_id
+         JOIN attendees a ON a.attendee_id = atp.attendee_id
+         JOIN users u ON u.user_id = a.user_id
+         WHERE e.planner_id = ?
+           AND e.archived_at IS NULL
+         ORDER BY atp.created_at DESC"
+    );
+    $stmt->execute([$_SESSION['user_id']]);
+    $attendeeRows = $stmt->fetchAll();
+
+    $stats['attendee_total'] = count($attendeeRows);
+    foreach ($attendeeRows as $attendeeRow) {
+        $attendeeAmount = (float)($attendeeRow['amount'] ?? 0);
+        $attendeeStatus = strtolower((string)($attendeeRow['status'] ?? 'requested'));
+
+        if ($attendeeStatus === 'paid') {
+            $stats['attendee_paid_count']++;
+            $stats['attendee_total_paid'] += $attendeeAmount;
+        } elseif ($attendeeStatus === 'failed') {
+            $stats['attendee_failed_count']++;
+            $stats['needs_action_count']++;
+        } else {
+            $stats['attendee_pending_count']++;
+            $stats['needs_action_count']++;
+            $pendingSources[] = [
+                'source_type' => 'Attendee ticket payment',
+                'event_title' => (string)($attendeeRow['event_title'] ?? ''),
+                'source_name' => (string)($attendeeRow['attendee_name'] ?? 'Attendee'),
+                'extra' => strtoupper((string)($attendeeRow['ticket_type'] ?? 'regular')) . ' ticket',
+                'amount' => $attendeeAmount,
+                'status' => $attendeeStatus,
+                'created_at' => (string)($attendeeRow['created_at'] ?? ''),
+                'action_url' => '#attendee-payment-' . (int)($attendeeRow['payment_id'] ?? 0),
+                'action_label' => 'Open Attendee Payment',
+            ];
+        }
+    }
+
+    usort($pendingSources, static function (array $a, array $b): int {
+        return strcmp((string)($b['created_at'] ?? ''), (string)($a['created_at'] ?? ''));
+    });
 } catch (Throwable $e) {
     if ($flashError === '') {
         $flashError = 'Unable to load M-Pesa payments right now.';
@@ -143,7 +220,7 @@ try {
         <div class="message message-error">Daraja is not fully configured. Missing: <?php echo htmlspecialchars(implode(', ', $darajaMissingFields)); ?>.</div>
     <?php endif; ?>
 
-    <div class="ops-note"><i class="fa-solid fa-shield-halved"></i> Security hardening options: set DARAJA_CALLBACK_TOKEN and include it in callback URL/query or X-Daraja-Callback-Token header, and optionally restrict callback origins with DARAJA_CALLBACK_ALLOWED_IPS.</div>
+    
 
     <section class="stats">
         <div class="stat"><div class="stat-value"><?php echo (int)$stats['total_bookings']; ?></div><div class="stat-label">Total Bookings</div></div>
@@ -152,11 +229,40 @@ try {
         <div class="stat"><div class="stat-value"><?php echo (int)$stats['failed_count']; ?></div><div class="stat-label">Failed</div></div>
         <div class="stat"><div class="stat-value"><?php echo (int)$stats['needs_action_count']; ?></div><div class="stat-label">Needs Action</div></div>
         <div class="stat"><div class="stat-value">KES <?php echo number_format((float)$stats['total_paid'], 2); ?></div><div class="stat-label">Paid Amount</div></div>
+        <div class="stat"><div class="stat-value"><?php echo (int)$stats['attendee_total']; ?></div><div class="stat-label">Attendee Payments</div></div>
+        <div class="stat"><div class="stat-value"><?php echo (int)$stats['attendee_pending_count']; ?></div><div class="stat-label">Attendee Pending</div></div>
+        <div class="stat"><div class="stat-value"><?php echo (int)$stats['attendee_failed_count']; ?></div><div class="stat-label">Attendee Failed</div></div>
+        <div class="stat"><div class="stat-value">KES <?php echo number_format((float)$stats['attendee_total_paid'], 2); ?></div><div class="stat-label">Attendee Paid Amount</div></div>
+    </section>
+
+    <section class="card" style="margin-bottom:14px;">
+        <h2 class="title">Pending Payment Sources</h2>
+        <?php if (empty($pendingSources)): ?>
+            <div class="empty">No pending payments right now.</div>
+        <?php else: ?>
+            <div class="priority-list">
+                <?php foreach (array_slice($pendingSources, 0, 12) as $source): ?>
+                    <div class="priority-item">
+                        <div class="priority-main">
+                            <strong><?php echo htmlspecialchars((string)$source['source_type']); ?></strong>
+                            for <?php echo htmlspecialchars((string)$source['event_title']); ?>
+                        </div>
+                        <div class="priority-meta">
+                            From: <?php echo htmlspecialchars((string)$source['source_name']); ?>
+                            | Detail: <?php echo htmlspecialchars((string)$source['extra']); ?>
+                            | Status: <?php echo htmlspecialchars(ucfirst((string)$source['status'])); ?>
+                            | Amount: KES <?php echo number_format((float)$source['amount'], 2); ?>
+                        </div>
+                        <a class="priority-link" href="<?php echo htmlspecialchars((string)$source['action_url']); ?>"><?php echo htmlspecialchars((string)$source['action_label']); ?></a>
+                    </div>
+                <?php endforeach; ?>
+            </div>
+        <?php endif; ?>
     </section>
 
     <section class="card">
         <h2 class="title">Booking Payments</h2>
-        <div class="ops-note"><i class="fa-solid fa-circle-info"></i> Real M-Pesa flow: send Mpesa prompt via Daraja, then reconcile callback/payment status to keep booking confirmations and budgets synchronized.</div>
+       
 
         <?php if (!empty($priorityRows)): ?>
             <div class="priority-list">
@@ -206,6 +312,48 @@ try {
                                 <td><span class="badge <?php echo $paymentClass; ?>"><?php echo htmlspecialchars(ucfirst($paymentStatus)); ?></span></td>
                                 <td><?php echo htmlspecialchars((string)($row['mpesa_code'] ?? '-')); ?></td>
                                 <td><a class="btn" href="initiate_payment.php?booking_id=<?php echo (int)$row['booking_id']; ?>">Open Booking Payment</a></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        <?php endif; ?>
+    </section>
+
+    <section class="card" style="margin-top:14px;">
+        <h2 class="title">Attendee Ticket Payments</h2>
+        <?php if (empty($attendeeRows)): ?>
+            <div class="empty">No attendee ticket payments found yet.</div>
+        <?php else: ?>
+            <div class="table-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Event</th>
+                            <th>Attendee</th>
+                            <th>Ticket Type</th>
+                            <th>Amount</th>
+                            <th>Status</th>
+                            <th>Phone</th>
+                            <th>Checkout ID</th>
+                            <th>Updated</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($attendeeRows as $row): ?>
+                            <?php
+                                $status = strtolower((string)($row['status'] ?? 'requested'));
+                                $statusClass = $status === 'paid' ? 'badge-paid' : ($status === 'failed' ? 'badge-failed' : 'badge-pending');
+                            ?>
+                            <tr id="attendee-payment-<?php echo (int)($row['payment_id'] ?? 0); ?>">
+                                <td><?php echo htmlspecialchars((string)$row['event_title']); ?><br><small><?php echo htmlspecialchars((string)$row['event_date']); ?></small></td>
+                                <td><?php echo htmlspecialchars((string)$row['attendee_name']); ?><br><small><?php echo htmlspecialchars((string)$row['attendee_email']); ?></small></td>
+                                <td><?php echo htmlspecialchars(strtoupper((string)($row['ticket_type'] ?? 'regular'))); ?></td>
+                                <td>KES <?php echo number_format((float)($row['amount'] ?? 0), 2); ?></td>
+                                <td><span class="badge <?php echo $statusClass; ?>"><?php echo htmlspecialchars(ucfirst($status)); ?></span></td>
+                                <td><?php echo htmlspecialchars((string)($row['phone_number'] ?? '-')); ?></td>
+                                <td><?php echo htmlspecialchars((string)($row['checkout_request_id'] ?? '-')); ?></td>
+                                <td><?php echo htmlspecialchars((string)($row['updated_at'] ?? '')); ?></td>
                             </tr>
                         <?php endforeach; ?>
                     </tbody>

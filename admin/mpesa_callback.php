@@ -73,8 +73,8 @@ function ensure_callback_request_is_allowed(PDO $pdo): void
 
 function callback_response(int $statusCode, array $payload): void
 {
-    http_response_code($statusCode);
-    echo json_encode($payload, JSON_UNESCAPED_SLASHES);
+    http_response_code(200);
+    echo json_encode(['ResultCode' => 0, 'ResultDesc' => 'Success'], JSON_UNESCAPED_SLASHES);
     exit;
 }
 
@@ -234,12 +234,46 @@ function ensure_attendee_ticket_payments_callback_schema(PDO $pdo): void
     $ready = true;
 }
 
+function ensure_transactions_vendor_user_callback_schema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM transactions LIKE 'vendor_user_id'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE transactions ADD COLUMN vendor_user_id INT NULL AFTER booking_id");
+        $pdo->exec("ALTER TABLE transactions ADD INDEX idx_transactions_vendor_user (vendor_user_id)");
+        $pdo->exec("ALTER TABLE transactions ADD CONSTRAINT fk_transactions_vendor_user FOREIGN KEY (vendor_user_id) REFERENCES users(user_id) ON DELETE SET NULL");
+    }
+
+    $ready = true;
+}
+
+function ensure_event_vendor_fee_callback_schema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM events LIKE 'vendor_fee_amount'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE events ADD COLUMN vendor_fee_amount DECIMAL(10,2) NOT NULL DEFAULT 100.00");
+    }
+
+    $ready = true;
+}
+
 try {
     if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
         callback_response(405, ['ok' => false, 'message' => 'Method not allowed']);
     }
 
     ensure_daraja_stk_requests_table($pdo);
+    ensure_transactions_vendor_user_callback_schema($pdo);
+    ensure_event_vendor_fee_callback_schema($pdo);
     ensure_stall_rentals_callback_schema($pdo);
     ensure_vendor_fee_payments_callback_schema($pdo);
     ensure_attendee_ticket_payments_callback_schema($pdo);
@@ -351,7 +385,7 @@ try {
                         ]
                     );
 
-                    callback_response(404, ['ok' => false, 'message' => 'Unknown checkout request']);
+                    callback_response(200, ['ok' => true, 'message' => 'Unknown checkout request acknowledged']);
                 }
 
                 $attendeePaymentId = (int)$attendeePaymentRequest['payment_id'];
@@ -690,9 +724,13 @@ try {
     $stmt = $pdo->prepare(
         "SELECT b.booking_id, b.event_id, b.status AS booking_status, b.booked_price,
                 e.planner_id,
+                                COALESCE(e.vendor_fee_amount, 100) AS vendor_fee_amount,
+              v.user_id AS vendor_user_id,
                 t.status AS payment_status
          FROM bookings b
          JOIN events e ON e.event_id = b.event_id
+          JOIN services s ON s.service_id = b.service_id
+          JOIN vendors v ON v.vendor_id = s.vendor_id
          LEFT JOIN transactions t ON t.booking_id = b.booking_id
          WHERE b.booking_id = ?
          LIMIT 1"
@@ -715,14 +753,15 @@ try {
             ]
         );
 
-        callback_response(404, ['ok' => false, 'message' => 'Booking not found']);
+        callback_response(200, ['ok' => true, 'message' => 'Booking not found callback acknowledged']);
     }
 
     $oldBookingStatus = strtolower((string)$booking['booking_status']);
     $bookedPrice = (float)$booking['booked_price'];
+    $vendorUserId = (int)($booking['vendor_user_id'] ?? 0);
     $paymentStatus = $incomingStatus;
     $newBookingStatus = $paymentStatus === 'paid' ? 'confirmed' : 'pending';
-    $platformFee = $bookedPrice * 0.10;
+    $platformFee = (float)($booking['vendor_fee_amount'] ?? 100);
 
     $transactionAmount = $amountFromCallback > 0 ? $amountFromCallback : $bookedPrice;
 
@@ -746,11 +785,11 @@ try {
     $stmt->execute([$bookingId]);
 
     if ($stmt->fetch()) {
-        $stmt = $pdo->prepare('UPDATE transactions SET mpesa_code = ?, amount = ?, status = ? WHERE booking_id = ?');
-        $stmt->execute([$mpesaReceipt, $transactionAmount, $paymentStatus, $bookingId]);
+        $stmt = $pdo->prepare('UPDATE transactions SET vendor_user_id = ?, mpesa_code = ?, amount = ?, status = ? WHERE booking_id = ?');
+        $stmt->execute([$vendorUserId > 0 ? $vendorUserId : null, $mpesaReceipt, $transactionAmount, $paymentStatus, $bookingId]);
     } else {
-        $stmt = $pdo->prepare('INSERT INTO transactions (booking_id, mpesa_code, amount, status) VALUES (?, ?, ?, ?)');
-        $stmt->execute([$bookingId, $mpesaReceipt, $transactionAmount, $paymentStatus]);
+        $stmt = $pdo->prepare('INSERT INTO transactions (booking_id, vendor_user_id, mpesa_code, amount, status) VALUES (?, ?, ?, ?, ?)');
+        $stmt->execute([$bookingId, $vendorUserId > 0 ? $vendorUserId : null, $mpesaReceipt, $transactionAmount, $paymentStatus]);
     }
 
     $stmt = $pdo->prepare('UPDATE bookings SET status = ?, platform_fee = ? WHERE booking_id = ?');
@@ -810,5 +849,5 @@ try {
     }
 
     error_log('admin/mpesa_callback.php error: ' . $e->getMessage());
-    callback_response(500, ['ok' => false, 'message' => 'Internal callback processing error']);
+    callback_response(200, ['ok' => true, 'message' => 'Callback error acknowledged']);
 }

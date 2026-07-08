@@ -40,6 +40,12 @@ function ensureAttendeeTicketPaymentsTable(PDO $pdo): void {
         $pdo->exec("ALTER TABLE attendee_ticket_payments ADD COLUMN ticket_type VARCHAR(32) NOT NULL DEFAULT 'regular' AFTER attendee_id");
     }
 
+    try {
+        $pdo->exec("CREATE INDEX idx_attendee_ticket_payment_checkout ON attendee_ticket_payments (checkout_request_id)");
+    } catch (Throwable $e) {
+        // Ignore when index already exists.
+    }
+
     $ready = true;
 }
 

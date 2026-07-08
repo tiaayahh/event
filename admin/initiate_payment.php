@@ -19,6 +19,38 @@ function ensureEventVendorFeeSchema(PDO $pdo): void
 	$ready = true;
 }
 
+function ensureTransactionsVendorUserSchema(PDO $pdo): void
+{
+	static $ready = false;
+	if ($ready) {
+		return;
+	}
+
+	$stmt = $pdo->query("SHOW COLUMNS FROM transactions LIKE 'vendor_user_id'");
+	if (!$stmt->fetch()) {
+		$pdo->exec("ALTER TABLE transactions ADD COLUMN vendor_user_id INT NULL AFTER booking_id");
+		$pdo->exec("ALTER TABLE transactions ADD INDEX idx_transactions_vendor_user (vendor_user_id)");
+		$pdo->exec("ALTER TABLE transactions ADD CONSTRAINT fk_transactions_vendor_user FOREIGN KEY (vendor_user_id) REFERENCES users(user_id) ON DELETE SET NULL");
+	}
+
+	$ready = true;
+}
+
+function ensureUsersPhoneSchema(PDO $pdo): void
+{
+	static $ready = false;
+	if ($ready) {
+		return;
+	}
+
+	$stmt = $pdo->query("SHOW COLUMNS FROM users LIKE 'phone_number'");
+	if (!$stmt->fetch()) {
+		$pdo->exec("ALTER TABLE users ADD COLUMN phone_number VARCHAR(20) DEFAULT NULL AFTER email");
+	}
+
+	$ready = true;
+}
+
 $bookingId = filter_input(INPUT_GET, 'booking_id', FILTER_VALIDATE_INT);
 if (!$bookingId) {
 	$_SESSION['flash_error'] = 'Invalid booking selected for payment.';
@@ -37,6 +69,8 @@ $darajaMissingStkFields = daraja_missing_stk_fields();
 
 try {
 	ensureEventVendorFeeSchema($pdo);
+	ensureTransactionsVendorUserSchema($pdo);
+	ensureUsersPhoneSchema($pdo);
 
 	$stmt = $pdo->prepare(
 		"SELECT b.booking_id,
@@ -49,12 +83,15 @@ try {
 				e.event_date,
 				s.name AS service_name,
 				v.business_name,
+				v.user_id AS vendor_user_id,
+				COALESCE(vu.phone_number, '') AS vendor_phone_number,
 				t.mpesa_code,
 				t.status AS payment_status
 		 FROM bookings b
 		 JOIN events e ON b.event_id = e.event_id
 		 JOIN services s ON b.service_id = s.service_id
 		 JOIN vendors v ON s.vendor_id = v.vendor_id
+		 JOIN users vu ON v.user_id = vu.user_id
 		 LEFT JOIN transactions t ON b.booking_id = t.booking_id
 		 WHERE b.booking_id = ? AND e.planner_id = ? AND e.archived_at IS NULL
 		 LIMIT 1"
@@ -75,21 +112,26 @@ try {
 
 	if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 		csrf_require_valid_post_token();
-		$action = strtolower(trim((string)($_POST['action'] ?? 'save')));
+		$action = strtolower(trim((string)($_POST['action'] ?? '')));
 
-		$mpesaCode = strtoupper(trim($_POST['mpesa_code'] ?? ''));
-		$paymentStatus = strtolower(trim($_POST['payment_status'] ?? 'pending'));
+		$mpesaCode = strtoupper(trim((string)($_POST['mpesa_code'] ?? '')));
+		$paymentStatus = strtolower(trim((string)($_POST['payment_status'] ?? 'pending')));
 		$oldBookingStatus = strtolower((string)$booking['booking_status']);
 		$newBookingStatus = $paymentStatus === 'paid' ? 'confirmed' : 'pending';
 		$bookedPrice = (float)$booking['booked_price'];
 		$platformFee = (float)($booking['vendor_fee_amount'] ?? 100);
+		$vendorUserId = (int)($booking['vendor_user_id'] ?? 0);
 		$mpesaCodeDb = $mpesaCode === '' ? null : $mpesaCode;
 
 		if ($action === 'stk_push') {
 			if (!$darajaStkConfigured) {
 				$flashError = 'Mpesa prompt is unavailable. Missing: ' . implode(', ', $darajaMissingStkFields) . '. You can still save payment manually using M-Pesa code and status.';
 			} else {
-			$phoneNumber = trim((string)($_POST['phone_number'] ?? ''));
+			$vendorPhoneRaw = trim((string)($booking['vendor_phone_number'] ?? ''));
+			$phoneNumber = daraja_normalize_phone($vendorPhoneRaw);
+			if ($phoneNumber === '') {
+				$flashError = 'Service provider phone number is missing or invalid. Ask the vendor to update phone number in profile before sending Mpesa prompt.';
+			} else {
 			$chargeAmount = daraja_effective_stk_amount($bookedPrice);
 			$pushResult = daraja_stk_push(
 				$phoneNumber,
@@ -155,24 +197,25 @@ try {
 				);
 			}
 			}
+			}
 		} elseif (!in_array($paymentStatus, ['pending', 'paid', 'failed'], true)) {
 			$flashError = 'Invalid payment status selected.';
 		} elseif ($paymentStatus === 'paid' && $mpesaCode === '') {
 			$flashError = 'M-Pesa code is required when marking payment as paid.';
 		} elseif ($mpesaCode !== '' && !preg_match('/^[A-Z0-9]{6,20}$/', $mpesaCode)) {
 			$flashError = 'M-Pesa code format is invalid.';
-		} else {
+		} elseif ($action === 'save') {
 			$pdo->beginTransaction();
 
 			$stmt = $pdo->prepare('SELECT booking_id FROM transactions WHERE booking_id = ? LIMIT 1');
 			$stmt->execute([$bookingId]);
 
 			if ($stmt->fetch()) {
-				$stmt = $pdo->prepare('UPDATE transactions SET mpesa_code = ?, amount = ?, status = ? WHERE booking_id = ?');
-				$stmt->execute([$mpesaCodeDb, $bookedPrice, $paymentStatus, $bookingId]);
+				$stmt = $pdo->prepare('UPDATE transactions SET vendor_user_id = ?, mpesa_code = ?, amount = ?, status = ? WHERE booking_id = ?');
+				$stmt->execute([$vendorUserId > 0 ? $vendorUserId : null, $mpesaCodeDb, $bookedPrice, $paymentStatus, $bookingId]);
 			} else {
-				$stmt = $pdo->prepare('INSERT INTO transactions (booking_id, mpesa_code, amount, status) VALUES (?, ?, ?, ?)');
-				$stmt->execute([$bookingId, $mpesaCodeDb, $bookedPrice, $paymentStatus]);
+				$stmt = $pdo->prepare('INSERT INTO transactions (booking_id, vendor_user_id, mpesa_code, amount, status) VALUES (?, ?, ?, ?, ?)');
+				$stmt->execute([$bookingId, $vendorUserId > 0 ? $vendorUserId : null, $mpesaCodeDb, $bookedPrice, $paymentStatus]);
 			}
 
 			$stmt = $pdo->prepare('UPDATE bookings SET status = ? WHERE booking_id = ?');
@@ -215,6 +258,8 @@ try {
 			$_SESSION['flash_success'] = 'Payment updated successfully.';
 			header('Location: mpesa_payments.php');
 			exit;
+		} else {
+			$flashError = 'Unsupported payment action.';
 		}
 	}
 
@@ -320,8 +365,8 @@ try {
 		<form method="POST">
 			<?php echo csrf_input(); ?>
 			<div class="field">
-				<label for="phone_number">Customer Phone Number (for Mpesa prompt)</label>
-				<input class="input" type="text" id="phone_number" name="phone_number" placeholder="e.g. 0712345678">
+				<label for="phone_number">Service Provider Phone (used for Mpesa prompt)</label>
+				<input class="input" type="text" id="phone_number" value="<?php echo htmlspecialchars((string)($booking['vendor_phone_number'] ?? '')); ?>" readonly>
 			</div>
 
 			<?php if ($darajaStkConfigured): ?>

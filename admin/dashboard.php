@@ -544,16 +544,16 @@ $remainingCashAtUse = max(0, $available - $totalCommitted);
 $percent = $totalBudget > 0 ? (($totalCommitted > 0 ? $totalCommitted : 0) / $totalBudget) * 100 : 0;
 $budgetColor = $percent > 80 ? 'status-danger' : ($percent > 50 ? 'status-warning' : 'status-good');
 $budgetLabel = $percent > 80 ? 'Over Budget' : ($percent > 50 ? 'Caution' : 'Good');
-$hasFundingOverrun = $totalBudget > 0 && $available < $totalBudget;
-$fundingGap = max(0, $totalBudget - $available);
-$fundingBuffer = max(0, $available - $totalBudget);
+$hasFundingOverrun = $totalBudget > 0 && $totalCommitted > $totalBudget;
+$fundingGap = max(0, $totalCommitted - $totalBudget);
+$fundingBuffer = max(0, $totalBudget - $totalCommitted);
 
 if ($hasFundingOverrun) {
     $attentionItems[] = [
         'type' => 'danger',
-        'label' => 'Budget overrun detected from received funds. Available funds are below planned budget.',
+        'label' => 'Budget overrun detected. Money spent is above planned budget.',
         'link' => 'mpesa_payments.php',
-        'link_text' => 'Review funding status',
+        'link_text' => 'Review spending',
     ];
 }
 
@@ -1216,13 +1216,13 @@ if ($pendingBookings > 0) {
                                     $eventVendorRevenue = (float)($ops['vendor_revenue_received'] ?? 0);
                                     $eventStallRevenue = (float)($ops['stall_revenue_received'] ?? 0);
                                     $eventSponsorships = (float)($ops['sponsorship_received'] ?? 0);
-                                    $eventCommittedPaid = $eventPaidTransactions + $eventItemSpentTotal + $eventSponsorships;
+                                    $eventCommittedPaid = $eventPaidTransactions + $eventItemSpentTotal;
                                     $eventManualCashAtUse = (float)($ops['manual_cash_available'] ?? 0);
                                     $eventAvailableFunds = $eventAttendeeRevenue + $eventVendorRevenue + $eventStallRevenue + $eventSponsorships + $eventManualCashAtUse;
                                     $eventRemainingCashAtUse = max(0, $eventAvailableFunds - $eventCommittedPaid);
-                                    $eventFundingGapLocal = max(0, $eventTotalBudget - $eventAvailableFunds);
-                                    $eventFundingBufferLocal = max(0, $eventAvailableFunds - $eventTotalBudget);
-                                    $eventHasFundingOverrun = $eventTotalBudget > 0 && $eventAvailableFunds < $eventTotalBudget;
+                                    $eventFundingGapLocal = max(0, $eventCommittedPaid - $eventTotalBudget);
+                                    $eventFundingBufferLocal = max(0, $eventTotalBudget - $eventCommittedPaid);
+                                    $eventHasFundingOverrun = $eventTotalBudget > 0 && $eventCommittedPaid > $eventTotalBudget;
                                     $eventPercent = $eventTotalBudget > 0 ? (($eventCommittedPaid > 0 ? $eventCommittedPaid : 0) / $eventTotalBudget) * 100 : 0;
                                 ?>
                                 <div class="event-budget-item" data-event-budget-item>
@@ -1235,7 +1235,7 @@ if ($pendingBookings > 0) {
                                     </button>
                                     <div class="event-budget-panel">
                                         <div class="budget-metric">Budget Plan: <strong>KES <?php echo number_format($eventTotalBudget, 2); ?></strong></div>
-                                        <div class="budget-metric">Money Spent (Incl Sponsorships): <strong>KES <?php echo number_format($eventCommittedPaid, 2); ?></strong></div>
+                                        <div class="budget-metric">Money Spent: <strong>KES <?php echo number_format($eventCommittedPaid, 2); ?></strong></div>
                                         <div class="budget-metric">Item Spend Total: <strong>KES <?php echo number_format($eventItemSpentTotal, 2); ?></strong></div>
                                         <div class="budget-metric">Attendee Money: <strong>KES <?php echo number_format($eventAttendeeRevenue, 2); ?></strong></div>
                                         <div class="budget-metric">Vendor Money: <strong>KES <?php echo number_format($eventVendorRevenue, 2); ?></strong></div>
@@ -1247,12 +1247,12 @@ if ($pendingBookings > 0) {
                                         <?php if ($eventHasFundingOverrun): ?>
                                             <div class="mini-alert mini-alert-danger">
                                                 <i class="fa-solid fa-triangle-exclamation"></i>
-                                                Overrun: Available funds are below planned budget by KES <?php echo number_format($eventFundingGapLocal, 2); ?>.
+                                                Overrun: Money spent is above budget by KES <?php echo number_format($eventFundingGapLocal, 2); ?>.
                                             </div>
                                         <?php else: ?>
                                             <div class="mini-alert mini-alert-success">
                                                 <i class="fa-solid fa-circle-check"></i>
-                                                Good: Available funds cover the planned budget. Buffer: KES <?php echo number_format($eventFundingBufferLocal, 2); ?>.
+                                                Good: Spending is within budget by KES <?php echo number_format($eventFundingBufferLocal, 2); ?>.
                                             </div>
                                         <?php endif; ?>
                                         <div class="progress-bar-container">
@@ -1394,9 +1394,10 @@ if ($pendingBookings > 0) {
                                     + (float)($ops['stall_revenue_received'] ?? 0)
                                     + (float)($ops['sponsorship_received'] ?? 0)
                                     + (float)($ops['manual_cash_available'] ?? 0);
-                                $eventFundingGap = max(0, (float)$event['budget_total'] - $availableFundsReceived);
-                                $eventFundingBuffer = max(0, $availableFundsReceived - (float)$event['budget_total']);
-                                $eventFundingOverrun = $availableFundsReceived < (float)$event['budget_total'];
+                                $eventSpentTotal = (float)($ops['paid_transactions_total'] ?? 0) + (float)($ops['item_spent_total'] ?? 0);
+                                $eventFundingGap = max(0, $eventSpentTotal - (float)$event['budget_total']);
+                                $eventFundingBuffer = max(0, (float)$event['budget_total'] - $eventSpentTotal);
+                                $eventFundingOverrun = $eventSpentTotal > (float)$event['budget_total'];
                                 $isHealthy = !$eventFundingOverrun
                                     && (int)$ops['pending_bookings'] === 0
                                     && (int)$ops['pending_payments'] === 0
@@ -1409,12 +1410,12 @@ if ($pendingBookings > 0) {
                                     <?php if ($eventFundingOverrun): ?>
                                         <div class="event-funding-alert danger">
                                             <i class="fa-solid fa-triangle-exclamation"></i>
-                                            Overrun: funds below budget by KES <?php echo number_format($eventFundingGap, 2); ?>
+                                            Overrun: money spent above budget by KES <?php echo number_format($eventFundingGap, 2); ?>
                                         </div>
                                     <?php else: ?>
                                         <div class="event-funding-alert success">
                                             <i class="fa-solid fa-circle-check"></i>
-                                            Good: funds cover budget. Buffer KES <?php echo number_format($eventFundingBuffer, 2); ?>
+                                            Good: spending is within budget by KES <?php echo number_format($eventFundingBuffer, 2); ?>
                                         </div>
                                     <?php endif; ?>
                                     <div class="event-chips">

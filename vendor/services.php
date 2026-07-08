@@ -11,9 +11,10 @@ $services = [];
 $editServiceId = filter_input(INPUT_GET, 'edit', FILTER_VALIDATE_INT);
 $editService = null;
 $newPendingCount = 0;
+$isMarketOperator = false;
 
 try {
-    $stmt = $pdo->prepare('SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1');
+    $stmt = $pdo->prepare("SELECT vendor_id, COALESCE(vendor_type, 'service_provider') AS vendor_type FROM vendors WHERE user_id = ? LIMIT 1");
     $stmt->execute([$_SESSION['user_id']]);
     $vendor = $stmt->fetch();
 
@@ -21,6 +22,7 @@ try {
         $flashError = 'Vendor profile not found.';
     } else {
         $vendorId = (int)$vendor['vendor_id'];
+        $isMarketOperator = ((string)($vendor['vendor_type'] ?? 'service_provider')) === 'market_operator';
 
         $pdo->exec(
             "CREATE TABLE IF NOT EXISTS vendor_notification_state (
@@ -59,7 +61,7 @@ try {
             $price = trim($_POST['price'] ?? '');
             $description = trim($_POST['description'] ?? '');
 
-            if ($name === '' || $price === '' || !is_numeric($price)) {
+            if ($name === '' || $price === '' || !is_numeric($price) || (float)$price < 0) {
                 $_SESSION['flash_error'] = 'Service name and valid price are required.';
             } else {
                 $stmt = $pdo->prepare('INSERT INTO services (vendor_id, name, description, price, availability) VALUES (?, ?, ?, ?, 1)');
@@ -91,7 +93,7 @@ try {
             $price = trim($_POST['price'] ?? '');
             $description = trim($_POST['description'] ?? '');
 
-            if (!$serviceId || $name === '' || $price === '' || !is_numeric($price)) {
+            if (!$serviceId || $name === '' || $price === '' || !is_numeric($price) || (float)$price < 0) {
                 $_SESSION['flash_error'] = 'Valid service name and price are required for update.';
             } else {
                 $stmt = $pdo->prepare('UPDATE services SET name = ?, price = ?, description = ? WHERE service_id = ? AND vendor_id = ?');
@@ -279,6 +281,13 @@ try {
 
     <div class="dashboard-card">
         <h2 class="card-title">Add Service</h2>
+        <p class="card-subtitle">
+            <?php if ($isMarketOperator): ?>
+                Manage your listed services and fee status.
+            <?php else: ?>
+                Manage your listed services and review your booking/payment history.
+            <?php endif; ?>
+        </p>
         <form method="POST" class="grid">
             <?php echo csrf_input(); ?>
             <input type="hidden" name="add_service" value="1">
@@ -353,7 +362,13 @@ try {
     <a href="dashboard.php" class="nav-link"><i class="fa-solid fa-house"></i><span>Home</span></a>
     <a href="services.php" class="nav-link active"><i class="fa-solid fa-bell-concierge"></i><span>Services</span></a>
     <a href="bookings.php" class="nav-link"><i class="fa-solid fa-book-open"></i><span>Bookings</span><?php if ($newPendingCount > 0): ?><span class="badge-unread"><?php echo $newPendingCount; ?></span><?php endif; ?></a>
-    <a href="schedule.php" class="nav-link"><i class="fa-solid fa-calendar-days"></i><span>Schedule</span></a>
+    <?php if ($isMarketOperator): ?>
+        <a href="pay_fee.php" class="nav-link"><i class="fa-solid fa-wallet"></i><span>Fees</span></a>
+        <a href="schedule.php" class="nav-link"><i class="fa-solid fa-calendar-days"></i><span>Schedule</span></a>
+    <?php else: ?>
+        <a href="booking_history.php" class="nav-link"><i class="fa-solid fa-clock-rotate-left"></i><span>History</span></a>
+        <a href="payment_history.php" class="nav-link"><i class="fa-solid fa-money-bill-wave"></i><span>Payments</span></a>
+    <?php endif; ?>
     <a href="profile.php" class="nav-link"><i class="fa-solid fa-user"></i><span>Profile</span></a>
 </nav>
 </body>

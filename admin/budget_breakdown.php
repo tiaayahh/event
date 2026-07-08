@@ -446,7 +446,7 @@ try {
                     ]
                 );
 
-                $_SESSION['flash_success'] = 'Planned budget breakdown updated. Sponsorships are treated as already paid.';
+                $_SESSION['flash_success'] = 'Planned budget breakdown updated. Sponsorships are treated as money received.';
                 header('Location: budget_breakdown.php?event_id=' . $eventId, true, 303);
                 exit;
             } catch (Throwable $txe) {
@@ -579,7 +579,7 @@ foreach ($plannedItems as $pi) {
     $itemSpentTotal += (float)($pi['spent_amount'] ?? 0);
 }
 $moneyReceived = $ticketRevenue + $vendorRevenue + $manualCashAdded + $sponsorshipTotal;
-$moneySpent = $paidTransactionTotal + $itemSpentTotal + $sponsorshipTotal;
+$moneySpent = $paidTransactionTotal + $itemSpentTotal;
 $cashLeft = max(0, $moneyReceived - $moneySpent);
 $utilizationPercent = $budgetTotal > 0 ? min(100, ($budgetCommitted / $budgetTotal) * 100) : 0;
 
@@ -722,7 +722,7 @@ if (empty($editPlannedItems)) {
             </div>
 
             <div class="edit-items-wrap" style="margin-top: 0;">
-                <div style="font-size:13px; font-weight:700; margin-bottom:8px;">Sponsorships (Assumed Paid)</div>
+                <div style="font-size:13px; font-weight:700; margin-bottom:8px;">Sponsorships (Received)</div>
                 <div class="item-example-text" style="margin-bottom:8px;">Every sponsorship entered here is treated as already received and included in Money Received immediately.</div>
                 <div id="sponsorship_rows">
                     <?php foreach ($sponsorships as $sponsorship): ?>
@@ -806,11 +806,11 @@ if (empty($editPlannedItems)) {
         <div class="budget-list">
             <div class="budget-metric">Budget Plan: <strong>KES <?php echo number_format($budgetTotal, 2); ?></strong></div>
             <div class="budget-metric">Planned Spend: <strong>KES <?php echo number_format($budgetCommitted, 2); ?></strong></div>
-            <div class="budget-metric">Money Spent (Incl Sponsorships): <strong>KES <?php echo number_format($moneySpent, 2); ?></strong></div>
+            <div class="budget-metric">Money Spent: <strong>KES <?php echo number_format($moneySpent, 2); ?></strong></div>
             <div class="budget-metric">Item Spend Total: <strong>KES <?php echo number_format($itemSpentTotal, 2); ?></strong></div>
             <div class="budget-metric">Attendee Money: <strong>KES <?php echo number_format($ticketRevenue, 2); ?></strong></div>
             <div class="budget-metric">Vendor Money: <strong>KES <?php echo number_format($vendorRevenue, 2); ?></strong></div>
-            <div class="budget-metric">Sponsorships (Assumed Paid): <strong>KES <?php echo number_format($sponsorshipTotal, 2); ?></strong></div>
+            <div class="budget-metric">Sponsorships (Received): <strong>KES <?php echo number_format($sponsorshipTotal, 2); ?></strong></div>
             <div class="budget-metric">Extra Cash: <strong>KES <?php echo number_format($manualCashAdded, 2); ?></strong></div>
             <div class="budget-metric">Money Received: <strong>KES <?php echo number_format($moneyReceived, 2); ?></strong></div>
             <div class="budget-metric">Cash Left: <strong>KES <?php echo number_format($cashLeft, 2); ?></strong></div>

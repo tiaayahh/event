@@ -5,14 +5,16 @@ requireRole('vendor');
 
 $schedule = [];
 $newPendingCount = 0;
+$isMarketOperator = false;
 
 try {
-    $stmt = $pdo->prepare("SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1");
+    $stmt = $pdo->prepare("SELECT vendor_id, COALESCE(vendor_type, 'service_provider') AS vendor_type FROM vendors WHERE user_id = ? LIMIT 1");
     $stmt->execute([$_SESSION['user_id']]);
     $vendor = $stmt->fetch();
 
     if ($vendor) {
         $vendorId = (int)$vendor['vendor_id'];
+        $isMarketOperator = ((string)($vendor['vendor_type'] ?? 'service_provider')) === 'market_operator';
 
         $pdo->exec(
             "CREATE TABLE IF NOT EXISTS vendor_notification_state (
@@ -187,7 +189,13 @@ try {
         <a href="dashboard.php" class="nav-link"><i class="fa-solid fa-house"></i><span>Home</span></a>
         <a href="services.php" class="nav-link"><i class="fa-solid fa-bell-concierge"></i><span>Services</span></a>
         <a href="bookings.php" class="nav-link"><i class="fa-solid fa-book-open"></i><span>Bookings</span><?php if ($newPendingCount > 0): ?><span class="badge-unread"><?php echo $newPendingCount; ?></span><?php endif; ?></a>
-        <a href="schedule.php" class="nav-link active"><i class="fa-solid fa-calendar-days"></i><span>Schedule</span></a>
+        <?php if ($isMarketOperator): ?>
+            <a href="pay_fee.php" class="nav-link"><i class="fa-solid fa-wallet"></i><span>Fees</span></a>
+            <a href="schedule.php" class="nav-link active"><i class="fa-solid fa-calendar-days"></i><span>Schedule</span></a>
+        <?php else: ?>
+            <a href="booking_history.php" class="nav-link"><i class="fa-solid fa-clock-rotate-left"></i><span>History</span></a>
+            <a href="payment_history.php" class="nav-link"><i class="fa-solid fa-money-bill-wave"></i><span>Payments</span></a>
+        <?php endif; ?>
         <a href="profile.php" class="nav-link"><i class="fa-solid fa-user"></i><span>Profile</span></a>
     </nav>
 </body>

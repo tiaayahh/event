@@ -6,6 +6,7 @@ require_once '../includes/daraja.php';
 
 checkAuth();
 requireRole('vendor');
+requireVendorType('market_operator');
 
 function ensureVendorFeePaymentsTable(PDO $pdo): void {
     static $ready = false;
@@ -33,6 +34,12 @@ function ensureVendorFeePaymentsTable(PDO $pdo): void {
             CONSTRAINT fk_vendor_fee_payment_user FOREIGN KEY (vendor_user_id) REFERENCES users(user_id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     );
+
+    try {
+        $pdo->exec("CREATE UNIQUE INDEX uq_vendor_fee_checkout ON vendor_fee_payments (checkout_request_id)");
+    } catch (Throwable $e) {
+        // Ignore when index already exists.
+    }
 
     $ready = true;
 }
@@ -66,6 +73,7 @@ function ensureVendorTypeSchema(PDO $pdo): void {
 }
 
 $vendorUserId = (int)$_SESSION['user_id'];
+$isAjaxRequest = strtolower((string)($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest';
 $vendorId = 0;
 $vendorType = 'service_provider';
 $events = [];
@@ -75,7 +83,6 @@ $defaultFeeAmount = 100.00;
 $selectedEventId = 0;
 $darajaConfigured = daraja_is_configured();
 $isServiceProvider = true;
-$allowManualConfirm = strtolower(trim((string)(getenv('DARAJA_ALLOW_MANUAL_CONFIRM') ?: '1'))) !== '0';
 $darajaEnv = strtolower(trim((string)(getenv('DARAJA_ENV') ?: 'sandbox')));
 $sandboxTestAmount = null;
 $sandboxAmountRaw = trim((string)(getenv('DARAJA_SANDBOX_TEST_AMOUNT') ?: ''));
@@ -84,6 +91,30 @@ if ($darajaEnv === 'sandbox' && is_numeric($sandboxAmountRaw)) {
     if ($parsedSandboxAmount > 0) {
         $sandboxTestAmount = $parsedSandboxAmount;
     }
+}
+
+function fetchVendorFeeEventPayment(PDO $pdo, int $eventId, int $vendorUserId): ?array
+{
+    $stmt = $pdo->prepare(
+        "SELECT e.event_id,
+                e.title,
+                e.event_date,
+                COALESCE(e.vendor_fee_amount, 100) AS vendor_fee_amount,
+                COALESCE(vfp.status, 'requested') AS fee_status,
+                COALESCE(vfp.checkout_request_id, '') AS checkout_request_id,
+                COALESCE(vfp.mpesa_code, '') AS mpesa_code,
+                vfp.updated_at
+         FROM events e
+         LEFT JOIN vendor_fee_payments vfp
+            ON vfp.event_id = e.event_id
+           AND vfp.vendor_user_id = ?
+         WHERE e.event_id = ?
+         LIMIT 1"
+    );
+    $stmt->execute([$vendorUserId, $eventId]);
+    $row = $stmt->fetch();
+
+    return $row ?: null;
 }
 
 try {
@@ -98,6 +129,12 @@ try {
 
     if ($vendorId <= 0) {
         throw new RuntimeException('Vendor profile not found.');
+    }
+
+    if ($isServiceProvider) {
+        $_SESSION['flash_error'] = 'Vendor fee payments apply only to market operators.';
+        header('Location: bookings.php');
+        exit;
     }
 
     ensureVendorFeePaymentsTable($pdo);
@@ -253,46 +290,59 @@ try {
                     ]
                 );
             }
-        } elseif ($action === 'confirm_paid') {
-            if (!$allowManualConfirm) {
-                throw new RuntimeException('Manual confirmation is disabled. Wait for automatic callback status update.');
-            }
-
+        } elseif ($action === 'save') {
+            $paymentStatus = strtolower(trim((string)($_POST['payment_status'] ?? 'requested')));
             $mpesaCode = strtoupper(trim((string)($_POST['mpesa_code'] ?? '')));
-            if (!preg_match('/^[A-Z0-9]{6,20}$/', $mpesaCode)) {
-                throw new RuntimeException('Enter a valid M-Pesa code (6-20 letters/numbers).');
+
+            if (!in_array($paymentStatus, ['requested', 'paid', 'failed'], true)) {
+                throw new RuntimeException('Invalid payment status selected.');
+            }
+            if ($paymentStatus === 'paid' && $mpesaCode === '') {
+                throw new RuntimeException('M-Pesa code is required when marking as paid.');
+            }
+            if ($mpesaCode !== '' && !preg_match('/^[A-Z0-9]{6,20}$/', $mpesaCode)) {
+                throw new RuntimeException('Invalid M-Pesa code format.');
             }
 
-            $stmt = $pdo->prepare('SELECT COALESCE(vendor_fee_amount, 100) FROM events WHERE event_id = ? AND archived_at IS NULL LIMIT 1');
+            $stmt = $pdo->prepare('SELECT COALESCE(vendor_fee_amount, 100) FROM events WHERE event_id = ? LIMIT 1');
             $stmt->execute([$eventId]);
             $feeAmount = (float)($stmt->fetchColumn() ?: $defaultFeeAmount);
 
             $stmt = $pdo->prepare(
                 "INSERT INTO vendor_fee_payments
                     (event_id, vendor_user_id, mpesa_code, amount, status)
-                 VALUES (?, ?, ?, ?, 'paid')
+                 VALUES (?, ?, ?, ?, ?)
                  ON DUPLICATE KEY UPDATE
                     mpesa_code = VALUES(mpesa_code),
                     amount = VALUES(amount),
-                    status = 'paid',
+                    status = VALUES(status),
                     updated_at = CURRENT_TIMESTAMP"
             );
-            $stmt->execute([$eventId, $vendorUserId, $mpesaCode, $feeAmount]);
+            $stmt->execute([
+                $eventId,
+                $vendorUserId,
+                $mpesaCode !== '' ? $mpesaCode : null,
+                $feeAmount,
+                $paymentStatus,
+            ]);
 
             audit_log(
                 $pdo,
                 $vendorUserId,
                 'vendor',
-                'vendor.fee_payment_confirmed',
+                'vendor.fee_manual_reconcile',
                 'event',
                 $eventId,
                 [
-                    'amount' => $feeAmount,
+                    'status' => $paymentStatus,
                     'mpesa_code' => $mpesaCode,
+                    'amount' => $feeAmount,
                 ]
             );
 
-            $success = 'Vendor event fee marked as paid.';
+            $success = 'Payment saved successfully.';
+        } else {
+            throw new RuntimeException('Unsupported payment action.');
         }
     }
 
@@ -330,6 +380,31 @@ try {
             ['error' => $e->getMessage()]
         );
     }
+}
+
+if ($isAjaxRequest && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $response = [
+        'ok' => $error === '',
+        'message' => $error !== '' ? $error : ($success !== '' ? $success : 'Request processed.'),
+        'selected_event_id' => $selectedEventId,
+    ];
+
+    if ($selectedEventId > 0) {
+        $eventState = fetchVendorFeeEventPayment($pdo, $selectedEventId, $vendorUserId);
+        if ($eventState) {
+            $response['event'] = [
+                'event_id' => (int)$eventState['event_id'],
+                'fee_status' => (string)($eventState['fee_status'] ?? 'requested'),
+                'checkout_request_id' => (string)($eventState['checkout_request_id'] ?? ''),
+                'mpesa_code' => (string)($eventState['mpesa_code'] ?? ''),
+                'updated_at' => (string)($eventState['updated_at'] ?? ''),
+            ];
+        }
+    }
+
+    header('Content-Type: application/json');
+    echo json_encode($response, JSON_UNESCAPED_SLASHES);
+    exit;
 }
 ?>
 <!DOCTYPE html>
@@ -438,6 +513,38 @@ try {
             border: 1px solid #c9f0d4;
         }
 
+        .toast-stack {
+            position: fixed;
+            top: 16px;
+            right: 16px;
+            z-index: 1200;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-width: 320px;
+        }
+
+        .toast {
+            border-radius: 8px;
+            padding: 10px 12px;
+            font-size: 12px;
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+            border: 1px solid transparent;
+            background: #fff;
+        }
+
+        .toast.success {
+            background: #ecfff0;
+            border-color: #c9f0d4;
+            color: #1c7a36;
+        }
+
+        .toast.error {
+            background: #ffecec;
+            border-color: #f6caca;
+            color: #9d2020;
+        }
+
         .fee-item {
             border: 1px solid #ececec;
             border-radius: 8px;
@@ -514,7 +621,20 @@ try {
             outline: none;
         }
 
+        .field select {
+            border: 1px solid #d8d8d8;
+            border-radius: 4px;
+            padding: 10px 12px;
+            font-size: 14px;
+            outline: none;
+        }
+
         .field input:focus {
+            border-color: #6C63FF;
+            box-shadow: 0 0 0 3px rgba(108, 99, 255, 0.12);
+        }
+
+        .field select:focus {
             border-color: #6C63FF;
             box-shadow: 0 0 0 3px rgba(108, 99, 255, 0.12);
         }
@@ -537,6 +657,28 @@ try {
 
         .btn-primary:hover {
             background-color: #5e56de;
+        }
+
+        .btn-primary.is-loading,
+        .btn-secondary.is-loading {
+            opacity: 0.75;
+            pointer-events: none;
+        }
+
+        .btn-spinner {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border: 2px solid rgba(255, 255, 255, 0.65);
+            border-top-color: rgba(255, 255, 255, 0.1);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 6px;
+            vertical-align: -1px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
         }
 
         .btn-secondary {
@@ -639,6 +781,7 @@ try {
     </style>
 </head>
 <body>
+    <div id="toast_stack" class="toast-stack" aria-live="polite" aria-atomic="true"></div>
     <header class="header">
         <div class="brand-logo">PLANORA</div>
         <a href="../logout.php" class="logout-btn">Logout</a>
@@ -670,7 +813,7 @@ try {
             <?php elseif (empty($events)): ?>
                 <div class="message">No events are linked to your bookings yet.</div>
             <?php else: ?>
-                <form method="POST" class="payment-form">
+                <form method="POST" class="payment-form js-async-form">
                     <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars(generate_csrf_token()); ?>">
                     <input type="hidden" name="action" value="stk_push">
                     <div class="payment-grid">
@@ -709,47 +852,51 @@ try {
                     }
                     $awaitingCallback = !empty($event['checkout_request_id']) && in_array($status, ['requested', 'pending'], true);
                     ?>
-                    <div class="fee-item">
+                    <div class="fee-item" data-event-id="<?php echo (int)$event['event_id']; ?>">
                         <div class="fee-title"><?php echo htmlspecialchars($event['title']); ?></div>
                         <div class="fee-meta">Date: <?php echo htmlspecialchars($event['event_date']); ?></div>
                         <div class="fee-meta">Fee: KES <?php echo number_format((float)$event['vendor_fee_amount'], 2); ?></div>
                         <div class="fee-meta">
                             Status:
-                            <span class="status-badge <?php echo $statusClass; ?>"><?php echo htmlspecialchars($event['fee_status'] ?? 'not paid'); ?></span>
+                            <span class="status-badge <?php echo $statusClass; ?> js-fee-status-badge"><?php echo htmlspecialchars($event['fee_status'] ?? 'not paid'); ?></span>
                         </div>
-                        <?php if (!empty($event['checkout_request_id'])): ?>
-                            <div class="fee-meta">Checkout Request ID: <?php echo htmlspecialchars((string)$event['checkout_request_id']); ?></div>
-                        <?php endif; ?>
-                        <?php if (!empty($event['mpesa_code'])): ?>
-                            <div class="fee-meta">M-Pesa Code: <?php echo htmlspecialchars($event['mpesa_code']); ?></div>
-                        <?php endif; ?>
+                        <div class="fee-meta js-fee-checkout" <?php echo empty($event['checkout_request_id']) ? 'style="display:none;"' : ''; ?>>Checkout Request ID: <span><?php echo htmlspecialchars((string)$event['checkout_request_id']); ?></span></div>
+                        <div class="fee-meta js-fee-code" <?php echo empty($event['mpesa_code']) ? 'style="display:none;"' : ''; ?>>M-Pesa Code: <span><?php echo htmlspecialchars((string)$event['mpesa_code']); ?></span></div>
 
                         <?php if ($awaitingCallback): ?>
                             <div class="fee-meta" style="margin-top:10px; color:#2c4ea0;">
                                 STK request sent. Waiting for M-Pesa callback to update status automatically.
                             </div>
-                            <form method="POST" class="fee-form" style="margin-top: 10px;">
+                            <form method="POST" class="fee-form js-async-form" style="margin-top: 10px;">
                                 <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars(generate_csrf_token()); ?>">
                                 <input type="hidden" name="action" value="sync_status">
                                 <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
                                 <button type="submit" class="btn-secondary"><i class="fa-solid fa-rotate"></i> Check Status Now</button>
                             </form>
-                        <?php elseif (!$allowManualConfirm): ?>
-                            <div class="fee-meta" style="margin-top:10px; color:#2c4ea0;">
-                                Manual confirmation is disabled. Use Mpesa prompt and wait for callback status update.
-                            </div>
                         <?php else: ?>
-                            <form method="POST" class="fee-form" style="margin-top: 10px;">
-                                <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars(generate_csrf_token()); ?>">
-                                <input type="hidden" name="action" value="confirm_paid">
-                                <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
-                                <div class="field" style="min-width: 0;">
-                                    <label for="mpesa_code_<?php echo (int)$event['event_id']; ?>">Confirm with M-Pesa Code</label>
-                                    <input id="mpesa_code_<?php echo (int)$event['event_id']; ?>" type="text" name="mpesa_code" maxlength="20" placeholder="e.g. QWE123RTY" required>
-                                </div>
-                                <button type="submit" class="btn-primary"><i class="fa-solid fa-check"></i> Confirm Paid</button>
-                            </form>
+                            <div class="fee-meta" style="margin-top:10px; color:#2c4ea0;">
+                                Use STK push first. If callback is delayed, use manual fallback below.
+                            </div>
                         <?php endif; ?>
+
+                        <form method="POST" class="fee-form js-async-form" style="margin-top: 10px;">
+                            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars(generate_csrf_token()); ?>">
+                            <input type="hidden" name="action" value="save">
+                            <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
+                            <div class="field">
+                                <label>Manual Status (Fallback)</label>
+                                <select name="payment_status" required>
+                                    <option value="requested" <?php echo strtolower((string)($event['fee_status'] ?? 'requested')) === 'requested' ? 'selected' : ''; ?>>Requested</option>
+                                    <option value="paid" <?php echo strtolower((string)($event['fee_status'] ?? 'requested')) === 'paid' ? 'selected' : ''; ?>>Paid</option>
+                                    <option value="failed" <?php echo strtolower((string)($event['fee_status'] ?? 'requested')) === 'failed' ? 'selected' : ''; ?>>Failed</option>
+                                </select>
+                            </div>
+                            <div class="field">
+                                <label>M-Pesa Code (required for Paid)</label>
+                                <input type="text" name="mpesa_code" maxlength="20" placeholder="e.g. QWE123RTY" value="<?php echo htmlspecialchars((string)($event['mpesa_code'] ?? '')); ?>">
+                            </div>
+                            <button type="submit" class="btn-secondary"><i class="fa-solid fa-floppy-disk"></i> Save Fallback</button>
+                        </form>
 
                     </div>
                 <?php endforeach; ?>
@@ -773,4 +920,114 @@ try {
         <a href="profile.php" class="nav-link"><i class="fa-solid fa-user"></i><span>Profile</span></a>
     </nav>
 </body>
+<script>
+(function () {
+    const stack = document.getElementById('toast_stack');
+
+    function showToast(type, message) {
+        if (!stack || !message) {
+            return;
+        }
+        const node = document.createElement('div');
+        node.className = 'toast ' + (type === 'error' ? 'error' : 'success');
+        node.textContent = message;
+        stack.appendChild(node);
+        setTimeout(function () {
+            if (node.parentNode) {
+                node.parentNode.removeChild(node);
+            }
+        }, 4500);
+    }
+
+    function mapStatusClass(status) {
+        const normalized = String(status || '').toLowerCase();
+        if (normalized === 'paid') return 'status-paid';
+        if (normalized === 'failed') return 'status-failed';
+        return 'status-pending';
+    }
+
+    function updateEventCard(eventState) {
+        if (!eventState || !eventState.event_id) {
+            return;
+        }
+        const card = document.querySelector('.fee-item[data-event-id="' + eventState.event_id + '"]');
+        if (!card) {
+            return;
+        }
+
+        const badge = card.querySelector('.js-fee-status-badge');
+        if (badge) {
+            badge.classList.remove('status-paid', 'status-failed', 'status-pending');
+            badge.classList.add(mapStatusClass(eventState.fee_status));
+            badge.textContent = String(eventState.fee_status || 'requested');
+        }
+
+        const checkoutWrap = card.querySelector('.js-fee-checkout');
+        if (checkoutWrap) {
+            const valueNode = checkoutWrap.querySelector('span');
+            if (eventState.checkout_request_id) {
+                checkoutWrap.style.display = '';
+                if (valueNode) valueNode.textContent = String(eventState.checkout_request_id);
+            } else {
+                checkoutWrap.style.display = 'none';
+            }
+        }
+
+        const codeWrap = card.querySelector('.js-fee-code');
+        if (codeWrap) {
+            const valueNode = codeWrap.querySelector('span');
+            if (eventState.mpesa_code) {
+                codeWrap.style.display = '';
+                if (valueNode) valueNode.textContent = String(eventState.mpesa_code);
+            } else {
+                codeWrap.style.display = 'none';
+            }
+        }
+    }
+
+    document.querySelectorAll('form.js-async-form').forEach(function (form) {
+        form.addEventListener('submit', function (event) {
+            event.preventDefault();
+
+            const submitButton = form.querySelector('button[type="submit"]');
+            const originalHtml = submitButton ? submitButton.innerHTML : '';
+            if (submitButton) {
+                submitButton.classList.add('is-loading');
+                submitButton.innerHTML = '<span class="btn-spinner" aria-hidden="true"></span>Processing...';
+            }
+
+            fetch(window.location.pathname, {
+                method: 'POST',
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: new FormData(form)
+            })
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                    const ok = !!data.ok;
+                    showToast(ok ? 'success' : 'error', String(data.message || (ok ? 'Done.' : 'Request failed.')));
+                    if (data.event) {
+                        updateEventCard(data.event);
+                    }
+                    if (ok && String(form.querySelector('input[name="action"]') ? form.querySelector('input[name="action"]').value : '') === 'stk_push') {
+                        const phoneField = form.querySelector('input[name="phone_number"]');
+                        if (phoneField) {
+                            phoneField.value = '';
+                        }
+                    }
+                })
+                .catch(function () {
+                    showToast('error', 'Could not complete request. Please try again.');
+                })
+                .finally(function () {
+                    if (submitButton) {
+                        submitButton.classList.remove('is-loading');
+                        submitButton.innerHTML = originalHtml;
+                    }
+                });
+        });
+    });
+})();
+</script>
 </html>

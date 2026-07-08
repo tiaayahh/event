@@ -53,6 +53,7 @@ BEGIN
         ('users', 'user_id'),
         ('users', 'full_name'),
         ('users', 'email'),
+        ('users', 'phone_number'),
         ('users', 'password_hash'),
         ('users', 'role'),
 
@@ -148,6 +149,7 @@ BEGIN
         ('stall_rentals', 'updated_at'),
 
         ('transactions', 'booking_id'),
+        ('transactions', 'vendor_user_id'),
         ('transactions', 'mpesa_code'),
         ('transactions', 'amount'),
         ('transactions', 'status'),

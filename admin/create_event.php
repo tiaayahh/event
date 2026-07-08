@@ -985,11 +985,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $moneyReceived = (float)($eventSummary['ticket_revenue'] ?? 0)
                         + (float)($eventSummary['vendor_revenue_received'] ?? 0)
                         + (float)($eventSummary['sponsorship_received'] ?? 0);
-                    $moneySpent = (float)($eventSummary['paid_transactions_total'] ?? 0)
-                        + (float)($eventSummary['sponsorship_received'] ?? 0);
+                    $itemSpentTotal = 0.0;
+                    $moneySpent = (float)($eventSummary['paid_transactions_total'] ?? 0);
                     foreach ($budgetItems as $budgetItem) {
-                        $moneySpent += (float)($budgetItem['spent_amount'] ?? 0);
+                        $spent = (float)($budgetItem['spent_amount'] ?? 0);
+                        $itemSpentTotal += $spent;
+                        $moneySpent += $spent;
                     }
+                    $cashAtUseAuto = $itemSpentTotal;
                     $cashLeft = max(0, $moneyReceived - $moneySpent);
 
                     $safeTitle = preg_replace('/[^a-zA-Z0-9_-]+/', '_', (string)($eventSummary['title'] ?? 'event'));
@@ -1008,10 +1011,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'Planned Spend: KES ' . number_format((float)$eventSummary['budget_committed'], 2, '.', ''),
                         'Attendee Money: KES ' . number_format((float)$eventSummary['ticket_revenue'], 2, '.', ''),
                         'Vendor Money: KES ' . number_format((float)$eventSummary['vendor_revenue_received'], 2, '.', ''),
-                        'Sponsorships (Assumed Paid): KES ' . number_format((float)$eventSummary['sponsorship_received'], 2, '.', ''),
-                        'Cash at Use (Auto): KES ' . number_format($moneyReceived, 2, '.', ''),
+                        'Sponsorships (Received): KES ' . number_format((float)$eventSummary['sponsorship_received'], 2, '.', ''),
+                        'Cash in Use (Auto from Item Spending): KES ' . number_format($cashAtUseAuto, 2, '.', ''),
                         'Money Received: KES ' . number_format($moneyReceived, 2, '.', ''),
-                        'Money Spent (Incl Sponsorships): KES ' . number_format($moneySpent, 2, '.', ''),
+                        'Money Spent: KES ' . number_format($moneySpent, 2, '.', ''),
                         'Cash Left: KES ' . number_format($cashLeft, 2, '.', ''),
                         '',
                         'Planned Budget Items',
@@ -1115,8 +1118,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 + (float)($eventRow['sponsorship_received'] ?? 0);
 
                             $moneySpentCandidate = $paidTransactions
-                                + $totalItemSpent
-                                + (float)($eventRow['sponsorship_received'] ?? 0);
+                                + $totalItemSpent;
                             if ($moneySpentCandidate > $moneyReceived) {
                                 $flashError = 'Cannot save item spending. Total money spent would be higher than money received.';
                             } else {
@@ -1154,7 +1156,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } elseif (isset($_POST['add_committed_paid'])) {
         $flashError = 'Use the planned budget items section to record money spent per item.';
     } elseif (isset($_POST['add_cash_at_use'])) {
-        $flashSuccess = 'Cash at Use is now auto-calculated from attendee payments, vendor payments, and sponsorships.';
+        $flashSuccess = 'Cash in Use is now auto-calculated from manual planned-item spending.';
     }
 }
 
@@ -1315,10 +1317,13 @@ try {
         }
 
         $ops = $eventOpsById[$eventId];
-        $availableFundsReceived = (float)$event['ticket_revenue']
-            + (float)($ops['vendor_revenue_received'] ?? 0)
-            + (float)($event['sponsorship_received'] ?? 0);
-        $hasBudgetOverrun = $availableFundsReceived < (float)$event['budget_total'];
+        $eventBudgetItems = $eventBudgetItemsByEventId[$eventId] ?? [];
+        $eventItemSpentTotal = 0.0;
+        foreach ($eventBudgetItems as $eventBudgetItem) {
+            $eventItemSpentTotal += (float)($eventBudgetItem['spent_amount'] ?? 0);
+        }
+        $moneySpentTotal = (float)($ops['paid_transactions_total'] ?? 0) + $eventItemSpentTotal;
+        $hasBudgetOverrun = $moneySpentTotal > (float)$event['budget_total'];
         if ($hasBudgetOverrun || $ops['pending_bookings'] > 0 || $ops['pending_payments'] > 0 || $ops['failed_payments'] > 0 || $ops['unread_vendor_messages'] > 0) {
             $eventsNeedingAttention++;
         }
@@ -1693,13 +1698,12 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                             + (int)($ticketTypesForEvent['vvip']['remaining'] ?? 0);
                         $sponsorshipReceived = (float)($event['sponsorship_received'] ?? 0);
                         $committedPaid = (float)($ops['paid_transactions_total'] ?? 0)
-                            + $itemSpentTotal
-                            + $sponsorshipReceived;
+                            + $itemSpentTotal;
                         $availableFundsReceived = (float)$event['ticket_revenue'] + (float)($ops['vendor_revenue_received'] ?? 0) + $sponsorshipReceived;
-                        $cashAtUseAuto = $availableFundsReceived;
+                        $cashAtUseAuto = $itemSpentTotal;
                         $cashLeftRaw = $availableFundsReceived - $committedPaid;
                         $cashLeft = max(0, $cashLeftRaw);
-                        $isBudgetOverrun = $availableFundsReceived < (float)$event['budget_total'];
+                        $isBudgetOverrun = $committedPaid > (float)$event['budget_total'];
                         $isHealthy = !$isBudgetOverrun
                             && (int)$ops['pending_bookings'] === 0
                             && (int)$ops['pending_payments'] === 0
@@ -1758,10 +1762,10 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                                 <span><span class="detail-label">Ticket Capacity:</span> <?php echo (int)$event['attendee_count']; ?> / <?php echo (int)$event['tickets_available']; ?></span>
                                 <span><span class="detail-label">Budget Plan:</span> KES <?php echo number_format($event['budget_total'], 2); ?></span>
                                 <span><span class="detail-label">Planned Spend:</span> KES <?php echo number_format($event['budget_committed'], 2); ?></span>
-                                <span><span class="detail-label">Money Spent (Incl Sponsorships):</span> KES <?php echo number_format($committedPaid, 2); ?></span>
+                                <span><span class="detail-label">Money Spent:</span> KES <?php echo number_format($committedPaid, 2); ?></span>
                                 <span><span class="detail-label">Item Spend Total:</span> KES <?php echo number_format($itemSpentTotal, 2); ?></span>
-                                <span><span class="detail-label">Cash at Use (Auto):</span> KES <?php echo number_format($cashAtUseAuto, 2); ?></span>
-                                <span><span class="detail-label">Sponsorships (Assumed Paid):</span> KES <?php echo number_format($sponsorshipReceived, 2); ?></span>
+                                <span><span class="detail-label">Cash in Use (Auto):</span> KES <?php echo number_format($cashAtUseAuto, 2); ?></span>
+                                <span><span class="detail-label">Sponsorships (Received):</span> KES <?php echo number_format($sponsorshipReceived, 2); ?></span>
                                 <span><span class="detail-label">Budget Left (Plan):</span> KES <?php echo number_format($availableBudget, 2); ?></span>
                                 <span><span class="detail-label">Money Received:</span> KES <?php echo number_format($availableFundsReceived, 2); ?></span>
                                 <span><span class="detail-label">Cash Left:</span> KES <?php echo number_format($cashLeft, 2); ?></span>
@@ -1867,7 +1871,7 @@ $draftProjectedFunds = $draftAttendeeContribution + $draftVendorContribution;
                                 </div>
 
                                 <div class="event-action-row">
-                                    <span class="adjustment-hint">Cash at Use is auto-filled from attendee revenue, vendor payments, and sponsorships.</span>
+                                    <span class="adjustment-hint">Cash in Use is auto-filled from manual spending in planned budget items.</span>
                                 </div>
 
                                 <div class="event-action-row-danger">

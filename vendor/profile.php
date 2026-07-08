@@ -5,6 +5,7 @@ requireRole('vendor');
 
 $fullName = $_SESSION['full_name'] ?? 'Vendor';
 $email = '';
+$phoneNumber = '';
 $businessName = '';
 $serviceType = '';
 $vendorType = 'service_provider';
@@ -53,6 +54,39 @@ function ensureVendorTypeSchema(PDO $pdo): void
     $ready = true;
 }
 
+function ensureUsersPhoneSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM users LIKE 'phone_number'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE users ADD COLUMN phone_number VARCHAR(20) DEFAULT NULL AFTER email");
+    }
+
+    $ready = true;
+}
+
+function normalizeKenyanPhone(string $raw): string
+{
+    $digits = preg_replace('/\D+/', '', $raw);
+    if ($digits === null) {
+        return '';
+    }
+
+    if (strpos($digits, '254') === 0 && strlen($digits) === 12) {
+        return $digits;
+    }
+
+    if (strpos($digits, '0') === 0 && strlen($digits) === 10) {
+        return '254' . substr($digits, 1);
+    }
+
+    return '';
+}
+
 function vendorServiceTypeOptions(): array
 {
     return [
@@ -71,6 +105,7 @@ function vendorServiceTypeOptions(): array
 try {
     ensureServiceRatingsTable($pdo);
     ensureVendorTypeSchema($pdo);
+    ensureUsersPhoneSchema($pdo);
 
     $stmt = $pdo->prepare("SELECT vendor_id FROM vendors WHERE user_id = ? LIMIT 1");
     $stmt->execute([$_SESSION['user_id']]);
@@ -115,11 +150,15 @@ try {
         if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_account_profile'])) {
             $newFullName = trim($_POST['full_name'] ?? '');
             $newEmail = trim($_POST['email'] ?? '');
+            $newPhoneRaw = trim((string)($_POST['phone_number'] ?? ''));
+            $newPhoneNumber = normalizeKenyanPhone($newPhoneRaw);
 
             if ($newFullName === '' || $newEmail === '') {
                 $_SESSION['flash_error'] = 'Full name and email are required.';
             } elseif (!filter_var($newEmail, FILTER_VALIDATE_EMAIL)) {
                 $_SESSION['flash_error'] = 'Please provide a valid email address.';
+            } elseif ($newPhoneRaw !== '' && $newPhoneNumber === '') {
+                $_SESSION['flash_error'] = 'Phone number format is invalid. Use 07XXXXXXXX or 2547XXXXXXXX.';
             } else {
                 $stmt = $pdo->prepare('SELECT user_id FROM users WHERE email = ? AND user_id <> ? LIMIT 1');
                 $stmt->execute([$newEmail, $_SESSION['user_id']]);
@@ -127,8 +166,8 @@ try {
                 if ($stmt->fetch()) {
                     $_SESSION['flash_error'] = 'That email is already in use by another account.';
                 } else {
-                    $stmt = $pdo->prepare('UPDATE users SET full_name = ?, email = ? WHERE user_id = ?');
-                    $stmt->execute([$newFullName, $newEmail, $_SESSION['user_id']]);
+                    $stmt = $pdo->prepare('UPDATE users SET full_name = ?, email = ?, phone_number = ? WHERE user_id = ?');
+                    $stmt->execute([$newFullName, $newEmail, $newPhoneNumber !== '' ? $newPhoneNumber : null, $_SESSION['user_id']]);
 
                     audit_log(
                         $pdo,
@@ -191,12 +230,13 @@ try {
         }
 
         // Fetch current data
-        $stmt = $pdo->prepare("SELECT v.business_name, v.service_type, COALESCE(v.vendor_type, 'service_provider') AS vendor_type, v.description, u.email, u.full_name FROM vendors v JOIN users u ON v.user_id = u.user_id WHERE v.user_id = ?");
+        $stmt = $pdo->prepare("SELECT v.business_name, v.service_type, COALESCE(v.vendor_type, 'service_provider') AS vendor_type, v.description, u.email, u.full_name, COALESCE(u.phone_number, '') AS phone_number FROM vendors v JOIN users u ON v.user_id = u.user_id WHERE v.user_id = ?");
         $stmt->execute([$_SESSION['user_id']]);
         $data = $stmt->fetch();
         if ($data) {
             $email = $data['email'];
             $fullName = $data['full_name'] ?? $fullName;
+            $phoneNumber = $data['phone_number'] ?? '';
             $businessName = $data['business_name'];
             $serviceType = $data['service_type'] ?? '';
             $vendorType = $data['vendor_type'] ?? 'service_provider';
@@ -671,6 +711,14 @@ try {
                     </div>
                 </div>
 
+                <div class="detail-row">
+                    <div class="detail-icon"><i class="fa-solid fa-phone"></i></div>
+                    <div class="detail-text">
+                        <div class="detail-label">Phone Number</div>
+                        <div class="detail-value"><?php echo htmlspecialchars($phoneNumber !== '' ? $phoneNumber : 'Not set'); ?></div>
+                    </div>
+                </div>
+
                 <?php if ($businessName !== ''): ?>
                 <div class="detail-row">
                     <div class="detail-icon"><i class="fa-solid fa-shop"></i></div>
@@ -752,6 +800,11 @@ try {
                         <input class="input" type="email" id="email" name="email" value="<?php echo htmlspecialchars($email); ?>" required>
                     </div>
 
+                    <div class="field">
+                        <label for="phone_number">Phone Number</label>
+                        <input class="input" type="text" id="phone_number" name="phone_number" value="<?php echo htmlspecialchars($phoneNumber); ?>" placeholder="e.g. 0712345678">
+                    </div>
+
                     <div class="actions">
                         <button type="submit" name="update_account_profile" value="1" class="btn-primary">Save Account</button>
                         <button type="button" class="btn-outline" onclick="toggleEditForms()">Cancel</button>
@@ -811,9 +864,21 @@ try {
             <i class="fa-solid fa-book-open"></i><span>Bookings</span>
             <?php if ($newPendingCount > 0): ?><span class="badge-unread"><?php echo $newPendingCount; ?></span><?php endif; ?>
         </a>
-        <a href="schedule.php" class="nav-link">
-            <i class="fa-solid fa-calendar-days"></i><span>Schedule</span>
-        </a>
+        <?php if ($vendorType === 'market_operator'): ?>
+            <a href="pay_fee.php" class="nav-link">
+                <i class="fa-solid fa-wallet"></i><span>Fees</span>
+            </a>
+            <a href="schedule.php" class="nav-link">
+                <i class="fa-solid fa-calendar-days"></i><span>Schedule</span>
+            </a>
+        <?php else: ?>
+            <a href="booking_history.php" class="nav-link">
+                <i class="fa-solid fa-clock-rotate-left"></i><span>History</span>
+            </a>
+            <a href="payment_history.php" class="nav-link">
+                <i class="fa-solid fa-money-bill-wave"></i><span>Payments</span>
+            </a>
+        <?php endif; ?>
         <a href="profile.php" class="nav-link active">
             <i class="fa-solid fa-user"></i><span>Profile</span>
         </a>

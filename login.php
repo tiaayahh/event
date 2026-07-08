@@ -24,6 +24,34 @@ const LOGIN_MAX_ATTEMPTS = 5;
 const LOGIN_WINDOW_MINUTES = 15;
 const LOGIN_TOTP_MAX_ATTEMPTS = 5;
 
+function loginEnsureVendorTypeSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM vendors LIKE 'vendor_type'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE vendors ADD COLUMN vendor_type ENUM('service_provider','market_operator') NOT NULL DEFAULT 'service_provider' AFTER service_type");
+    }
+
+    $ready = true;
+}
+
+function loginResolveVendorType(PDO $pdo, int $userId): string
+{
+    loginEnsureVendorTypeSchema($pdo);
+
+    $stmt = $pdo->prepare("SELECT COALESCE(vendor_type, 'service_provider') AS vendor_type FROM vendors WHERE user_id = ? LIMIT 1");
+    $stmt->execute([$userId]);
+    $vendorType = (string)($stmt->fetchColumn() ?: 'service_provider');
+
+    return in_array($vendorType, ['service_provider', 'market_operator'], true)
+        ? $vendorType
+        : 'service_provider';
+}
+
 function ensureLoginAttemptsTable(PDO $pdo): void
 {
     static $initialized = false;
@@ -122,6 +150,7 @@ function completeLoginAndRedirect(array $user, PDO $pdo): void
     $_SESSION['user_id']   = (int)$user['user_id'];
     $_SESSION['full_name'] = (string)$user['full_name'];
     $_SESSION['role']      = (string)$user['role'];
+    unset($_SESSION['vendor_type']);
     $_SESSION['last_activity_at'] = time();
 
     clearPendingOtpContext();
@@ -143,7 +172,9 @@ function completeLoginAndRedirect(array $user, PDO $pdo): void
             header('Location: admin/dashboard.php', true, 303);
             break;
         case 'vendor':
-            header('Location: vendor/dashboard.php', true, 303);
+            $vendorType = loginResolveVendorType($pdo, (int)$user['user_id']);
+            $_SESSION['vendor_type'] = $vendorType;
+            header('Location: ' . ($vendorType === 'market_operator' ? 'vendor/stall_registration.php' : 'vendor/bookings.php'), true, 303);
             break;
         case 'attendee':
             header('Location: attendee/dashboard.php', true, 303);

@@ -20,6 +20,8 @@ require_once __DIR__ . '/audit.php';
 const LOGIN_PATH = '../login.php';
 const ADMIN_DASHBOARD_PATH = '../admin/dashboard.php';
 const VENDOR_DASHBOARD_PATH = '../vendor/dashboard.php';
+const SERVICE_PROVIDER_DASHBOARD_PATH = '../vendor/bookings.php';
+const MARKET_OPERATOR_DASHBOARD_PATH = '../vendor/stall_registration.php';
 const ATTENDEE_DASHBOARD_PATH = '../attendee/dashboard.php';
 const SESSION_IDLE_TIMEOUT_SECONDS = 0;
 
@@ -38,12 +40,90 @@ function ensureEventsArchiveColumn(PDO $pdo): void {
     $ready = true;
 }
 
+function authEnsureVendorTypeSchema(PDO $pdo): void {
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM vendors LIKE 'vendor_type'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE vendors ADD COLUMN vendor_type ENUM('service_provider','market_operator') NOT NULL DEFAULT 'service_provider' AFTER service_type");
+    }
+
+    $ready = true;
+}
+
+function authResolveVendorTypeByUserId(PDO $pdo, int $userId): string {
+    authEnsureVendorTypeSchema($pdo);
+
+    $stmt = $pdo->prepare("SELECT COALESCE(vendor_type, 'service_provider') AS vendor_type FROM vendors WHERE user_id = ? LIMIT 1");
+    $stmt->execute([$userId]);
+    $vendorType = (string)($stmt->fetchColumn() ?: 'service_provider');
+
+    return in_array($vendorType, ['service_provider', 'market_operator'], true)
+        ? $vendorType
+        : 'service_provider';
+}
+
+function getVendorDashboardPath(): string {
+    $vendorType = (string)($_SESSION['vendor_type'] ?? '');
+
+    if (!in_array($vendorType, ['service_provider', 'market_operator'], true) && isset($_SESSION['user_id'])) {
+        $vendorType = authResolveVendorTypeByUserId($GLOBALS['pdo'], (int)$_SESSION['user_id']);
+        $_SESSION['vendor_type'] = $vendorType;
+    }
+
+    if ($vendorType === 'market_operator') {
+        return MARKET_OPERATOR_DASHBOARD_PATH;
+    }
+
+    if ($vendorType === 'service_provider') {
+        return SERVICE_PROVIDER_DASHBOARD_PATH;
+    }
+
+    return VENDOR_DASHBOARD_PATH;
+}
+
+function getCurrentVendorType(): string {
+    if (!isset($_SESSION['user_id']) || (string)($_SESSION['role'] ?? '') !== 'vendor') {
+        return '';
+    }
+
+    $vendorType = (string)($_SESSION['vendor_type'] ?? '');
+    if (!in_array($vendorType, ['service_provider', 'market_operator'], true)) {
+        $vendorType = authResolveVendorTypeByUserId($GLOBALS['pdo'], (int)$_SESSION['user_id']);
+        $_SESSION['vendor_type'] = $vendorType;
+    }
+
+    return $vendorType;
+}
+
+function requireVendorType(string $type): void {
+    $allowed = ['service_provider', 'market_operator'];
+    if (!in_array($type, $allowed, true)) {
+        return;
+    }
+
+    if (!isset($_SESSION['role']) || (string)$_SESSION['role'] !== 'vendor') {
+        header('Location: ' . LOGIN_PATH);
+        exit;
+    }
+
+    $currentType = getCurrentVendorType();
+    if ($currentType !== $type) {
+        $_SESSION['flash_error'] = 'Access denied for this vendor type.';
+        header('Location: ' . getVendorDashboardPath());
+        exit;
+    }
+}
+
 function getDashboardPathByRole($role) {
     switch ($role) {
         case 'planner':
             return ADMIN_DASHBOARD_PATH;
         case 'vendor':
-            return VENDOR_DASHBOARD_PATH;
+            return getVendorDashboardPath();
         case 'attendee':
             return ATTENDEE_DASHBOARD_PATH;
         default:

@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INT AUTO_INCREMENT PRIMARY KEY,
     full_name VARCHAR(150) NOT NULL,
     email VARCHAR(190) NOT NULL UNIQUE,
+    phone_number VARCHAR(20) DEFAULT NULL,
     password_hash VARCHAR(255) NOT NULL,
     role ENUM('planner', 'vendor', 'attendee') NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -165,13 +166,16 @@ CREATE TABLE IF NOT EXISTS stall_rentals (
 CREATE TABLE IF NOT EXISTS transactions (
     transaction_id INT AUTO_INCREMENT PRIMARY KEY,
     booking_id INT NOT NULL,
+    vendor_user_id INT DEFAULT NULL,
     mpesa_code VARCHAR(64) DEFAULT NULL,
     amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
     status ENUM('pending', 'paid', 'failed') NOT NULL DEFAULT 'pending',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_transactions_booking (booking_id),
     INDEX idx_transactions_status (status),
-    CONSTRAINT fk_transactions_booking FOREIGN KEY (booking_id) REFERENCES bookings(booking_id) ON DELETE CASCADE
+    INDEX idx_transactions_vendor_user (vendor_user_id),
+    CONSTRAINT fk_transactions_booking FOREIGN KEY (booking_id) REFERENCES bookings(booking_id) ON DELETE CASCADE,
+    CONSTRAINT fk_transactions_vendor_user FOREIGN KEY (vendor_user_id) REFERENCES users(user_id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS attendances (

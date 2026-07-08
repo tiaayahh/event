@@ -47,6 +47,39 @@ function ensureVendorTypeSchema(PDO $pdo): void
     $ready = true;
 }
 
+function ensureUsersPhoneSchema(PDO $pdo): void
+{
+    static $ready = false;
+    if ($ready) {
+        return;
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM users LIKE 'phone_number'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE users ADD COLUMN phone_number VARCHAR(20) DEFAULT NULL AFTER email");
+    }
+
+    $ready = true;
+}
+
+function normalizeKenyanPhone(string $raw): string
+{
+    $digits = preg_replace('/\D+/', '', $raw);
+    if ($digits === null) {
+        return '';
+    }
+
+    if (strpos($digits, '254') === 0 && strlen($digits) === 12) {
+        return $digits;
+    }
+
+    if (strpos($digits, '0') === 0 && strlen($digits) === 10) {
+        return '254' . substr($digits, 1);
+    }
+
+    return '';
+}
+
 function isDisposableEmailDomain(string $email): bool
 {
     $domain = strtolower((string)substr(strrchr($email, '@') ?: '', 1));
@@ -84,6 +117,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $email    = strtolower(trim($_POST['email']));
     $rawPassword = $_POST['password'] ?? '';
     $role     = $_POST['role'] ?? '';
+    $vendorTypeInput = strtolower(trim((string)($_POST['vendor_type'] ?? '')));
+    $phoneRaw = trim((string)($_POST['phone_number'] ?? ''));
+    $normalizedPhone = normalizeKenyanPhone($phoneRaw);
 
     if (!in_array($role, ['vendor', 'attendee', 'planner'], true)) {
         $error = 'Please select a valid role.';
@@ -97,6 +133,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $error = 'Please use a permanent email address.';
     } elseif (!isStrongPassword($rawPassword)) {
         $error = 'Password must be at least 8 characters and include uppercase, lowercase, number, and symbol.';
+    } elseif ($role === 'vendor' && $normalizedPhone === '') {
+        $error = 'Vendor phone number is required. Use 07XXXXXXXX or 2547XXXXXXXX.';
+    } elseif ($role === 'vendor' && !in_array($vendorTypeInput, ['service_provider', 'market_operator'], true)) {
+        $error = 'Please choose whether you are a service provider or market operator.';
     }
 
     if ($error === '') {
@@ -112,9 +152,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         try {
             $pdo->beginTransaction();
+            ensureUsersPhoneSchema($pdo);
 
-            $stmt = $pdo->prepare("INSERT INTO users (full_name, email, password_hash, role) VALUES (?, ?, ?, ?)");
-            $stmt->execute([$fullName, $email, $password, $role]);
+            $stmt = $pdo->prepare("INSERT INTO users (full_name, email, phone_number, password_hash, role) VALUES (?, ?, ?, ?, ?)");
+            $stmt->execute([$fullName, $email, $normalizedPhone !== '' ? $normalizedPhone : null, $password, $role]);
             $userId = $pdo->lastInsertId();
 
             if ($role === 'vendor') {
@@ -130,11 +171,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 if (!in_array($vendorType, ['service_provider', 'market_operator'], true)) {
-                    $vendorType = 'service_provider';
+                    throw new RuntimeException('Please choose whether you are a service provider or market operator.');
                 }
 
-                if ($businessName === '' || $serviceType === '') {
-                    throw new RuntimeException('Business name and service type are required for vendors.');
+                if ($businessName === '') {
+                    throw new RuntimeException('Business name is required for vendors.');
+                }
+
+                if ($vendorType === 'service_provider') {
+                    if ($serviceType === '') {
+                        throw new RuntimeException('Service type is required for service providers.');
+                    }
+                } else {
+                    if ($serviceType === '' || !in_array($serviceType, $allowedServiceTypes, true)) {
+                        $serviceType = 'Market Stall Seller';
+                    }
                 }
 
                 $stmt = $pdo->prepare("INSERT INTO vendors (user_id, business_name, service_type, vendor_type, description) VALUES (?, ?, ?, ?, ?)");
@@ -370,6 +421,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             </div>
 
             <div class="form-group">
+                <label for="phone_number">Phone Number</label>
+                <input type="text" id="phone_number" name="phone_number" class="form-control" placeholder="e.g. 0712345678" value="<?php echo htmlspecialchars((string)($_POST['phone_number'] ?? '')); ?>">
+                <p class="password-hint">Required for vendors to receive M-Pesa STK payments.</p>
+            </div>
+
+            <div class="form-group">
                 <label for="password">Password</label>
                 <input type="password" id="password" name="password" class="form-control" placeholder="Use a strong password" required>
                 <p class="password-hint">Use at least 8 characters with uppercase, lowercase, number, and symbol.</p>
@@ -379,9 +436,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <label for="roleSelect">I am a</label>
                 <select name="role" id="roleSelect" class="form-control" required>
                     <option value="">-- Select your role --</option>
-                    <option value="planner">Planner</option>
-                    <option value="vendor">Vendor</option>
-                    <option value="attendee">Attendee</option>
+                    <option value="planner" <?php echo (($_POST['role'] ?? '') === 'planner') ? 'selected' : ''; ?>>Planner</option>
+                    <option value="vendor" <?php echo (($_POST['role'] ?? '') === 'vendor') ? 'selected' : ''; ?>>Vendor</option>
+                    <option value="attendee" <?php echo (($_POST['role'] ?? '') === 'attendee') ? 'selected' : ''; ?>>Attendee</option>
                 </select>
             </div>
 
@@ -389,26 +446,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <div class="form-group">
                     <label for="vendor_type">Are you a</label>
                     <select id="vendor_type" name="vendor_type" class="form-control">
-                        <option value="service_provider">Service Provider (DJ, Caterer, Photographer - hired by planners to do a job)</option>
-                        <option value="market_operator">Market Operator (Small business selling goods - pays a stall fee to sell at events)</option>
+                        <option value="">-- Select vendor type --</option>
+                        <option value="service_provider" <?php echo (($_POST['vendor_type'] ?? '') === 'service_provider') ? 'selected' : ''; ?>>Service Provider (DJ, Caterer, Photographer - hired by planners to do a job)</option>
+                        <option value="market_operator" <?php echo (($_POST['vendor_type'] ?? '') === 'market_operator') ? 'selected' : ''; ?>>Market Operator (Small business selling goods - pays a stall fee to sell at events)</option>
                     </select>
                 </div>
                 <div class="form-group">
                     <label for="business_name">Business Name</label>
-                    <input type="text" id="business_name" name="business_name" class="form-control" placeholder="e.g. DJ Brian Entertainments">
+                    <input type="text" id="business_name" name="business_name" class="form-control" placeholder="e.g. DJ Brian Entertainments" value="<?php echo htmlspecialchars((string)($_POST['business_name'] ?? '')); ?>">
                 </div>
                 <div class="form-group">
-                    <label for="service_type">Service Type</label>
+                    <label for="service_type" id="serviceTypeLabel">Service Type</label>
                     <select id="service_type" name="service_type" class="form-control">
                         <option value="">-- Select service type --</option>
                         <?php foreach (vendorServiceTypeOptions() as $option): ?>
-                            <option value="<?php echo htmlspecialchars($option); ?>"><?php echo htmlspecialchars($option); ?></option>
+                            <option value="<?php echo htmlspecialchars($option); ?>" <?php echo (($_POST['service_type'] ?? '') === $option) ? 'selected' : ''; ?>><?php echo htmlspecialchars($option); ?></option>
                         <?php endforeach; ?>
                     </select>
                 </div>
                 <div class="form-group">
                     <label for="description">Description</label>
-                    <textarea id="description" name="description" class="form-control" rows="3" placeholder="Tell clients about your service..."></textarea>
+                    <textarea id="description" name="description" class="form-control" rows="3" placeholder="Tell clients about your service..."><?php echo htmlspecialchars((string)($_POST['description'] ?? '')); ?></textarea>
                 </div>
             </div>
 
@@ -423,15 +481,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     <script>
         const roleSelect = document.getElementById('roleSelect');
         const vendorFields = document.getElementById('vendorFields');
+        const vendorTypeSelect = document.getElementById('vendor_type');
+        const businessNameInput = document.getElementById('business_name');
+        const serviceTypeSelect = document.getElementById('service_type');
+        const serviceTypeLabel = document.getElementById('serviceTypeLabel');
+
+        function syncVendorFieldRequirements() {
+            const isVendor = roleSelect.value === 'vendor';
+            const isServiceProvider = vendorTypeSelect.value === 'service_provider';
+
+            vendorTypeSelect.required = isVendor;
+            businessNameInput.required = isVendor;
+            serviceTypeSelect.required = isVendor && isServiceProvider;
+
+            serviceTypeLabel.textContent = isServiceProvider ? 'Service Type' : 'Service Type (optional for market operators)';
+        }
 
         roleSelect.addEventListener('change', function () {
             vendorFields.style.display = this.value === 'vendor' ? 'block' : 'none';
+            syncVendorFieldRequirements();
         });
+
+        vendorTypeSelect.addEventListener('change', syncVendorFieldRequirements);
 
         // Show vendor fields on page load if vendor was pre-selected (e.g., after validation error)
         if (roleSelect.value === 'vendor') {
             vendorFields.style.display = 'block';
         }
+
+        syncVendorFieldRequirements();
     </script>
 </body>
 </html>

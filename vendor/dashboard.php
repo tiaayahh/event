@@ -911,6 +911,12 @@ try {
                 <a href="messages.php?unread=1" class="quick-link"><i class="fa-solid fa-comments"></i> View Messages</a>
                 <a href="services.php" class="quick-link"><i class="fa-solid fa-bell-concierge"></i> Update Services</a>
                 <a href="download_pass.php" class="quick-link"><i class="fa-solid fa-id-badge"></i> Download Vendor Pass</a>
+                <?php if ($isMarketOperator): ?>
+                    <a href="pay_fee.php" class="quick-link"><i class="fa-solid fa-wallet"></i> Pay Fees</a>
+                <?php else: ?>
+                    <a href="booking_history.php" class="quick-link"><i class="fa-solid fa-clock-rotate-left"></i> Booking History</a>
+                    <a href="payment_history.php" class="quick-link"><i class="fa-solid fa-money-bill-wave"></i> Payment History</a>
+                <?php endif; ?>
             </div>
         </div>
 
@@ -1049,10 +1055,25 @@ try {
             <span>Bookings</span>
             <?php if ($newPendingCount > 0): ?><span class="badge-unread"><?php echo $newPendingCount; ?></span><?php endif; ?>
         </a>
-        <a href="schedule.php" class="nav-link">
-            <i class="fa-solid fa-calendar-days"></i>
-            <span>Schedule</span>
-        </a>
+        <?php if ($isMarketOperator): ?>
+            <a href="pay_fee.php" class="nav-link">
+                <i class="fa-solid fa-wallet"></i>
+                <span>Fees</span>
+            </a>
+            <a href="schedule.php" class="nav-link">
+                <i class="fa-solid fa-calendar-days"></i>
+                <span>Schedule</span>
+            </a>
+        <?php else: ?>
+            <a href="booking_history.php" class="nav-link">
+                <i class="fa-solid fa-clock-rotate-left"></i>
+                <span>History</span>
+            </a>
+            <a href="payment_history.php" class="nav-link">
+                <i class="fa-solid fa-money-bill-wave"></i>
+                <span>Payments</span>
+            </a>
+        <?php endif; ?>
         <a href="profile.php" class="nav-link">
             <i class="fa-solid fa-user"></i>
             <span>Profile</span>

@@ -212,39 +212,63 @@ try {
             );
 
             $success = 'Mpesa prompt sent. Complete the payment on your phone.';
-        } elseif ($action === 'confirm_paid') {
+        } elseif ($action === 'save') {
+            $stallLabel = trim((string)($_POST['stall_label'] ?? ''));
             $mpesaCode = strtoupper(trim((string)($_POST['mpesa_code'] ?? '')));
-            if (!preg_match('/^[A-Z0-9]{6,20}$/', $mpesaCode)) {
-                throw new RuntimeException('Enter a valid M-Pesa code (6-20 letters/numbers).');
+            $paymentStatus = strtolower(trim((string)($_POST['payment_status'] ?? 'pending')));
+
+            if ($stallLabel !== '' && strlen($stallLabel) > 80) {
+                throw new RuntimeException('Stall label must be 80 characters or fewer.');
+            }
+            if (!in_array($paymentStatus, ['pending', 'paid', 'failed', 'cancelled'], true)) {
+                throw new RuntimeException('Invalid payment status selected.');
+            }
+            if ($paymentStatus === 'paid' && $mpesaCode === '') {
+                throw new RuntimeException('M-Pesa code is required when marking as paid.');
+            }
+            if ($mpesaCode !== '' && !preg_match('/^[A-Z0-9]{6,20}$/', $mpesaCode)) {
+                throw new RuntimeException('Invalid M-Pesa code format.');
             }
 
             $stmt = $pdo->prepare(
                 "INSERT INTO stall_rentals
-                    (event_id, vendor_user_id, created_by_planner, amount, mpesa_code, payment_status)
-                 VALUES (?, ?, ?, ?, ?, 'paid')
+                    (event_id, vendor_user_id, created_by_planner, stall_label, amount, mpesa_code, payment_status)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
                  ON DUPLICATE KEY UPDATE
                     created_by_planner = VALUES(created_by_planner),
+                    stall_label = VALUES(stall_label),
                     amount = VALUES(amount),
                     mpesa_code = VALUES(mpesa_code),
-                    payment_status = 'paid',
+                    payment_status = VALUES(payment_status),
                     updated_at = CURRENT_TIMESTAMP"
             );
-            $stmt->execute([$eventId, $vendorUserId, (int)$event['planner_id'], $rentalAmount, $mpesaCode]);
+            $stmt->execute([
+                (int)$eventId,
+                $vendorUserId,
+                (int)$event['planner_id'],
+                $stallLabel !== '' ? $stallLabel : null,
+                $rentalAmount,
+                $mpesaCode !== '' ? $mpesaCode : null,
+                $paymentStatus,
+            ]);
 
             audit_log(
                 $pdo,
                 $vendorUserId,
                 'vendor',
-                'vendor.stall_payment_confirmed',
+                'vendor.stall_manual_reconcile',
                 'event',
                 (string)$eventId,
                 [
-                    'amount' => $rentalAmount,
+                    'status' => $paymentStatus,
                     'mpesa_code' => $mpesaCode,
+                    'amount' => $rentalAmount,
                 ]
             );
 
-            $success = 'Stall payment marked as paid.';
+            $success = 'Stall payment saved successfully.';
+        } else {
+            throw new RuntimeException('Unsupported payment action.');
         }
     }
 
@@ -318,7 +342,7 @@ try {
         .form-row { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; margin-top: 10px; align-items: end; }
         .form-row .form-group { margin: 0; }
         label { display: block; font-size: 12px; color: #4B5563; margin-bottom: 5px; }
-        input[type="text"] { width: 100%; padding: 9px 10px; border: 1px solid #d6d6e7; border-radius: 6px; font-size: 13px; }
+        input[type="text"], select { width: 100%; padding: 9px 10px; border: 1px solid #d6d6e7; border-radius: 6px; font-size: 13px; }
         .btn { border: none; border-radius: 8px; padding: 10px 12px; font-size: 12px; cursor: pointer; font-weight: 700; }
         .btn-primary { background: #6C63FF; color: #fff; }
         .btn-secondary { background: #ece9ff; color: #3f379f; }
@@ -356,7 +380,7 @@ try {
         <?php endif; ?>
 
         <?php if (!$darajaConfigured): ?>
-            <div class="message error">Daraja is not fully configured, but manual payment confirmation still works.</div>
+            <div class="message error">Daraja is not fully configured. Configure Daraja to use STK push payments.</div>
         <?php endif; ?>
 
         <?php if (empty($events)): ?>
@@ -397,16 +421,30 @@ try {
                     <?php if ($awaitingCallback): ?>
                         <div class="note">Mpesa prompt sent. Waiting for M-Pesa callback to update status automatically.</div>
                     <?php else: ?>
-                        <form method="post" class="action-row">
-                            <?php echo csrf_input(); ?>
-                            <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
-                            <input type="hidden" name="action" value="confirm_paid">
-                            <input type="text" name="mpesa_code" maxlength="20" placeholder="Enter M-Pesa code" required>
-                            <button type="submit" class="btn btn-secondary">Manual Confirm</button>
-                        </form>
+                        <div class="note">Use STK push first. If callback is delayed, use manual fallback below.</div>
                     <?php endif; ?>
 
-                    <div class="note">If callback is configured, paid status is updated automatically after successful Mpesa prompt completion.</div>
+                    <form method="post" class="form-row" style="margin-top:12px;">
+                        <?php echo csrf_input(); ?>
+                        <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
+                        <input type="hidden" name="action" value="save">
+                        <div class="form-group">
+                            <label>Fallback Status</label>
+                            <select name="payment_status" required>
+                                <option value="pending" <?php echo $rawStatus === 'pending' ? 'selected' : ''; ?>>Pending</option>
+                                <option value="paid" <?php echo $rawStatus === 'paid' ? 'selected' : ''; ?>>Paid</option>
+                                <option value="failed" <?php echo $rawStatus === 'failed' ? 'selected' : ''; ?>>Failed</option>
+                                <option value="cancelled" <?php echo $rawStatus === 'cancelled' ? 'selected' : ''; ?>>Cancelled</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>M-Pesa Code (for Paid)</label>
+                            <input type="text" name="mpesa_code" maxlength="20" placeholder="e.g. QWE123RTY" value="<?php echo htmlspecialchars((string)($event['mpesa_code'] ?? '')); ?>">
+                        </div>
+                        <button type="submit" class="btn btn-secondary">Save Fallback</button>
+                    </form>
+
+                    <div class="note">Primary flow remains STK + callback; fallback is only for missed callbacks.</div>
                 </article>
             <?php endforeach; ?>
         <?php endif; ?>

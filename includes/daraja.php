@@ -1,5 +1,9 @@
 <?php
 
+if (!defined('DARAJA_TEST_AMOUNT')) {
+    define('DARAJA_TEST_AMOUNT', 1.0);
+}
+
 if (!function_exists('daraja_config')) {
     function daraja_config(): array
     {
@@ -85,20 +89,8 @@ if (!function_exists('daraja_is_stk_configured')) {
 if (!function_exists('daraja_effective_stk_amount')) {
     function daraja_effective_stk_amount(float $intendedAmount): float
     {
-        $cfg = daraja_config();
-        if (($cfg['env'] ?? 'sandbox') !== 'sandbox') {
-            return $intendedAmount;
-        }
-
-        $raw = trim((string)(getenv('DARAJA_SANDBOX_TEST_AMOUNT') ?: ''));
-        if ($raw !== '' && is_numeric($raw)) {
-            $parsed = (float)$raw;
-            if ($parsed > 0) {
-                return $parsed;
-            }
-        }
-
-        return $intendedAmount;
+        // Demo policy: all STK requests use KES 1 regardless of configured business amount.
+        return (float)DARAJA_TEST_AMOUNT;
     }
 }
 
