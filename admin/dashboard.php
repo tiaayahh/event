@@ -1168,9 +1168,14 @@ if ($pendingBookings > 0) {
     <div class="main-wrapper">
         <header class="header">
             <div class="header-brand-mobile">Planora</div>
-            <a href="../logout.php" class="logout-btn">
-                <i class="fa-solid fa-right-from-bracket"></i> Logout
-            </a>
+            <div style="display:flex; align-items:center; gap:8px;">
+                <a href="../two_factor_setup.php" class="logout-btn">
+                    <i class="fa-solid fa-shield-halved"></i> Manage 2-Step
+                </a>
+                <a href="../logout.php" class="logout-btn">
+                    <i class="fa-solid fa-right-from-bracket"></i> Logout
+                </a>
+            </div>
         </header>
 
         <main class="content">

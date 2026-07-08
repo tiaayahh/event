@@ -436,7 +436,10 @@ try {
 <body>
 <header class="header">
     <div class="brand">PLANORA</div>
-    <a class="logout-btn" href="../logout.php">Logout</a>
+    <div style="display:flex; align-items:center; gap:8px;">
+        <a class="logout-btn" href="../two_factor_setup.php"><i class="fa-solid fa-shield-halved"></i> Manage 2-Step</a>
+        <a class="logout-btn" href="../logout.php">Logout</a>
+    </div>
 </header>
 <div class="container">
     <p class="welcome">Welcome, <?php echo htmlspecialchars($fullName); ?>.</p>
