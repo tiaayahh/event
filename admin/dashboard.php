@@ -1161,6 +1161,7 @@ if ($pendingBookings > 0) {
             <li><a href="messages.php"><span class="menu-label"><i class="fa-solid fa-comments"></i> Messages</span><?php if ($unreadMessages > 0): ?><span class="badge-unread"><?php echo $unreadMessages; ?></span><?php endif; ?></a></li>
             <li><a href="mpesa_payments.php"><span class="menu-label"><i class="fa-solid fa-book-bookmark"></i> Booking Payments</span></a></li>
             <li><a href="stall_payments.php"><span class="menu-label"><i class="fa-solid fa-store"></i> Stall Payments</span></a></li>
+            <li><a href="checkin.php"><span class="menu-label"><i class="fa-solid fa-qrcode"></i> QR Check-in</span></a></li>
             <li><a href="profile.php"><span class="menu-label"><i class="fa-solid fa-user"></i> Profile</span></a></li>
         </ul>
     </aside>
@@ -1292,6 +1293,9 @@ if ($pendingBookings > 0) {
                         </a>
                         <a href="stall_payments.php" class="btn btn-secondary">
                             <i class="fa-solid fa-store"></i> Stall Payment Reconciliation
+                        </a>
+                        <a href="checkin.php" class="btn btn-secondary">
+                            <i class="fa-solid fa-qrcode"></i> QR Check-in
                         </a>
                     </div>
                 </div>
@@ -1491,6 +1495,10 @@ if ($pendingBookings > 0) {
         <a href="mpesa_payments.php" class="bottom-nav-item">
             <i class="fa-solid fa-book-bookmark"></i>
             <span>M-Pesa</span>
+        </a>
+        <a href="checkin.php" class="bottom-nav-item">
+            <i class="fa-solid fa-qrcode"></i>
+            <span>Check-in</span>
         </a>
         <a href="../logout.php" class="bottom-nav-item">
             <i class="fa-solid fa-right-from-bracket"></i>

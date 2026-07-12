@@ -1,7 +1,11 @@
 <?php
 
+if (!defined('DARAJA_SANDBOX_AMOUNT')) {
+    define('DARAJA_SANDBOX_AMOUNT', 1.0);
+}
+
 if (!defined('DARAJA_TEST_AMOUNT')) {
-    define('DARAJA_TEST_AMOUNT', 1.0);
+    define('DARAJA_TEST_AMOUNT', (float)DARAJA_SANDBOX_AMOUNT);
 }
 
 if (!function_exists('daraja_config')) {
@@ -90,7 +94,7 @@ if (!function_exists('daraja_effective_stk_amount')) {
     function daraja_effective_stk_amount(float $intendedAmount): float
     {
         // Demo policy: all STK requests use KES 1 regardless of configured business amount.
-        return (float)DARAJA_TEST_AMOUNT;
+        return (float)DARAJA_SANDBOX_AMOUNT;
     }
 }
 
@@ -136,8 +140,86 @@ if (!function_exists('daraja_apply_curl_network_options')) {
 }
 
 if (!function_exists('daraja_get_access_token')) {
+    function daraja_token_cache_path(array $cfg): string
+    {
+        $env = preg_replace('/[^a-z0-9_\-]/i', '', strtolower((string)($cfg['env'] ?? 'sandbox')));
+        if ($env === null || $env === '') {
+            $env = 'sandbox';
+        }
+
+        $cacheDir = dirname(__DIR__) . '/storage/cache';
+        if (!is_dir($cacheDir)) {
+            @mkdir($cacheDir, 0775, true);
+        }
+
+        return $cacheDir . '/daraja_token_' . $env . '.json';
+    }
+}
+
+if (!function_exists('daraja_load_cached_access_token')) {
+    function daraja_load_cached_access_token(array $cfg): ?array
+    {
+        $cachePath = daraja_token_cache_path($cfg);
+        if (!is_file($cachePath)) {
+            return null;
+        }
+
+        $json = @file_get_contents($cachePath);
+        if (!is_string($json) || trim($json) === '') {
+            return null;
+        }
+
+        $payload = json_decode($json, true);
+        if (!is_array($payload)) {
+            return null;
+        }
+
+        $token = trim((string)($payload['access_token'] ?? ''));
+        $expiresAt = (int)($payload['expires_at'] ?? 0);
+        if ($token === '' || $expiresAt <= 0) {
+            return null;
+        }
+
+        // Keep a small safety margin so we don't send nearly-expired tokens.
+        if ($expiresAt <= (time() + 30)) {
+            return null;
+        }
+
+        return [
+            'token' => $token,
+            'expires_at' => $expiresAt,
+        ];
+    }
+}
+
+if (!function_exists('daraja_store_cached_access_token')) {
+    function daraja_store_cached_access_token(array $cfg, string $token, int $expiresInSeconds): void
+    {
+        $token = trim($token);
+        if ($token === '') {
+            return;
+        }
+
+        $ttl = max(60, $expiresInSeconds);
+        $cachePath = daraja_token_cache_path($cfg);
+        $payload = [
+            'access_token' => $token,
+            'expires_at' => time() + $ttl,
+            'cached_at' => time(),
+        ];
+
+        @file_put_contents($cachePath, json_encode($payload, JSON_UNESCAPED_SLASHES));
+    }
+}
+
+if (!function_exists('daraja_get_access_token')) {
     function daraja_get_access_token(array $cfg): array
     {
+        $cached = daraja_load_cached_access_token($cfg);
+        if (is_array($cached) && !empty($cached['token'])) {
+            return ['success' => true, 'token' => (string)$cached['token'], 'cached' => true];
+        }
+
         $auth = base64_encode($cfg['consumer_key'] . ':' . $cfg['consumer_secret']);
 
         $ch = curl_init($cfg['oauth_url']);
@@ -163,6 +245,11 @@ if (!function_exists('daraja_get_access_token')) {
 
         $payload = json_decode((string)$raw, true);
         if (!is_array($payload) || empty($payload['access_token'])) {
+            // Fallback to any still-valid cached token if endpoint returns malformed/empty payload.
+            $cached = daraja_load_cached_access_token($cfg);
+            if (is_array($cached) && !empty($cached['token'])) {
+                return ['success' => true, 'token' => (string)$cached['token'], 'cached' => true];
+            }
             return ['success' => false, 'message' => 'Unable to retrieve Daraja access token.'];
         }
 
@@ -170,7 +257,11 @@ if (!function_exists('daraja_get_access_token')) {
             return ['success' => false, 'message' => 'Daraja token request failed with HTTP ' . $httpCode . '.'];
         }
 
-        return ['success' => true, 'token' => (string)$payload['access_token']];
+        $token = (string)$payload['access_token'];
+        $expiresIn = (int)($payload['expires_in'] ?? 3599);
+        daraja_store_cached_access_token($cfg, $token, $expiresIn);
+
+        return ['success' => true, 'token' => $token, 'cached' => false];
     }
 }
 

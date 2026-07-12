@@ -211,10 +211,12 @@ function ensure_attendee_ticket_payments_callback_schema(PDO $pdo): void
             status ENUM('requested', 'paid', 'failed') NOT NULL DEFAULT 'requested',
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            UNIQUE KEY uq_attendee_ticket_payment (event_id, attendee_id),
+            checked_in_at TIMESTAMP NULL DEFAULT NULL,
+            checkin_by_user_id INT NULL DEFAULT NULL,
             INDEX idx_attendee_ticket_payment_event_status (event_id, status),
             INDEX idx_attendee_ticket_payment_attendee (attendee_id),
             INDEX idx_attendee_ticket_payment_checkout (checkout_request_id),
+            INDEX idx_attendee_ticket_payment_checkin (event_id, attendee_id, status, checked_in_at),
             CONSTRAINT fk_attendee_ticket_payment_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
             CONSTRAINT fk_attendee_ticket_payment_attendee FOREIGN KEY (attendee_id) REFERENCES attendees(attendee_id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
@@ -229,6 +231,22 @@ function ensure_attendee_ticket_payments_callback_schema(PDO $pdo): void
         $pdo->exec("CREATE INDEX idx_attendee_ticket_payment_checkout ON attendee_ticket_payments (checkout_request_id)");
     } catch (Throwable $e) {
         // Ignore if index already exists.
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM attendee_ticket_payments LIKE 'checked_in_at'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE attendee_ticket_payments ADD COLUMN checked_in_at TIMESTAMP NULL DEFAULT NULL AFTER updated_at");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM attendee_ticket_payments LIKE 'checkin_by_user_id'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE attendee_ticket_payments ADD COLUMN checkin_by_user_id INT NULL DEFAULT NULL AFTER checked_in_at");
+    }
+
+    try {
+        $pdo->exec("ALTER TABLE attendee_ticket_payments DROP INDEX uq_attendee_ticket_payment");
+    } catch (Throwable $e) {
+        // Ignore if key is absent.
     }
 
     $ready = true;
@@ -294,8 +312,8 @@ try {
         callback_response(400, ['ok' => false, 'message' => 'Missing stkCallback object']);
     }
 
-    $checkoutRequestId = (string)($stk['CheckoutRequestID'] ?? '');
-    $merchantRequestId = (string)($stk['MerchantRequestID'] ?? '');
+    $checkoutRequestId = trim((string)($stk['CheckoutRequestID'] ?? ''));
+    $merchantRequestId = trim((string)($stk['MerchantRequestID'] ?? ''));
     $resultCode = (int)($stk['ResultCode'] ?? -1);
     $resultDesc = (string)($stk['ResultDesc'] ?? 'No result description');
 
@@ -318,12 +336,15 @@ try {
     $amountFromCallback = isset($metaMap['Amount']) ? (float)$metaMap['Amount'] : 0.0;
 
     $stmt = $pdo->prepare(
-        "SELECT booking_id, planner_user_id, status
+        "SELECT booking_id, planner_user_id, status,
+                checkout_request_id, merchant_request_id
          FROM daraja_stk_requests
          WHERE checkout_request_id = ?
+            OR (? <> '' AND merchant_request_id = ?)
+         ORDER BY CASE WHEN checkout_request_id = ? THEN 0 ELSE 1 END
          LIMIT 1"
     );
-    $stmt->execute([$checkoutRequestId]);
+    $stmt->execute([$checkoutRequestId, $merchantRequestId, $merchantRequestId, $checkoutRequestId]);
     $stkRequest = $stmt->fetch();
 
     if (!$stkRequest) {
@@ -337,36 +358,44 @@ try {
                             ELSE 'pending'
                         END
                     ) AS payment_status,
-                    e.planner_id
+                    e.planner_id,
+                    sr.checkout_request_id, sr.merchant_request_id
              FROM stall_rentals sr
              JOIN events e ON e.event_id = sr.event_id
              WHERE sr.checkout_request_id = ?
+                OR (? <> '' AND sr.merchant_request_id = ?)
+             ORDER BY CASE WHEN sr.checkout_request_id = ? THEN 0 ELSE 1 END
              LIMIT 1"
         );
-        $stmt->execute([$checkoutRequestId]);
+        $stmt->execute([$checkoutRequestId, $merchantRequestId, $merchantRequestId, $checkoutRequestId]);
         $stallRequest = $stmt->fetch();
 
         if (!$stallRequest) {
             $stmt = $pdo->prepare(
-                "SELECT vfp.payment_id, vfp.event_id, vfp.vendor_user_id, vfp.status, e.planner_id
+                "SELECT vfp.payment_id, vfp.event_id, vfp.vendor_user_id, vfp.status, e.planner_id,
+                        vfp.checkout_request_id, vfp.merchant_request_id
                  FROM vendor_fee_payments vfp
                  JOIN events e ON e.event_id = vfp.event_id
                  WHERE vfp.checkout_request_id = ?
+                    OR (? <> '' AND vfp.merchant_request_id = ?)
+                 ORDER BY CASE WHEN vfp.checkout_request_id = ? THEN 0 ELSE 1 END
                  LIMIT 1"
             );
-            $stmt->execute([$checkoutRequestId]);
+            $stmt->execute([$checkoutRequestId, $merchantRequestId, $merchantRequestId, $checkoutRequestId]);
             $vendorFeeRequest = $stmt->fetch();
 
             if (!$vendorFeeRequest) {
                 $stmt = $pdo->prepare(
                     "SELECT atp.payment_id, atp.event_id, atp.attendee_id, atp.ticket_type, atp.amount, atp.status,
-                            e.planner_id
+                            e.planner_id, atp.checkout_request_id, atp.merchant_request_id
                      FROM attendee_ticket_payments atp
                      JOIN events e ON e.event_id = atp.event_id
                      WHERE atp.checkout_request_id = ?
+                        OR (? <> '' AND atp.merchant_request_id = ?)
+                     ORDER BY CASE WHEN atp.checkout_request_id = ? THEN 0 ELSE 1 END
                      LIMIT 1"
                 );
-                $stmt->execute([$checkoutRequestId]);
+                $stmt->execute([$checkoutRequestId, $merchantRequestId, $merchantRequestId, $checkoutRequestId]);
                 $attendeePaymentRequest = $stmt->fetch();
 
                 if (!$attendeePaymentRequest) {
@@ -380,6 +409,7 @@ try {
                         [
                             'reason' => 'checkout_request_not_found',
                             'merchant_request_id' => $merchantRequestId,
+                            'checkout_request_id' => $checkoutRequestId,
                             'result_code' => $resultCode,
                             'result_desc' => $resultDesc,
                         ]
@@ -463,13 +493,13 @@ try {
                         $stmt = $pdo->prepare("INSERT INTO attendances (event_id, attendee_id) VALUES (?, ?)");
                         $stmt->execute([$eventId, $attendeeId]);
                         $registeredNow = true;
-
-                        $stmt = $pdo->prepare("UPDATE event_ticket_types SET tickets_remaining = GREATEST(0, tickets_remaining - 1) WHERE event_id = ? AND ticket_type = ? LIMIT 1");
-                        $stmt->execute([$eventId, $ticketType]);
-
-                        $stmt = $pdo->prepare("UPDATE events SET tickets_available = GREATEST(0, tickets_available - 1) WHERE event_id = ?");
-                        $stmt->execute([$eventId]);
                     }
+
+                    $stmt = $pdo->prepare("UPDATE event_ticket_types SET tickets_remaining = GREATEST(0, tickets_remaining - 1) WHERE event_id = ? AND ticket_type = ? LIMIT 1");
+                    $stmt->execute([$eventId, $ticketType]);
+
+                    $stmt = $pdo->prepare("UPDATE events SET tickets_available = GREATEST(0, tickets_available - 1) WHERE event_id = ?");
+                    $stmt->execute([$eventId]);
 
                     if ($existingStatus !== 'paid' && $ticketAmount > 0) {
                         $stmt = $pdo->prepare("UPDATE events SET ticket_revenue = ticket_revenue + ? WHERE event_id = ?");

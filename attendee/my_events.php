@@ -1,6 +1,7 @@
 <?php
 require_once '../includes/auth.php';
 require_once '../includes/csrf.php';
+require_once '../includes/ticket_qr.php';
 checkAuth();
 requireRole('attendee');
 
@@ -79,18 +80,43 @@ function ensureAttendeeTicketPaymentsTable(PDO $pdo): void
             ticket_type VARCHAR(32) NOT NULL DEFAULT 'regular',
             mpesa_code VARCHAR(64) DEFAULT NULL,
             amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+                    ticket_type VARCHAR(32) NOT NULL DEFAULT 'regular',
+                    checkout_request_id VARCHAR(120) DEFAULT NULL,
+                    merchant_request_id VARCHAR(120) DEFAULT NULL,
+                    phone_number VARCHAR(20) DEFAULT NULL,
             status ENUM('requested', 'paid', 'failed') NOT NULL DEFAULT 'requested',
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             UNIQUE KEY uq_attendee_ticket_payment (event_id, attendee_id),
+                    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_attendee_ticket_payment_attendee (attendee_id),
-            CONSTRAINT fk_attendee_ticket_payment_event FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE CASCADE,
+                    checked_in_at TIMESTAMP NULL DEFAULT NULL,
+                    checkin_by_user_id INT NULL DEFAULT NULL,
+                    INDEX idx_attendee_ticket_payment_event_status (event_id, status),
             CONSTRAINT fk_attendee_ticket_payment_attendee FOREIGN KEY (attendee_id) REFERENCES attendees(attendee_id) ON DELETE CASCADE
+                    INDEX idx_attendee_ticket_payment_checkout (checkout_request_id),
+                    INDEX idx_attendee_ticket_payment_checkin (event_id, attendee_id, status, checked_in_at),
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     );
 
     $stmt = $pdo->query("SHOW COLUMNS FROM attendee_ticket_payments LIKE 'ticket_type'");
     if (!$stmt->fetch()) {
         $pdo->exec("ALTER TABLE attendee_ticket_payments ADD COLUMN ticket_type VARCHAR(32) NOT NULL DEFAULT 'regular' AFTER attendee_id");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM attendee_ticket_payments LIKE 'checked_in_at'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE attendee_ticket_payments ADD COLUMN checked_in_at TIMESTAMP NULL DEFAULT NULL AFTER updated_at");
+    }
+
+    $stmt = $pdo->query("SHOW COLUMNS FROM attendee_ticket_payments LIKE 'checkin_by_user_id'");
+    if (!$stmt->fetch()) {
+        $pdo->exec("ALTER TABLE attendee_ticket_payments ADD COLUMN checkin_by_user_id INT NULL DEFAULT NULL AFTER checked_in_at");
+    }
+
+    try {
+        $pdo->exec("ALTER TABLE attendee_ticket_payments DROP INDEX uq_attendee_ticket_payment");
+    } catch (Throwable $e) {
+        // Ignore if key is absent.
     }
 
     $ready = true;
@@ -227,12 +253,18 @@ try {
             COALESCE(e.image_url, '') AS image_url,
                 COALESCE(e.category, '') AS category,
                 COALESCE(e.event_type, 'in_person') AS event_type,
-                a.status, COALESCE(p.status, 'requested') AS payment_status, COALESCE(p.mpesa_code, '') AS mpesa_code,
-                COALESCE(p.ticket_type, 'regular') AS attendee_ticket_type,
-                COALESCE(p.amount, e.ticket_price) AS ticket_amount
+                a.status,
+                (SELECT COALESCE(MAX(p1.status), 'requested')
+                 FROM attendee_ticket_payments p1
+                 WHERE p1.event_id = a.event_id AND p1.attendee_id = a.attendee_id) AS payment_status,
+                (SELECT COALESCE(MAX(p2.ticket_type), 'regular')
+                 FROM attendee_ticket_payments p2
+                 WHERE p2.event_id = a.event_id AND p2.attendee_id = a.attendee_id AND p2.status = 'paid') AS attendee_ticket_type,
+                (SELECT COALESCE(MAX(p3.amount), e.ticket_price)
+                 FROM attendee_ticket_payments p3
+                 WHERE p3.event_id = a.event_id AND p3.attendee_id = a.attendee_id AND p3.status = 'paid') AS ticket_amount
          FROM attendances a
          JOIN events e ON e.event_id = a.event_id
-         LEFT JOIN attendee_ticket_payments p ON p.event_id = a.event_id AND p.attendee_id = a.attendee_id
          WHERE a.attendee_id = ? AND e.archived_at IS NULL
          ORDER BY e.event_date ASC"
     );
@@ -246,10 +278,32 @@ try {
         } else {
             $completedEvents[] = $row;
         }
+    }
 
-        if (strtolower((string)$row['status']) === 'registered') {
-            $ticketCards[] = $row;
-        }
+    $stmt = $pdo->prepare(
+        "SELECT
+            p.payment_id,
+            p.event_id,
+            p.ticket_type AS attendee_ticket_type,
+            p.status AS payment_status,
+            p.amount AS ticket_amount,
+            p.mpesa_code,
+            p.checked_in_at,
+            e.title,
+            e.event_date,
+            COALESCE(e.category, '') AS category,
+            COALESCE(e.event_type, 'in_person') AS event_type
+         FROM attendee_ticket_payments p
+         JOIN events e ON e.event_id = p.event_id
+         WHERE p.attendee_id = ?
+           AND p.status = 'paid'
+           AND e.archived_at IS NULL
+           AND e.event_date >= CURDATE()
+         ORDER BY e.event_date ASC, p.payment_id ASC"
+    );
+    $stmt->execute([$attendeeId]);
+    foreach ($stmt->fetchAll() as $row) {
+        $ticketCards[] = $row;
     }
 
     $stmt = $pdo->prepare(
@@ -321,9 +375,12 @@ function attendeePaymentLabel(string $status): string
         .btn { border: none; border-radius: 8px; padding: 8px 11px; font-size: 12px; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-block; }
         .btn-light { background: #ece9ff; color: #3f379f; }
         .btn-danger { background: #ffecec; color: #9d2020; }
-        .ticket-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px,1fr)); gap: 10px; }
-        .ticket { background: #1f1d35; color: #fff; border-radius: 12px; padding: 14px; }
+        .ticket-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px,1fr)); gap: 10px; }
+        .ticket { background: #1f1d35; color: #fff; border-radius: 11px; padding: 12px; }
         .qr-box { background: repeating-linear-gradient(45deg, #fff, #fff 4px, #e6e6ff 4px, #e6e6ff 8px); border-radius: 8px; color: #1f1d35; font-weight: 700; font-size: 12px; padding: 12px; margin: 8px 0; text-align: center; }
+        .qr-image { width: 120px; max-width: 100%; height: auto; border-radius: 8px; border: 1px solid #dcd8ff; background: #fff; padding: 8px; }
+        .ticket-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin-top: 8px; }
+        .btn-qr-download { background: #fff; color: #2f2a86; border: 1px solid #d6d1ff; border-radius: 8px; padding: 7px 10px; font-size: 12px; font-weight: 700; text-decoration: none; display: inline-block; }
         .empty { color: #666; font-size: 13px; }
         .bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; height: 62px; background: #6C63FF; display: flex; z-index: 999; }
         .nav-item { flex: 1; color: rgba(255,255,255,.76); text-decoration: none; font-size: 11px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; }
@@ -422,13 +479,17 @@ function attendeePaymentLabel(string $status): string
     </section>
 
     <section class="section">
-        <h2>Digital Tickets</h2>
+        <h2>Digital Tickets (<?php echo count($ticketCards); ?>)</h2>
         <div class="ticket-grid">
             <?php if (empty($ticketCards)): ?>
                 <p class="empty">No active tickets yet.</p>
             <?php else: ?>
                 <?php foreach ($ticketCards as $event): ?>
-                    <?php $ticketCode = strtoupper(substr(sha1((string)$event['event_id'] . '-' . (string)$attendeeId . '-' . (string)$event['event_date']), 0, 14)); ?>
+                    <?php $paymentId = (int)($event['payment_id'] ?? 0); ?>
+                    <?php $ticketCode = ticket_qr_build_code((int)$event['event_id'], (int)$attendeeId, (string)$event['event_date'], $paymentId); ?>
+                    <?php $ticketToken = ticket_qr_build_payload_token((int)$event['event_id'], (int)$attendeeId, (string)$event['event_date'], $paymentId); ?>
+                    <?php $ticketQrDataUri = ticket_qr_render_data_uri($ticketToken); ?>
+                    <?php $ticketQrExt = str_starts_with($ticketQrDataUri, 'data:image/svg+xml') ? 'svg' : 'png'; ?>
                     <?php $accessType = ((string)($event['event_type'] ?? 'in_person') === 'online') ? 'Online Access' : 'In-person'; ?>
                     <?php $tierType = attendeeTicketTypeLabel((string)($event['attendee_ticket_type'] ?? 'regular')); ?>
                     <?php $ticketCategory = trim((string)($event['category'] ?? '')); ?>
@@ -445,7 +506,24 @@ function attendeePaymentLabel(string $status): string
                             <div style="font-size:12px; opacity:.85;">Amount Paid: <?php echo $ticketAmount > 0 ? 'KES ' . number_format($ticketAmount, 2) : 'Free'; ?></div>
                         <?php endif; ?>
                         <div style="font-size:12px; opacity:.85;">Payment: <?php echo htmlspecialchars(attendeePaymentLabel((string)$event['payment_status'])); ?></div>
-                        <div class="qr-box">QR: <?php echo htmlspecialchars($ticketCode); ?></div>
+                        <div style="font-size:12px; opacity:.85;">Ticket #: <?php echo $paymentId > 0 ? (int)$paymentId : 'N/A'; ?></div>
+                        <?php if (!empty($event['checked_in_at'])): ?>
+                            <div style="font-size:12px; opacity:.85; color:#c6ffcf;">Status: Checked in</div>
+                        <?php endif; ?>
+                        <div class="qr-box">
+                            <?php if ($ticketQrDataUri !== ''): ?>
+                                <img class="qr-image" src="<?php echo htmlspecialchars($ticketQrDataUri); ?>" alt="Ticket QR">
+                            <?php else: ?>
+                                QR unavailable right now
+                            <?php endif; ?>
+                            <div style="margin-top:8px;">Ticket Code: <?php echo htmlspecialchars($ticketCode); ?></div>
+                            <?php if ($ticketQrDataUri !== ''): ?>
+                                <div class="ticket-actions">
+                                    <a class="btn-qr-download" href="<?php echo htmlspecialchars($ticketQrDataUri); ?>" download="ticket-qr-<?php echo (int)$paymentId; ?>.<?php echo htmlspecialchars($ticketQrExt); ?>">Download QR</a>
+                                    <a class="btn-qr-download" href="download_ticket.php?event_id=<?php echo (int)$event['event_id']; ?>&payment_id=<?php echo (int)$paymentId; ?>">Download Ticket</a>
+                                </div>
+                            <?php endif; ?>
+                        </div>
                         <div style="font-size:12px; opacity:.9;">Valid on <?php echo htmlspecialchars((string)$event['event_date']); ?></div>
                     </div>
                 <?php endforeach; ?>

@@ -1,5 +1,6 @@
 ﻿<?php
 require_once '../includes/auth.php';
+require_once '../includes/two_step.php';
 checkAuth();
 requireRole('vendor');
 
@@ -17,7 +18,41 @@ $recentRatings = [];
 $newPendingCount = 0;
 $flashSuccess = $_SESSION['flash_success'] ?? '';
 $flashError = $_SESSION['flash_error'] ?? '';
+$emailOtpEnabled = false;
 unset($_SESSION['flash_success'], $_SESSION['flash_error']);
+
+try {
+    $emailOtpEnabled = two_step_email_otp_is_enabled($pdo, (int)$_SESSION['user_id']);
+} catch (Throwable $e) {
+    $emailOtpEnabled = false;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['toggle_email_2fa'])) {
+    $toggleAction = strtolower(trim((string)($_POST['toggle_email_2fa'] ?? '')));
+    $enable2fa = $toggleAction === 'enable';
+
+    try {
+        two_step_set_email_otp_enabled($pdo, (int)$_SESSION['user_id'], $enable2fa);
+
+        audit_log(
+            $pdo,
+            (int)$_SESSION['user_id'],
+            (string)$_SESSION['role'],
+            $enable2fa ? 'auth.email_2fa_enabled' : 'auth.email_2fa_disabled',
+            'user',
+            (string)$_SESSION['user_id']
+        );
+
+        $_SESSION['flash_success'] = $enable2fa
+            ? '2-step verification has been enabled.'
+            : '2-step verification has been disabled.';
+    } catch (Throwable $e) {
+        $_SESSION['flash_error'] = 'Unable to update 2-step verification right now.';
+    }
+
+    header('Location: profile.php');
+    exit;
+}
 
 function ensureServiceRatingsTable(PDO $pdo): void
 {
@@ -777,6 +812,18 @@ try {
                         </div>
                     <?php endforeach; ?>
                 <?php endif; ?>
+            </div>
+
+            <div class="edit-form" style="margin-top:14px;">
+                <h2 class="form-title"><i class="fa-solid fa-shield-halved"></i> 2-Step Verification</h2>
+                <p class="helper">Status: <strong><?php echo $emailOtpEnabled ? 'Enabled' : 'Disabled'; ?></strong></p>
+                <form method="POST">
+                    <?php echo csrf_input(); ?>
+                    <input type="hidden" name="toggle_email_2fa" value="<?php echo $emailOtpEnabled ? 'disable' : 'enable'; ?>">
+                    <button type="submit" class="<?php echo $emailOtpEnabled ? 'btn-outline' : 'btn-primary'; ?>">
+                        <?php echo $emailOtpEnabled ? 'Turn Off 2FA' : 'Turn On 2FA'; ?>
+                    </button>
+                </form>
             </div>
 
             <!-- Toggle button for edit forms -->

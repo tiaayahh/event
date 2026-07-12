@@ -12,13 +12,29 @@ try {
             payment_id BIGINT AUTO_INCREMENT PRIMARY KEY,
             event_id INT NOT NULL,
             attendee_id INT NOT NULL,
+            ticket_type VARCHAR(32) NOT NULL DEFAULT 'regular',
+            checkout_request_id VARCHAR(120) DEFAULT NULL,
+            merchant_request_id VARCHAR(120) DEFAULT NULL,
+            phone_number VARCHAR(20) DEFAULT NULL,
             mpesa_code VARCHAR(64) DEFAULT NULL,
             amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
             status ENUM('requested', 'paid', 'failed') NOT NULL DEFAULT 'requested',
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            UNIQUE KEY uq_attendee_ticket_payment (event_id, attendee_id)
+            checked_in_at TIMESTAMP NULL DEFAULT NULL,
+            checkin_by_user_id INT NULL DEFAULT NULL,
+            INDEX idx_attendee_ticket_payment_event_status (event_id, status),
+            INDEX idx_attendee_ticket_payment_attendee (attendee_id),
+            INDEX idx_attendee_ticket_payment_checkout (checkout_request_id),
+            INDEX idx_attendee_ticket_payment_checkin (event_id, attendee_id, status, checked_in_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
     );
+
+    try {
+        $pdo->exec("ALTER TABLE attendee_ticket_payments DROP INDEX uq_attendee_ticket_payment");
+    } catch (Throwable $e) {
+        // Ignore if key is absent.
+    }
 
     $stmt = $pdo->prepare('SELECT attendee_id FROM attendees WHERE user_id = ? LIMIT 1');
     $stmt->execute([$_SESSION['user_id']]);

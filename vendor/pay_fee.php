@@ -81,6 +81,8 @@ $error = '';
 $success = '';
 $defaultFeeAmount = 100.00;
 $selectedEventId = 0;
+$lastAction = '';
+$lastCheckoutRequestId = '';
 $darajaConfigured = daraja_is_configured();
 $isServiceProvider = true;
 $darajaEnv = strtolower(trim((string)(getenv('DARAJA_ENV') ?: 'sandbox')));
@@ -152,6 +154,7 @@ try {
         $eventId = (int)($_POST['event_id'] ?? 0);
         $selectedEventId = $eventId;
         $action = strtolower(trim((string)($_POST['action'] ?? '')));
+        $lastAction = $action;
 
         if ($eventId <= 0) {
             throw new RuntimeException('Invalid event selected.');
@@ -208,6 +211,8 @@ try {
                 $phoneNumber,
                 $feeAmount,
             ]);
+
+            $lastCheckoutRequestId = (string)($pushResult['checkout_request_id'] ?? '');
 
             audit_log(
                 $pdo,
@@ -387,6 +392,8 @@ if ($isAjaxRequest && $_SERVER['REQUEST_METHOD'] === 'POST') {
         'ok' => $error === '',
         'message' => $error !== '' ? $error : ($success !== '' ? $success : 'Request processed.'),
         'selected_event_id' => $selectedEventId,
+        'action' => $lastAction,
+        'checkout_request_id' => $lastCheckoutRequestId,
     ];
 
     if ($selectedEventId > 0) {
@@ -852,7 +859,7 @@ if ($isAjaxRequest && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                     $awaitingCallback = !empty($event['checkout_request_id']) && in_array($status, ['requested', 'pending'], true);
                     ?>
-                    <div class="fee-item" data-event-id="<?php echo (int)$event['event_id']; ?>">
+                    <div class="fee-item" data-event-id="<?php echo (int)$event['event_id']; ?>" data-checkout-id="<?php echo htmlspecialchars((string)($event['checkout_request_id'] ?? '')); ?>" data-fee-status="<?php echo htmlspecialchars((string)($event['fee_status'] ?? 'requested')); ?>">
                         <div class="fee-title"><?php echo htmlspecialchars($event['title']); ?></div>
                         <div class="fee-meta">Date: <?php echo htmlspecialchars($event['event_date']); ?></div>
                         <div class="fee-meta">Fee: KES <?php echo number_format((float)$event['vendor_fee_amount'], 2); ?></div>
@@ -864,7 +871,7 @@ if ($isAjaxRequest && $_SERVER['REQUEST_METHOD'] === 'POST') {
                         <div class="fee-meta js-fee-code" <?php echo empty($event['mpesa_code']) ? 'style="display:none;"' : ''; ?>>M-Pesa Code: <span><?php echo htmlspecialchars((string)$event['mpesa_code']); ?></span></div>
 
                         <?php if ($awaitingCallback): ?>
-                            <div class="fee-meta" style="margin-top:10px; color:#2c4ea0;">
+                            <div class="fee-meta js-awaiting-callback" style="margin-top:10px; color:#2c4ea0;">
                                 STK request sent. Waiting for M-Pesa callback to update status automatically.
                             </div>
                             <form method="POST" class="fee-form js-async-form" style="margin-top: 10px;">
@@ -874,12 +881,15 @@ if ($isAjaxRequest && $_SERVER['REQUEST_METHOD'] === 'POST') {
                                 <button type="submit" class="btn-secondary"><i class="fa-solid fa-rotate"></i> Check Status Now</button>
                             </form>
                         <?php else: ?>
-                            <div class="fee-meta" style="margin-top:10px; color:#2c4ea0;">
+                            <div class="fee-meta js-awaiting-callback" style="margin-top:10px; color:#2c4ea0; display:none;">
+                                STK request sent. Waiting for M-Pesa callback to update status automatically.
+                            </div>
+                            <div class="fee-meta js-fallback-note" style="margin-top:10px; color:#2c4ea0;">
                                 Use STK push first. If callback is delayed, use manual fallback below.
                             </div>
                         <?php endif; ?>
 
-                        <form method="POST" class="fee-form js-async-form" style="margin-top: 10px;">
+                        <form method="POST" class="fee-form js-async-form js-manual-fallback" style="margin-top: 10px;<?php echo strtolower((string)($event['fee_status'] ?? 'requested')) === 'paid' ? ' display:none;' : ''; ?>">
                             <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars(generate_csrf_token()); ?>">
                             <input type="hidden" name="action" value="save">
                             <input type="hidden" name="event_id" value="<?php echo (int)$event['event_id']; ?>">
@@ -923,6 +933,7 @@ if ($isAjaxRequest && $_SERVER['REQUEST_METHOD'] === 'POST') {
 <script>
 (function () {
     const stack = document.getElementById('toast_stack');
+    const pollTimers = new Map();
 
     function showToast(type, message) {
         if (!stack || !message) {
@@ -962,14 +973,18 @@ if ($isAjaxRequest && $_SERVER['REQUEST_METHOD'] === 'POST') {
             badge.textContent = String(eventState.fee_status || 'requested');
         }
 
+        card.setAttribute('data-fee-status', String(eventState.fee_status || 'requested'));
+
         const checkoutWrap = card.querySelector('.js-fee-checkout');
         if (checkoutWrap) {
             const valueNode = checkoutWrap.querySelector('span');
             if (eventState.checkout_request_id) {
                 checkoutWrap.style.display = '';
                 if (valueNode) valueNode.textContent = String(eventState.checkout_request_id);
+                card.setAttribute('data-checkout-id', String(eventState.checkout_request_id));
             } else {
                 checkoutWrap.style.display = 'none';
+                card.setAttribute('data-checkout-id', '');
             }
         }
 
@@ -983,6 +998,76 @@ if ($isAjaxRequest && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 codeWrap.style.display = 'none';
             }
         }
+
+        const normalizedStatus = String(eventState.fee_status || '').toLowerCase();
+        const awaitingNote = card.querySelector('.js-awaiting-callback');
+        const fallbackNote = card.querySelector('.js-fallback-note');
+        const manualFallbackForm = card.querySelector('.js-manual-fallback');
+
+        if (awaitingNote) {
+            awaitingNote.style.display = (normalizedStatus === 'requested' || normalizedStatus === 'pending') ? '' : 'none';
+        }
+        if (fallbackNote) {
+            fallbackNote.style.display = (normalizedStatus === 'requested' || normalizedStatus === 'pending') ? 'none' : '';
+        }
+        if (manualFallbackForm) {
+            manualFallbackForm.style.display = normalizedStatus === 'paid' ? 'none' : '';
+        }
+    }
+
+    function stopPolling(eventId) {
+        const key = String(eventId || '');
+        if (pollTimers.has(key)) {
+            clearInterval(pollTimers.get(key));
+            pollTimers.delete(key);
+        }
+    }
+
+    function startPolling(eventId, checkoutRequestId) {
+        const key = String(eventId || '');
+        const checkoutId = String(checkoutRequestId || '').trim();
+        if (!key || !checkoutId) {
+            return;
+        }
+
+        stopPolling(key);
+
+        const poll = function () {
+            fetch('../check_payment_status.php?checkout_request_id=' + encodeURIComponent(checkoutId), {
+                method: 'GET',
+                headers: {
+                    'Accept': 'application/json'
+                }
+            })
+                .then(function (response) { return response.json(); })
+                .then(function (data) {
+                    if (!data || !data.ok) {
+                        return;
+                    }
+
+                    const normalized = String(data.status || '').toLowerCase();
+                    updateEventCard({
+                        event_id: Number(eventId),
+                        fee_status: normalized || 'requested',
+                        checkout_request_id: checkoutId,
+                        mpesa_code: String(data.mpesa_code || '')
+                    });
+
+                    if (normalized === 'paid') {
+                        showToast('success', 'Payment confirmed successfully.');
+                        stopPolling(key);
+                    } else if (normalized === 'failed') {
+                        showToast('error', 'Payment failed. You can retry STK push or use manual fallback.');
+                        stopPolling(key);
+                    }
+                })
+                .catch(function () {
+                    // Keep polling silently to avoid noisy transient network errors.
+                });
+        };
+
+        poll();
+        pollTimers.set(key, setInterval(poll, 5000));
     }
 
     document.querySelectorAll('form.js-async-form').forEach(function (form) {
@@ -1010,7 +1095,13 @@ if ($isAjaxRequest && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     if (data.event) {
                         updateEventCard(data.event);
                     }
-                    if (ok && String(form.querySelector('input[name="action"]') ? form.querySelector('input[name="action"]').value : '') === 'stk_push') {
+                    const action = String(data.action || (form.querySelector('input[name="action"]') ? form.querySelector('input[name="action"]').value : ''));
+                    if (ok && action === 'stk_push') {
+                        const selectedEventId = Number(data.selected_event_id || 0);
+                        const checkoutId = String(data.checkout_request_id || (data.event && data.event.checkout_request_id ? data.event.checkout_request_id : '') || '');
+                        if (selectedEventId > 0 && checkoutId !== '') {
+                            startPolling(selectedEventId, checkoutId);
+                        }
                         const phoneField = form.querySelector('input[name="phone_number"]');
                         if (phoneField) {
                             phoneField.value = '';
@@ -1027,6 +1118,15 @@ if ($isAjaxRequest && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     }
                 });
         });
+    });
+
+    document.querySelectorAll('.fee-item').forEach(function (card) {
+        const eventId = Number(card.getAttribute('data-event-id') || 0);
+        const checkoutId = String(card.getAttribute('data-checkout-id') || '').trim();
+        const status = String(card.getAttribute('data-fee-status') || '').toLowerCase();
+        if (eventId > 0 && checkoutId !== '' && (status === 'requested' || status === 'pending')) {
+            startPolling(eventId, checkoutId);
+        }
     });
 })();
 </script>

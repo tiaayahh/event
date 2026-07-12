@@ -4,7 +4,8 @@
     "type": "project",
     "require": {
         "php": ">=8.1",
-        "phpmailer/phpmailer": "^7.1"
+        "phpmailer/phpmailer": "^7.1",
+        "chillerlan/php-qrcode": "^5.0"
     },
     "config": {
         "vendor-dir": "third_party"

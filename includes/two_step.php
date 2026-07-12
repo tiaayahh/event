@@ -88,7 +88,19 @@ function two_step_start_pending(array $user, bool $passwordNeedsUpdate = false, 
         $sentAt = (int)($existing['sent_at'] ?? 0);
         $sentRecently = $sentAt > 0 && (time() - $sentAt) <= TWO_STEP_LOGIN_SEND_DEDUP_SECONDS;
 
-        if ($sameUser && $notExpired && $sentRecently) {
+        if ($sameUser && $notExpired) {
+            // Keep one active code per pending login unless user explicitly requests resend.
+            $_SESSION['pending_2fa']['password_needs_update'] =
+                !empty($existing['password_needs_update']) || $passwordNeedsUpdate;
+
+            // Avoid rapid resend loops right after initial login attempt.
+            if ($sentRecently) {
+                return [
+                    'email_sent' => true,
+                    'error_message' => '',
+                ];
+            }
+
             return [
                 'email_sent' => true,
                 'error_message' => '',
