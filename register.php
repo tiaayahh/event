@@ -412,7 +412,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <?php echo csrf_input(); ?>
             <div class="form-group">
                 <label for="full_name">Full Name</label>
-                <input type="text" id="full_name" name="full_name" class="form-control" placeholder="e.g. John Doe" required>
+                <input type="text" id="full_name" name="full_name" class="form-control" placeholder="e.g. Jane Doe" required>
             </div>
 
             <div class="form-group">
@@ -453,7 +453,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 </div>
                 <div class="form-group">
                     <label for="business_name">Business Name</label>
-                    <input type="text" id="business_name" name="business_name" class="form-control" placeholder="e.g. DJ Brian Entertainments" value="<?php echo htmlspecialchars((string)($_POST['business_name'] ?? '')); ?>">
+                    <input type="text" id="business_name" name="business_name" class="form-control" placeholder="e.g. DJ Tia Entertainments" value="<?php echo htmlspecialchars((string)($_POST['business_name'] ?? '')); ?>">
                 </div>
                 <div class="form-group">
                     <label for="service_type" id="serviceTypeLabel">Service Type</label>
